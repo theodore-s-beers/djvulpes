@@ -1,6 +1,6 @@
 use crate::chunk::{Chunk, Form, parse_chunks, parse_document_root, parse_form_at};
 use crate::dirm::{Dirm, DirmTailEntry, parse_dirm};
-use crate::error::Result;
+use crate::error::ParseResult;
 use crate::info::{PageInfo, read_page_info};
 use crate::page::{PageDetails, read_page_details};
 
@@ -51,7 +51,7 @@ impl<'a> Page<'a> {
     /// # Errors
     ///
     /// Returns an error if the page form's child chunk stream is malformed.
-    pub fn details(&self, bytes: &'a [u8]) -> Result<PageDetails<'a>> {
+    pub fn details(&self, bytes: &'a [u8]) -> ParseResult<PageDetails<'a>> {
         read_page_details(bytes, &self.form)
     }
 }
@@ -63,7 +63,7 @@ impl<'a> Document<'a> {
     ///
     /// Returns an error if the root document form, root chunk stream, or
     /// directory chunk is malformed.
-    pub fn parse(bytes: &'a [u8]) -> Result<Self> {
+    pub fn parse(bytes: &'a [u8]) -> ParseResult<Self> {
         let root = parse_document_root(bytes)?;
         let root_chunks = parse_chunks(bytes, root.children_start, root.chunk.data_end)?;
         let directory = root_chunks
@@ -139,7 +139,7 @@ impl<'a> Document<'a> {
     /// # Errors
     ///
     /// Returns an error if a top-level `FORM` chunk cannot be parsed.
-    pub fn root_chunk_counts(&self, bytes: &[u8]) -> Result<RootChunkCounts> {
+    pub fn root_chunk_counts(&self, bytes: &[u8]) -> ParseResult<RootChunkCounts> {
         let mut counts = RootChunkCounts::default();
 
         for chunk in &self.root_chunks {
@@ -231,7 +231,7 @@ impl<'a> DocumentForm<'a> {
     /// # Errors
     ///
     /// Returns an error if the page form's child chunk stream is malformed.
-    pub fn page(&self, bytes: &'a [u8]) -> Result<Option<Page<'a>>> {
+    pub fn page(&self, bytes: &'a [u8]) -> ParseResult<Option<Page<'a>>> {
         if self.kind != DocumentFormKind::Page {
             return Ok(None);
         }
@@ -270,7 +270,7 @@ pub struct Pages<'a> {
 }
 
 impl<'a> Iterator for Pages<'a> {
-    type Item = Result<Page<'a>>;
+    type Item = ParseResult<Page<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         for document_form in self.forms.by_ref() {
@@ -357,7 +357,7 @@ mod tests {
         let form_counts = document.form_kind_counts();
         let pages = document
             .pages(&bytes)
-            .collect::<Result<Vec<_>>>()
+            .collect::<ParseResult<Vec<_>>>()
             .expect("pages should parse");
 
         assert_eq!(root_counts.dirm, 1);

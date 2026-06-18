@@ -1,5 +1,5 @@
 use crate::chunk::{Form, parse_chunks, read_u16_be, read_u16_le};
-use crate::error::Result;
+use crate::error::ParseResult;
 
 #[derive(Debug, Clone)]
 pub struct PageInfo {
@@ -16,7 +16,7 @@ pub struct PageInfo {
 /// # Errors
 ///
 /// Returns an error if the page form's child chunk stream is malformed.
-pub fn read_page_info(bytes: &[u8], form: &Form<'_>) -> Result<Option<PageInfo>> {
+pub fn read_page_info(bytes: &[u8], form: &Form<'_>) -> ParseResult<Option<PageInfo>> {
     if form.kind != "DJVU" {
         return Ok(None);
     }

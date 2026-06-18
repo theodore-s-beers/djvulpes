@@ -56,7 +56,7 @@ enum Command {
     },
 }
 
-pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
+pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Command::Summary { file: cli.file }) {

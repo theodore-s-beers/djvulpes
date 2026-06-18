@@ -1,5 +1,5 @@
 use crate::chunk::{Chunk, Form, parse_chunks};
-use crate::error::Result;
+use crate::error::ParseResult;
 use crate::info::{PageInfo, read_page_info};
 
 #[derive(Debug, Clone)]
@@ -40,7 +40,7 @@ pub enum PageChunkPayload<'a> {
 /// # Errors
 ///
 /// Returns an error if the page form's child chunk stream is malformed.
-pub fn read_page_details<'a>(bytes: &'a [u8], form: &Form<'a>) -> Result<PageDetails<'a>> {
+pub fn read_page_details<'a>(bytes: &'a [u8], form: &Form<'a>) -> ParseResult<PageDetails<'a>> {
     let info = read_page_info(bytes, form)?;
     let chunks = parse_chunks(bytes, form.children_start, form.chunk.data_end)?
         .into_iter()

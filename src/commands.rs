@@ -1,14 +1,15 @@
+use anyhow::{Context, bail};
 use djvulpes::{
-    Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkKind,
-    PageChunkPayload, Result, parse_chunks, parse_dirm_tail, parse_form_at, parse_text_payload,
-    read_page_details,
+    Chunk, DirectoryEntry, Dirm, Document, DocumentFormKind, Form, PageChunk, PageChunkKind,
+    PageChunkPayload, ParseResult, parse_chunks, parse_dirm_tail, parse_form_at,
+    parse_text_payload, read_page_details,
 };
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-pub fn run_summary(path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let bytes = fs::read(path)?;
+pub fn run_summary(path: &Path) -> anyhow::Result<()> {
+    let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
 
     println!("file: {}", path.display());
@@ -34,8 +35,8 @@ pub fn run_summary(path: &Path) -> std::result::Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-pub fn run_pages(path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let bytes = fs::read(path)?;
+pub fn run_pages(path: &Path) -> anyhow::Result<()> {
+    let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
 
     println!("file: {}", path.display());
@@ -65,8 +66,8 @@ pub fn run_pages(path: &Path) -> std::result::Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-pub fn run_forms(path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let bytes = fs::read(path)?;
+pub fn run_forms(path: &Path) -> anyhow::Result<()> {
+    let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
 
     println!("file: {}", path.display());
@@ -91,16 +92,14 @@ pub fn run_forms(path: &Path) -> std::result::Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-pub fn run_form(path: &Path, offset: usize) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let bytes = fs::read(path)?;
+pub fn run_form(path: &Path, offset: usize) -> anyhow::Result<()> {
+    let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
     let form = parse_form_at(&bytes, offset)?;
 
     println!("file: {}", path.display());
-    if let Some(decoded_tail) = decode_document_directory_tail(&bytes, &document)
-        .ok()
-        .flatten()
-        && let Some(dirm) = &document.directory
+    if let Some(dirm) = &document.directory
+        && let Ok(decoded_tail) = decode_dirm_tail(&bytes, dirm)
     {
         let entries = parse_dirm_tail(dirm, &decoded_tail)?;
         let directory_entries = document.directory_entries(&entries);
@@ -122,11 +121,11 @@ pub fn run_form(path: &Path, offset: usize) -> std::result::Result<(), Box<dyn s
     Ok(())
 }
 
-pub fn run_dirm(path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let bytes = fs::read(path)?;
+pub fn run_dirm(path: &Path) -> anyhow::Result<()> {
+    let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
     let Some(dirm) = &document.directory else {
-        return Err("document has no DIRM chunk".into());
+        bail!("document has no DIRM chunk");
     };
 
     println!("file: {}", path.display());
@@ -141,7 +140,7 @@ pub fn run_dirm(path: &Path) -> std::result::Result<(), Box<dyn std::error::Erro
         tail.len()
     );
 
-    let decoded_tail = match decode_bzz_with_local_tool(tail) {
+    let decoded_tail = match decode_dirm_tail(&bytes, dirm) {
         Ok(decoded_tail) => decoded_tail,
         Err(error) => {
             println!("decoded tail: unavailable ({error})");
@@ -180,12 +179,12 @@ pub fn run_dirm(path: &Path) -> std::result::Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-pub fn run_page(path: &Path, number: usize) -> std::result::Result<(), Box<dyn std::error::Error>> {
+pub fn run_page(path: &Path, number: usize) -> anyhow::Result<()> {
     if number == 0 {
-        return Err("page number must be 1 or greater".into());
+        bail!("page number must be 1 or greater");
     }
 
-    let bytes = fs::read(path)?;
+    let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
     let Some(document_form) = document
         .forms
@@ -193,25 +192,19 @@ pub fn run_page(path: &Path, number: usize) -> std::result::Result<(), Box<dyn s
         .filter(|form| form.kind == DocumentFormKind::Page)
         .nth(number - 1)
     else {
-        return Err(format!(
+        bail!(
             "page {number} not found; document has {} pages",
             document.form_kind_counts().pages
-        )
-        .into());
+        );
     };
 
     println!("file: {}", path.display());
     println!("page: {number}");
 
-    let decoded_tail = decode_document_directory_tail(&bytes, &document)
-        .ok()
-        .flatten();
-    if let Some(decoded_tail) = decoded_tail.as_ref() {
-        let dirm = document
-            .directory
-            .as_ref()
-            .expect("decoded DIRM tail requires a DIRM chunk");
-        let entries = parse_dirm_tail(dirm, decoded_tail)?;
+    if let Some(dirm) = &document.directory
+        && let Ok(decoded_tail) = decode_dirm_tail(&bytes, dirm)
+    {
+        let entries = parse_dirm_tail(dirm, &decoded_tail)?;
         let resolved_entries = document.directory_entries(&entries);
         print_page_detail(
             &bytes,
@@ -226,12 +219,12 @@ pub fn run_page(path: &Path, number: usize) -> std::result::Result<(), Box<dyn s
     Ok(())
 }
 
-pub fn run_text(path: &Path, number: usize) -> std::result::Result<(), Box<dyn std::error::Error>> {
+pub fn run_text(path: &Path, number: usize) -> anyhow::Result<()> {
     if number == 0 {
-        return Err("page number must be 1 or greater".into());
+        bail!("page number must be 1 or greater");
     }
 
-    let bytes = fs::read(path)?;
+    let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
     let Some(document_form) = document
         .forms
@@ -239,11 +232,10 @@ pub fn run_text(path: &Path, number: usize) -> std::result::Result<(), Box<dyn s
         .filter(|form| form.kind == DocumentFormKind::Page)
         .nth(number - 1)
     else {
-        return Err(format!(
+        bail!(
             "page {number} not found; document has {} pages",
             document.form_kind_counts().pages
-        )
-        .into());
+        );
     };
     let details = read_page_details(&bytes, &document_form.form)?;
 
@@ -272,7 +264,11 @@ pub fn run_text(path: &Path, number: usize) -> std::result::Result<(), Box<dyn s
     Ok(())
 }
 
-fn print_root_chunk_counts(document: &Document<'_>, bytes: &[u8]) -> Result<()> {
+fn read_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    fs::read(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn print_root_chunk_counts(document: &Document<'_>, bytes: &[u8]) -> ParseResult<()> {
     let counts = document.root_chunk_counts(bytes)?;
     println!(
         "  counts: DIRM={}, NAVM={}, FORM:DJVU={}, FORM:DJVI={}, FORM:THUM={}, other={}",
@@ -286,7 +282,7 @@ fn print_root_chunk_counts(document: &Document<'_>, bytes: &[u8]) -> Result<()> 
     Ok(())
 }
 
-fn print_root_chunk_sample(bytes: &[u8], chunks: &[Chunk<'_>]) -> Result<()> {
+fn print_root_chunk_sample(bytes: &[u8], chunks: &[Chunk<'_>]) -> ParseResult<()> {
     let sample_len = chunks.len().min(16);
     println!("  first {sample_len}:");
 
@@ -304,7 +300,7 @@ fn print_root_chunk_sample(bytes: &[u8], chunks: &[Chunk<'_>]) -> Result<()> {
     Ok(())
 }
 
-fn print_chunk_line(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
+fn print_chunk_line(bytes: &[u8], chunk: &Chunk<'_>) -> ParseResult<()> {
     if chunk.id == "FORM" {
         let form = parse_form_at(bytes, chunk.data_start - 8)?;
         println!(
@@ -329,7 +325,7 @@ fn print_chunk_line(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
     Ok(())
 }
 
-fn print_form_detail(bytes: &[u8], form: &Form<'_>, offset: usize) -> Result<()> {
+fn print_form_detail(bytes: &[u8], form: &Form<'_>, offset: usize) -> ParseResult<()> {
     println!(
         "form: @{offset} FORM:{} size={} data=[{}..{})",
         form.kind, form.chunk.size, form.chunk.data_start, form.chunk.data_end
@@ -345,7 +341,7 @@ fn print_form_detail(bytes: &[u8], form: &Form<'_>, offset: usize) -> Result<()>
     Ok(())
 }
 
-fn print_form_child_chunk_line(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
+fn print_form_child_chunk_line(bytes: &[u8], chunk: &Chunk<'_>) -> ParseResult<()> {
     if chunk.id == "FORM" {
         let form = parse_form_at(bytes, chunk.data_start - 8)?;
         println!(
@@ -373,7 +369,7 @@ fn print_form_child_chunk_line(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
     Ok(())
 }
 
-fn print_dirm_summary(document: &Document<'_>, bytes: &[u8]) -> Result<()> {
+fn print_dirm_summary(document: &Document<'_>, bytes: &[u8]) -> ParseResult<()> {
     let Some(dirm) = &document.directory else {
         return Ok(());
     };
@@ -430,7 +426,7 @@ fn print_page_detail(
     form: &Form<'_>,
     offset: u32,
     directory_context: Option<(&Document<'_>, &[DirectoryEntry<'_>])>,
-) -> Result<()> {
+) -> ParseResult<()> {
     let details = read_page_details(bytes, form)?;
 
     println!(
@@ -461,7 +457,7 @@ fn print_page_chunk_line(
     bytes: &[u8],
     page_chunk: &PageChunk<'_>,
     directory_context: Option<(&Document<'_>, &[DirectoryEntry<'_>])>,
-) -> Result<()> {
+) -> ParseResult<()> {
     let chunk = &page_chunk.chunk;
 
     if chunk.id == "FORM" {
@@ -492,17 +488,14 @@ fn print_page_chunk_line(
     Ok(())
 }
 
-fn print_text_chunk(
-    bytes: &[u8],
-    page_chunk: &PageChunk<'_>,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn print_text_chunk(bytes: &[u8], page_chunk: &PageChunk<'_>) -> anyhow::Result<()> {
     let chunk = &page_chunk.chunk;
     let encoded = &bytes[chunk.data_start..chunk.data_end];
     let decoded;
     let payload = match page_chunk.kind {
         PageChunkKind::Txta => encoded,
         PageChunkKind::Txtz => {
-            decoded = decode_bzz_with_local_tool(encoded).map_err(std::io::Error::other)?;
+            decoded = decode_bzz_with_local_tool(encoded)?;
             &decoded
         }
         _ => return Ok(()),
@@ -559,54 +552,37 @@ fn format_include_payload(
     )
 }
 
-fn decode_document_directory_tail(
-    bytes: &[u8],
-    document: &Document<'_>,
-) -> std::result::Result<Option<Vec<u8>>, String> {
-    let Some(dirm) = &document.directory else {
-        return Ok(None);
-    };
-    let tail = dirm
-        .compressed_tail(bytes)
-        .map_err(|error| error.to_string())?;
-
-    decode_bzz_with_local_tool(tail).map(Some)
+fn decode_dirm_tail(bytes: &[u8], dirm: &Dirm) -> anyhow::Result<Vec<u8>> {
+    let tail = dirm.compressed_tail(bytes)?;
+    decode_bzz_with_local_tool(tail)
 }
 
-fn decode_bzz_with_local_tool(bytes: &[u8]) -> std::result::Result<Vec<u8>, String> {
+fn decode_bzz_with_local_tool(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     let temp_dir = std::env::temp_dir();
     let unique = format!("djvulpes-dirm-{}-{:p}", std::process::id(), bytes.as_ptr());
     let input_path = temp_dir.join(format!("{unique}.bzz"));
     let output_path = temp_dir.join(format!("{unique}.raw"));
 
-    fs::write(&input_path, bytes).map_err(|error| {
-        format!(
-            "could not write {}: {error}",
-            input_path.as_path().display()
-        )
-    })?;
+    fs::write(&input_path, bytes)
+        .with_context(|| format!("failed to write {}", input_path.as_path().display()))?;
 
     let output = Command::new("bzz")
         .arg("-d")
         .arg(&input_path)
         .arg(&output_path)
         .output()
-        .map_err(|error| format!("could not run bzz: {error}"))?;
+        .context("failed to run bzz")?;
 
     let _ = fs::remove_file(&input_path);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = fs::remove_file(&output_path);
-        return Err(format!("bzz exited with {}: {stderr}", output.status));
+        bail!("bzz exited with {}: {stderr}", output.status);
     }
 
-    let decoded = fs::read(&output_path).map_err(|error| {
-        format!(
-            "could not read {}: {error}",
-            output_path.as_path().display()
-        )
-    })?;
+    let decoded = fs::read(&output_path)
+        .with_context(|| format!("failed to read {}", output_path.as_path().display()))?;
     let _ = fs::remove_file(&output_path);
 
     Ok(decoded)
@@ -616,7 +592,7 @@ fn print_include_resolution(
     bytes: &[u8],
     document: &Document<'_>,
     entries: &[DirectoryEntry<'_>],
-) -> Result<()> {
+) -> ParseResult<()> {
     println!();
     println!("first page includes:");
 

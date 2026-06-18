@@ -1,5 +1,5 @@
 use crate::chunk::{Chunk, read_u16_be, read_u32_be, require_range};
-use crate::error::{ParseError, Result};
+use crate::error::{ParseError, ParseResult};
 use std::ops::Range;
 
 #[derive(Debug, Clone)]
@@ -35,7 +35,7 @@ impl Dirm {
     /// # Errors
     ///
     /// Returns an error if the directory range is outside `bytes`.
-    pub fn compressed_tail<'a>(&self, bytes: &'a [u8]) -> Result<&'a [u8]> {
+    pub fn compressed_tail<'a>(&self, bytes: &'a [u8]) -> ParseResult<&'a [u8]> {
         require_range(bytes, self.compressed_tail_start, self.compressed_tail_len)?;
         Ok(&bytes[self.compressed_tail_range()])
     }
@@ -47,7 +47,7 @@ impl Dirm {
 ///
 /// Returns an error if the chunk is too small for the declared directory offset
 /// table.
-pub fn parse_dirm(bytes: &[u8], chunk: &Chunk<'_>) -> Result<Dirm> {
+pub fn parse_dirm(bytes: &[u8], chunk: &Chunk<'_>) -> ParseResult<Dirm> {
     require_range(bytes, chunk.data_start, 3)?;
 
     let flags = bytes[chunk.data_start];
@@ -89,7 +89,7 @@ pub fn parse_dirm(bytes: &[u8], chunk: &Chunk<'_>) -> Result<Dirm> {
 ///
 /// Returns an error if `raw` is too short, if it does not contain enough
 /// null-terminated names, or if a name is not valid UTF-8.
-pub fn parse_dirm_tail<'a>(dirm: &Dirm, raw: &'a [u8]) -> Result<Vec<DirmTailEntry<'a>>> {
+pub fn parse_dirm_tail<'a>(dirm: &Dirm, raw: &'a [u8]) -> ParseResult<Vec<DirmTailEntry<'a>>> {
     let entry_count = usize::from(dirm.entry_count);
 
     if dirm.offsets.len() != entry_count {

@@ -1,5 +1,5 @@
 use crate::chunk::require_range;
-use crate::error::{ParseError, Result};
+use crate::error::{ParseError, ParseResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextPayload<'a> {
@@ -18,7 +18,7 @@ pub struct TextPayload<'a> {
 ///
 /// Returns an error if the payload is truncated or if the declared text bytes
 /// are not valid UTF-8.
-pub fn parse_text_payload(bytes: &[u8]) -> Result<TextPayload<'_>> {
+pub fn parse_text_payload(bytes: &[u8]) -> ParseResult<TextPayload<'_>> {
     require_range(bytes, 0, 3)?;
 
     let text_len = usize::from(bytes[0]) << 16 | usize::from(bytes[1]) << 8 | usize::from(bytes[2]);

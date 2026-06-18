@@ -1,4 +1,4 @@
-use crate::error::{ParseError, Result};
+use crate::error::{ParseError, ParseResult};
 
 pub const DJVU_MAGIC: &[u8; 4] = b"AT&T";
 
@@ -24,7 +24,7 @@ pub struct Form<'a> {
 ///
 /// Returns an error if the byte slice is truncated, does not start with the
 /// `DjVu` magic bytes, or has an unsupported root form kind.
-pub fn parse_document_root(bytes: &[u8]) -> Result<Form<'_>> {
+pub fn parse_document_root(bytes: &[u8]) -> ParseResult<Form<'_>> {
     require_range(bytes, 0, 4)?;
     if &bytes[0..4] != DJVU_MAGIC {
         return Err(ParseError("missing DjVu magic bytes `AT&T`".to_string()));
@@ -45,7 +45,7 @@ pub fn parse_document_root(bytes: &[u8]) -> Result<Form<'_>> {
 ///
 /// Returns an error if the chunk is truncated, is not a `FORM`, or is too small
 /// to contain its four-byte form kind.
-pub fn parse_form_at(bytes: &[u8], start: usize) -> Result<Form<'_>> {
+pub fn parse_form_at(bytes: &[u8], start: usize) -> ParseResult<Form<'_>> {
     let chunk = parse_chunk_at(bytes, start)?;
     if chunk.id != "FORM" {
         return Err(ParseError(format!(
@@ -74,7 +74,7 @@ pub fn parse_form_at(bytes: &[u8], start: usize) -> Result<Form<'_>> {
 ///
 /// Returns an error if any child chunk is malformed or extends beyond the
 /// supplied parent range.
-pub fn parse_chunks(bytes: &[u8], start: usize, end: usize) -> Result<Vec<Chunk<'_>>> {
+pub fn parse_chunks(bytes: &[u8], start: usize, end: usize) -> ParseResult<Vec<Chunk<'_>>> {
     let mut chunks = Vec::new();
     let mut cursor = start;
 
@@ -101,7 +101,7 @@ pub fn parse_chunks(bytes: &[u8], start: usize, end: usize) -> Result<Vec<Chunk<
 ///
 /// Returns an error if the chunk header, payload, or required padding byte is
 /// outside the available byte slice.
-pub fn parse_chunk_at(bytes: &[u8], start: usize) -> Result<Chunk<'_>> {
+pub fn parse_chunk_at(bytes: &[u8], start: usize) -> ParseResult<Chunk<'_>> {
     require_range(bytes, start, 8)?;
 
     let id = ascii_tag(bytes, start)?;
@@ -126,23 +126,23 @@ pub fn parse_chunk_at(bytes: &[u8], start: usize) -> Result<Chunk<'_>> {
     })
 }
 
-fn ascii_tag(bytes: &[u8], start: usize) -> Result<&str> {
+fn ascii_tag(bytes: &[u8], start: usize) -> ParseResult<&str> {
     require_range(bytes, start, 4)?;
     std::str::from_utf8(&bytes[start..start + 4])
         .map_err(|_| ParseError(format!("non-ASCII chunk tag at offset {start}")))
 }
 
-pub fn read_u16_be(bytes: &[u8], start: usize) -> Result<u16> {
+pub fn read_u16_be(bytes: &[u8], start: usize) -> ParseResult<u16> {
     require_range(bytes, start, 2)?;
     Ok(u16::from_be_bytes([bytes[start], bytes[start + 1]]))
 }
 
-pub fn read_u16_le(bytes: &[u8], start: usize) -> Result<u16> {
+pub fn read_u16_le(bytes: &[u8], start: usize) -> ParseResult<u16> {
     require_range(bytes, start, 2)?;
     Ok(u16::from_le_bytes([bytes[start], bytes[start + 1]]))
 }
 
-pub fn read_u32_be(bytes: &[u8], start: usize) -> Result<u32> {
+pub fn read_u32_be(bytes: &[u8], start: usize) -> ParseResult<u32> {
     require_range(bytes, start, 4)?;
     Ok(u32::from_be_bytes([
         bytes[start],
@@ -152,12 +152,12 @@ pub fn read_u32_be(bytes: &[u8], start: usize) -> Result<u32> {
     ]))
 }
 
-fn checked_add(lhs: usize, rhs: usize) -> Result<usize> {
+fn checked_add(lhs: usize, rhs: usize) -> ParseResult<usize> {
     lhs.checked_add(rhs)
         .ok_or_else(|| ParseError("offset overflow".to_string()))
 }
 
-pub fn require_range(bytes: &[u8], start: usize, len: usize) -> Result<()> {
+pub fn require_range(bytes: &[u8], start: usize, len: usize) -> ParseResult<()> {
     let end = checked_add(start, len)?;
     if end > bytes.len() {
         return Err(ParseError(format!(

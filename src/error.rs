@@ -1,8 +1,7 @@
-use std::fmt;
+pub type ParseResult<T> = std::result::Result<T, ParseError>;
 
-pub type Result<T> = std::result::Result<T, ParseError>;
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 pub struct ParseError(pub(crate) String);
 
 impl ParseError {
@@ -11,11 +10,3 @@ impl ParseError {
         &self.0
     }
 }
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ParseError {}

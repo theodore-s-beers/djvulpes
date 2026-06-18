@@ -15,7 +15,7 @@ pub use document::{
     DirectoryEntry, Document, DocumentForm, DocumentFormKind, FormKindCounts, Page, Pages,
     RootChunkCounts,
 };
-pub use error::{ParseError, Result};
+pub use error::{ParseError, ParseResult};
 pub use info::{PageInfo, read_page_info};
 pub use page::{PageChunk, PageChunkKind, PageChunkPayload, PageDetails, read_page_details};
 pub use text::{TextPayload, parse_text_payload};

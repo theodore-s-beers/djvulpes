@@ -4,6 +4,6 @@
 mod cli;
 mod commands;
 
-fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn main() -> anyhow::Result<()> {
     cli::run()
 }
