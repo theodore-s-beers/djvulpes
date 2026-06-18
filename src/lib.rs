@@ -7,6 +7,7 @@ pub(crate) mod document;
 pub(crate) mod error;
 pub(crate) mod info;
 pub(crate) mod page;
+pub(crate) mod text;
 
 pub use chunk::{Chunk, Form, parse_chunk_at, parse_chunks, parse_document_root, parse_form_at};
 pub use dirm::{Dirm, DirmTailEntry, parse_dirm, parse_dirm_tail};
@@ -17,3 +18,4 @@ pub use document::{
 pub use error::{ParseError, Result};
 pub use info::{PageInfo, read_page_info};
 pub use page::{PageChunk, PageChunkKind, PageChunkPayload, PageDetails, read_page_details};
+pub use text::{TextPayload, parse_text_payload};

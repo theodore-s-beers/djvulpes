@@ -1,6 +1,7 @@
 use djvulpes::{
-    Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkPayload, Result,
-    parse_chunks, parse_dirm_tail, parse_form_at, read_page_details,
+    Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkKind,
+    PageChunkPayload, Result, parse_chunks, parse_dirm_tail, parse_form_at, parse_text_payload,
+    read_page_details,
 };
 use std::fs;
 use std::path::Path;
@@ -225,6 +226,52 @@ pub fn run_page(path: &Path, number: usize) -> std::result::Result<(), Box<dyn s
     Ok(())
 }
 
+pub fn run_text(path: &Path, number: usize) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if number == 0 {
+        return Err("page number must be 1 or greater".into());
+    }
+
+    let bytes = fs::read(path)?;
+    let document = Document::parse(&bytes)?;
+    let Some(document_form) = document
+        .forms
+        .iter()
+        .filter(|form| form.kind == DocumentFormKind::Page)
+        .nth(number - 1)
+    else {
+        return Err(format!(
+            "page {number} not found; document has {} pages",
+            document.form_kind_counts().pages
+        )
+        .into());
+    };
+    let details = read_page_details(&bytes, &document_form.form)?;
+
+    println!("file: {}", path.display());
+    println!("page: {number}");
+    println!(
+        "form: @{} FORM:{} size={}",
+        document_form.offset, details.form.kind, details.form.chunk.size
+    );
+
+    let mut found_text = false;
+    for chunk in details
+        .chunks
+        .iter()
+        .filter(|chunk| matches!(chunk.kind, PageChunkKind::Txta | PageChunkKind::Txtz))
+    {
+        found_text = true;
+        print_text_chunk(&bytes, chunk)?;
+    }
+
+    if !found_text {
+        println!();
+        println!("text: none");
+    }
+
+    Ok(())
+}
+
 fn print_root_chunk_counts(document: &Document<'_>, bytes: &[u8]) -> Result<()> {
     let counts = document.root_chunk_counts(bytes)?;
     println!(
@@ -440,6 +487,42 @@ fn print_page_chunk_line(
             chunk.data_end,
             format_page_chunk_payload(page_chunk, directory_context)
         );
+    }
+
+    Ok(())
+}
+
+fn print_text_chunk(
+    bytes: &[u8],
+    page_chunk: &PageChunk<'_>,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let chunk = &page_chunk.chunk;
+    let encoded = &bytes[chunk.data_start..chunk.data_end];
+    let decoded;
+    let payload = match page_chunk.kind {
+        PageChunkKind::Txta => encoded,
+        PageChunkKind::Txtz => {
+            decoded = decode_bzz_with_local_tool(encoded).map_err(std::io::Error::other)?;
+            &decoded
+        }
+        _ => return Ok(()),
+    };
+    let parsed = parse_text_payload(payload)?;
+
+    println!();
+    println!(
+        "{}: @{} size={} decoded_bytes={} text_bytes={} zone_bytes={}",
+        chunk.id,
+        chunk.data_start - 8,
+        chunk.size,
+        payload.len(),
+        parsed.text_len,
+        parsed.zone_data.len()
+    );
+    println!();
+    print!("{}", parsed.text);
+    if !parsed.text.ends_with('\n') {
+        println!();
     }
 
     Ok(())

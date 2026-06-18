@@ -1,4 +1,4 @@
-use crate::commands::{run_dirm, run_form, run_forms, run_page, run_pages, run_summary};
+use crate::commands::{run_dirm, run_form, run_forms, run_page, run_pages, run_summary, run_text};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -48,6 +48,12 @@ enum Command {
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
+    /// Extract hidden text from one page by 1-based page number.
+    Text {
+        number: usize,
+        #[arg(default_value = DEFAULT_FILE)]
+        file: PathBuf,
+    },
 }
 
 pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -60,6 +66,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Command::Form { offset, file } => run_form(&file, offset)?,
         Command::Dirm { file } => run_dirm(&file)?,
         Command::Page { number, file } => run_page(&file, number)?,
+        Command::Text { number, file } => run_text(&file, number)?,
     }
 
     Ok(())
