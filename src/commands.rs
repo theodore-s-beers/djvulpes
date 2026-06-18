@@ -1,8 +1,8 @@
 use anyhow::{Context, bail};
 use djvulpes::{
     Chunk, DirectoryEntry, Dirm, Document, DocumentFormKind, Form, PageChunk, PageChunkKind,
-    PageChunkPayload, ParseResult, parse_chunks, parse_dirm_tail, parse_form_at,
-    parse_text_payload, read_page_details,
+    PageChunkPayload, ParseResult, TextZone, parse_chunks, parse_dirm_tail, parse_form_at,
+    parse_text_payload, parse_text_zones, read_page_details,
 };
 use std::fs;
 use std::path::Path;
@@ -219,7 +219,7 @@ pub fn run_page(path: &Path, number: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run_text(path: &Path, number: usize) -> anyhow::Result<()> {
+pub fn run_text(path: &Path, number: usize, show_zones: bool) -> anyhow::Result<()> {
     if number == 0 {
         bail!("page number must be 1 or greater");
     }
@@ -253,7 +253,7 @@ pub fn run_text(path: &Path, number: usize) -> anyhow::Result<()> {
         .filter(|chunk| matches!(chunk.kind, PageChunkKind::Txta | PageChunkKind::Txtz))
     {
         found_text = true;
-        print_text_chunk(&bytes, chunk)?;
+        print_text_chunk(&bytes, chunk, show_zones)?;
     }
 
     if !found_text {
@@ -488,7 +488,11 @@ fn print_page_chunk_line(
     Ok(())
 }
 
-fn print_text_chunk(bytes: &[u8], page_chunk: &PageChunk<'_>) -> anyhow::Result<()> {
+fn print_text_chunk(
+    bytes: &[u8],
+    page_chunk: &PageChunk<'_>,
+    show_zones: bool,
+) -> anyhow::Result<()> {
     let chunk = &page_chunk.chunk;
     let encoded = &bytes[chunk.data_start..chunk.data_end];
     let decoded;
@@ -518,7 +522,58 @@ fn print_text_chunk(bytes: &[u8], page_chunk: &PageChunk<'_>) -> anyhow::Result<
         println!();
     }
 
+    if show_zones {
+        println!();
+        match parse_text_zones(parsed.zone_data)? {
+            Some(root) => {
+                println!("zones:");
+                print_text_zone(&root, parsed.text, root.height, 0);
+            }
+            None => println!("zones: none"),
+        }
+    }
+
     Ok(())
+}
+
+fn print_text_zone(zone: &TextZone, text: &str, page_height: i32, depth: usize) {
+    let indent = "  ".repeat(depth);
+    println!(
+        "{indent}{} bbox=({}, {}, {}, {}) text=[{}..{}){}",
+        zone.kind.as_str(),
+        zone.x_min(),
+        zone.y_min(page_height),
+        zone.x_max(),
+        zone.y_max(page_height),
+        zone.text_start,
+        zone.text_end(),
+        format_zone_text(zone, text)
+    );
+
+    for child in &zone.children {
+        print_text_zone(child, text, page_height, depth + 1);
+    }
+}
+
+fn format_zone_text(zone: &TextZone, text: &str) -> String {
+    let Some(slice) = text.get(zone.text_start..zone.text_end()) else {
+        return String::new();
+    };
+    if slice.is_empty() {
+        return String::new();
+    }
+
+    let mut excerpt = String::new();
+    for (index, character) in slice.chars().enumerate() {
+        if index == 80 {
+            excerpt.push_str("...");
+            break;
+        }
+        excerpt.push(character);
+    }
+
+    let escaped = excerpt.escape_debug().to_string();
+    format!(" \"{escaped}\"")
 }
 
 fn format_page_chunk_payload(

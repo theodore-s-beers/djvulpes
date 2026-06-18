@@ -51,6 +51,8 @@ enum Command {
     /// Extract hidden text from one page by 1-based page number.
     Text {
         number: usize,
+        #[arg(long)]
+        zones: bool,
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
@@ -66,7 +68,11 @@ pub fn run() -> anyhow::Result<()> {
         Command::Form { offset, file } => run_form(&file, offset)?,
         Command::Dirm { file } => run_dirm(&file)?,
         Command::Page { number, file } => run_page(&file, number)?,
-        Command::Text { number, file } => run_text(&file, number)?,
+        Command::Text {
+            number,
+            zones,
+            file,
+        } => run_text(&file, number, zones)?,
     }
 
     Ok(())
