@@ -1,0 +1,318 @@
+#![forbid(unsafe_code)]
+#![warn(clippy::pedantic, clippy::nursery)]
+
+use std::fmt;
+
+const DJVU_MAGIC: &[u8; 4] = b"AT&T";
+
+pub type Result<T> = std::result::Result<T, ParseError>;
+
+#[derive(Debug)]
+pub struct ParseError(String);
+
+impl ParseError {
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+#[derive(Debug, Clone)]
+pub struct Chunk<'a> {
+    pub id: &'a str,
+    pub size: u32,
+    pub data_start: usize,
+    pub data_end: usize,
+    pub next_start: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Form<'a> {
+    pub chunk: Chunk<'a>,
+    pub kind: &'a str,
+    pub children_start: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Dirm {
+    pub flags: u8,
+    pub entry_count: u16,
+    pub offsets: Vec<u32>,
+    pub compressed_tail_len: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PageInfo {
+    pub width: u16,
+    pub height: u16,
+    pub version: u8,
+    pub dpi: u16,
+    pub gamma: f32,
+    pub rotation: u8,
+}
+
+/// Parses the top-level `DjVu` document `FORM`.
+///
+/// # Errors
+///
+/// Returns an error if the byte slice is truncated, does not start with the
+/// `DjVu` magic bytes, or has an unsupported root form kind.
+pub fn parse_document_root(bytes: &[u8]) -> Result<Form<'_>> {
+    require_range(bytes, 0, 4)?;
+    if &bytes[0..4] != DJVU_MAGIC {
+        return Err(ParseError("missing DjVu magic bytes `AT&T`".to_string()));
+    }
+
+    let root = parse_form_at(bytes, 4)?;
+    match root.kind {
+        "DJVU" | "DJVM" => Ok(root),
+        other => Err(ParseError(format!(
+            "unexpected DjVu root FORM kind `{other}`"
+        ))),
+    }
+}
+
+/// Parses a `FORM` chunk at an absolute byte offset.
+///
+/// # Errors
+///
+/// Returns an error if the chunk is truncated, is not a `FORM`, or is too small
+/// to contain its four-byte form kind.
+pub fn parse_form_at(bytes: &[u8], start: usize) -> Result<Form<'_>> {
+    let chunk = parse_chunk_at(bytes, start)?;
+    if chunk.id != "FORM" {
+        return Err(ParseError(format!(
+            "expected FORM at offset {start}, found {}",
+            chunk.id
+        )));
+    }
+
+    if chunk.size < 4 {
+        return Err(ParseError(format!(
+            "FORM at offset {start} is too small to contain a form kind"
+        )));
+    }
+
+    let kind = ascii_tag(bytes, chunk.data_start)?;
+    Ok(Form {
+        children_start: chunk.data_start + 4,
+        chunk,
+        kind,
+    })
+}
+
+/// Parses sibling chunks in the half-open byte range `start..end`.
+///
+/// # Errors
+///
+/// Returns an error if any child chunk is malformed or extends beyond the
+/// supplied parent range.
+pub fn parse_chunks(bytes: &[u8], start: usize, end: usize) -> Result<Vec<Chunk<'_>>> {
+    let mut chunks = Vec::new();
+    let mut cursor = start;
+
+    while cursor < end {
+        let chunk = parse_chunk_at(bytes, cursor)?;
+        if chunk.data_end > end {
+            return Err(ParseError(format!(
+                "chunk {} at offset {cursor} extends past parent end {end}",
+                chunk.id
+            )));
+        }
+
+        let next_start = chunk.next_start;
+        chunks.push(chunk);
+        cursor = next_start;
+    }
+
+    Ok(chunks)
+}
+
+/// Parses one chunk at an absolute byte offset.
+///
+/// # Errors
+///
+/// Returns an error if the chunk header, payload, or required padding byte is
+/// outside the available byte slice.
+pub fn parse_chunk_at(bytes: &[u8], start: usize) -> Result<Chunk<'_>> {
+    require_range(bytes, start, 8)?;
+
+    let id = ascii_tag(bytes, start)?;
+    let size = read_u32_be(bytes, start + 4)?;
+    let data_start = start + 8;
+    let data_end = checked_add(data_start, size as usize)?;
+    require_range(bytes, data_start, size as usize)?;
+
+    let next_start = checked_add(data_end, (size & 1) as usize)?;
+    if next_start > bytes.len() {
+        return Err(ParseError(format!(
+            "chunk {id} at offset {start} has invalid padding"
+        )));
+    }
+
+    Ok(Chunk {
+        id,
+        size,
+        data_start,
+        data_end,
+        next_start,
+    })
+}
+
+/// Parses the currently understood, uncompressed prefix of a `DIRM` chunk.
+///
+/// # Errors
+///
+/// Returns an error if the chunk is too small for the declared directory offset
+/// table.
+pub fn parse_dirm(bytes: &[u8], chunk: &Chunk<'_>) -> Result<Dirm> {
+    require_range(bytes, chunk.data_start, 3)?;
+
+    let flags = bytes[chunk.data_start];
+    let entry_count = read_u16_be(bytes, chunk.data_start + 1)?;
+    let offsets_start = chunk.data_start + 3;
+    let offsets_len = usize::from(entry_count) * 4;
+    let compressed_tail_start = checked_add(offsets_start, offsets_len)?;
+
+    if compressed_tail_start > chunk.data_end {
+        return Err(ParseError(format!(
+            "DIRM declares {entry_count} entries, but the chunk is too small for their offsets"
+        )));
+    }
+
+    let mut offsets = Vec::with_capacity(usize::from(entry_count));
+    for index in 0..usize::from(entry_count) {
+        offsets.push(read_u32_be(bytes, offsets_start + index * 4)?);
+    }
+
+    Ok(Dirm {
+        flags,
+        entry_count,
+        offsets,
+        compressed_tail_len: chunk.data_end - compressed_tail_start,
+    })
+}
+
+/// Reads the first `INFO` chunk from a `FORM:DJVU` page, if present.
+///
+/// # Errors
+///
+/// Returns an error if the page form's child chunk stream is malformed.
+pub fn read_page_info(bytes: &[u8], form: &Form<'_>) -> Result<Option<PageInfo>> {
+    if form.kind != "DJVU" {
+        return Ok(None);
+    }
+
+    let children = parse_chunks(bytes, form.children_start, form.chunk.data_end)?;
+    let Some(info_chunk) = children.first().filter(|chunk| chunk.id == "INFO") else {
+        return Ok(None);
+    };
+
+    if info_chunk.size < 10 {
+        return Ok(None);
+    }
+
+    let start = info_chunk.data_start;
+    Ok(Some(PageInfo {
+        width: read_u16_be(bytes, start)?,
+        height: read_u16_be(bytes, start + 2)?,
+        version: bytes[start + 4],
+        dpi: read_u16_be(bytes, start + 5)?,
+        gamma: f32::from(bytes[start + 8]) / 10.0,
+        rotation: bytes[start + 9],
+    }))
+}
+
+fn ascii_tag(bytes: &[u8], start: usize) -> Result<&str> {
+    require_range(bytes, start, 4)?;
+    std::str::from_utf8(&bytes[start..start + 4])
+        .map_err(|_| ParseError(format!("non-ASCII chunk tag at offset {start}")))
+}
+
+fn read_u16_be(bytes: &[u8], start: usize) -> Result<u16> {
+    require_range(bytes, start, 2)?;
+    Ok(u16::from_be_bytes([bytes[start], bytes[start + 1]]))
+}
+
+fn read_u32_be(bytes: &[u8], start: usize) -> Result<u32> {
+    require_range(bytes, start, 4)?;
+    Ok(u32::from_be_bytes([
+        bytes[start],
+        bytes[start + 1],
+        bytes[start + 2],
+        bytes[start + 3],
+    ]))
+}
+
+fn checked_add(lhs: usize, rhs: usize) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| ParseError("offset overflow".to_string()))
+}
+
+fn require_range(bytes: &[u8], start: usize, len: usize) -> Result<()> {
+    let end = checked_add(start, len)?;
+    if end > bytes.len() {
+        return Err(ParseError(format!(
+            "need bytes [{start}..{end}), but file only has {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_document_root_accepts_minimal_multipage_document() {
+        let bytes = b"AT&TFORM\0\0\0\x04DJVM";
+
+        let root = parse_document_root(bytes).expect("minimal root should parse");
+
+        assert_eq!(root.kind, "DJVM");
+        assert_eq!(root.children_start, 16);
+        assert_eq!(root.chunk.data_end, 16);
+    }
+
+    #[test]
+    fn parse_form_rejects_size_too_small_for_form_kind() {
+        let bytes = b"FORM\0\0\0\x03ABC!";
+
+        let error = parse_form_at(bytes, 0).expect_err("undersized FORM should fail");
+
+        assert!(error.message().contains("too small"));
+    }
+
+    #[test]
+    fn parse_chunks_accepts_final_child_padding_after_parent_data() {
+        let bytes = b"ABCD\0\0\0\x01Z\0";
+
+        let chunks = parse_chunks(bytes, 0, 9).expect("final padding may sit after parent data");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].data_end, 9);
+        assert_eq!(chunks[0].next_start, 10);
+    }
+
+    #[test]
+    fn parse_chunks_accepts_odd_child_with_padding_inside_parent() {
+        let bytes = b"ABCD\0\0\0\x01Z\0";
+
+        let chunks = parse_chunks(bytes, 0, 10).expect("padded odd chunk should parse");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].id, "ABCD");
+        assert_eq!(chunks[0].data_start, 8);
+        assert_eq!(chunks[0].data_end, 9);
+        assert_eq!(chunks[0].next_start, 10);
+    }
+}

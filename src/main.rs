@@ -3,58 +3,12 @@
 #![allow(clippy::similar_names, clippy::uninlined_format_args)]
 
 use std::env;
-use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 
-const DJVU_MAGIC: &[u8; 4] = b"AT&T";
-
-type Result<T> = std::result::Result<T, ParseError>;
-
-#[derive(Debug)]
-struct ParseError(String);
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ParseError {}
-
-#[derive(Debug, Clone)]
-struct Chunk<'a> {
-    id: &'a str,
-    size: u32,
-    data_start: usize,
-    data_end: usize,
-    next_start: usize,
-}
-
-#[derive(Debug, Clone)]
-struct Form<'a> {
-    chunk: Chunk<'a>,
-    kind: &'a str,
-    children_start: usize,
-}
-
-#[derive(Debug, Clone)]
-struct Dirm {
-    flags: u8,
-    entry_count: u16,
-    offsets: Vec<u32>,
-    compressed_tail_len: usize,
-}
-
-#[derive(Debug, Clone)]
-struct PageInfo {
-    width: u16,
-    height: u16,
-    version: u8,
-    dpi: u16,
-    gamma: f32,
-    rotation: u8,
-}
+use djvulpes::{
+    Chunk, Result, parse_chunks, parse_dirm, parse_document_root, parse_form_at, read_page_info,
+};
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let path = input_path();
@@ -82,6 +36,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn input_path() -> PathBuf {
+    env::args_os()
+        .nth(1)
+        .map_or_else(|| PathBuf::from("Rypka-HIL.djvu"), PathBuf::from)
 }
 
 fn print_root_chunk_counts(bytes: &[u8], chunks: &[Chunk<'_>]) -> Result<()> {
@@ -155,91 +115,6 @@ fn print_chunk_line(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
     Ok(())
 }
 
-fn input_path() -> PathBuf {
-    env::args_os()
-        .nth(1)
-        .map_or_else(|| PathBuf::from("Rypka-HIL.djvu"), PathBuf::from)
-}
-
-fn parse_document_root(bytes: &[u8]) -> Result<Form<'_>> {
-    require_range(bytes, 0, 4)?;
-    if &bytes[0..4] != DJVU_MAGIC {
-        return Err(ParseError("missing DjVu magic bytes `AT&T`".to_string()));
-    }
-
-    let root = parse_form_at(bytes, 4)?;
-    match root.kind {
-        "DJVU" | "DJVM" => Ok(root),
-        other => Err(ParseError(format!(
-            "unexpected DjVu root FORM kind `{other}`"
-        ))),
-    }
-}
-
-fn parse_form_at(bytes: &[u8], start: usize) -> Result<Form<'_>> {
-    let chunk = parse_chunk_at(bytes, start)?;
-    if chunk.id != "FORM" {
-        return Err(ParseError(format!(
-            "expected FORM at offset {start}, found {}",
-            chunk.id
-        )));
-    }
-
-    require_range(bytes, chunk.data_start, 4)?;
-    let kind = ascii_tag(bytes, chunk.data_start)?;
-    Ok(Form {
-        children_start: chunk.data_start + 4,
-        chunk,
-        kind,
-    })
-}
-
-fn parse_chunks(bytes: &[u8], start: usize, end: usize) -> Result<Vec<Chunk<'_>>> {
-    let mut chunks = Vec::new();
-    let mut cursor = start;
-
-    while cursor < end {
-        let chunk = parse_chunk_at(bytes, cursor)?;
-        if chunk.data_end > end {
-            return Err(ParseError(format!(
-                "chunk {} at offset {cursor} extends past parent end {end}",
-                chunk.id
-            )));
-        }
-
-        let next_start = chunk.next_start;
-        chunks.push(chunk);
-        cursor = next_start;
-    }
-
-    Ok(chunks)
-}
-
-fn parse_chunk_at(bytes: &[u8], start: usize) -> Result<Chunk<'_>> {
-    require_range(bytes, start, 8)?;
-
-    let id = ascii_tag(bytes, start)?;
-    let size = read_u32_be(bytes, start + 4)?;
-    let data_start = start + 8;
-    let data_end = checked_add(data_start, size as usize)?;
-    require_range(bytes, data_start, size as usize)?;
-
-    let next_start = checked_add(data_end, (size & 1) as usize)?;
-    if next_start > bytes.len() {
-        return Err(ParseError(format!(
-            "chunk {id} at offset {start} has invalid padding"
-        )));
-    }
-
-    Ok(Chunk {
-        id,
-        size,
-        data_start,
-        data_end,
-        next_start,
-    })
-}
-
 fn print_dirm_summary(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
     let dirm = parse_dirm(bytes, chunk)?;
     println!("DIRM:");
@@ -256,8 +131,15 @@ fn print_dirm_summary(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
     );
 
     let mut forms = Vec::new();
+    let mut unresolved_offsets = 0;
     for offset in &dirm.offsets {
-        let Ok(form) = parse_form_at(bytes, *offset as usize) else {
+        let Ok(offset_start) = usize::try_from(*offset) else {
+            unresolved_offsets += 1;
+            continue;
+        };
+
+        let Ok(form) = parse_form_at(bytes, offset_start) else {
+            unresolved_offsets += 1;
             continue;
         };
         forms.push((*offset, form));
@@ -270,6 +152,7 @@ fn print_dirm_summary(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
         "  referenced forms: {} DJVU pages, {} DJVI shared, {} THUM thumbnails",
         page_count, shared_count, thumbnail_count
     );
+    println!("  unresolved offsets: {unresolved_offsets}");
 
     println!();
     println!("first referenced forms:");
@@ -292,95 +175,5 @@ fn print_dirm_summary(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
         println!();
     }
 
-    Ok(())
-}
-
-fn parse_dirm(bytes: &[u8], chunk: &Chunk<'_>) -> Result<Dirm> {
-    require_range(bytes, chunk.data_start, 3)?;
-
-    let flags = bytes[chunk.data_start];
-    let entry_count = read_u16_be(bytes, chunk.data_start + 1)?;
-    let offsets_start = chunk.data_start + 3;
-    let offsets_len = entry_count as usize * 4;
-    let compressed_tail_start = checked_add(offsets_start, offsets_len)?;
-
-    if compressed_tail_start > chunk.data_end {
-        return Err(ParseError(format!(
-            "DIRM declares {entry_count} entries, but the chunk is too small for their offsets"
-        )));
-    }
-
-    let mut offsets = Vec::with_capacity(entry_count as usize);
-    for index in 0..entry_count as usize {
-        offsets.push(read_u32_be(bytes, offsets_start + index * 4)?);
-    }
-
-    Ok(Dirm {
-        flags,
-        entry_count,
-        offsets,
-        compressed_tail_len: chunk.data_end - compressed_tail_start,
-    })
-}
-
-fn read_page_info(bytes: &[u8], form: &Form<'_>) -> Result<Option<PageInfo>> {
-    if form.kind != "DJVU" {
-        return Ok(None);
-    }
-
-    let children = parse_chunks(bytes, form.children_start, form.chunk.data_end)?;
-    let Some(info_chunk) = children.first().filter(|chunk| chunk.id == "INFO") else {
-        return Ok(None);
-    };
-
-    if info_chunk.size < 10 {
-        return Ok(None);
-    }
-
-    let start = info_chunk.data_start;
-    Ok(Some(PageInfo {
-        width: read_u16_be(bytes, start)?,
-        height: read_u16_be(bytes, start + 2)?,
-        version: bytes[start + 4],
-        dpi: read_u16_be(bytes, start + 5)?,
-        gamma: f32::from(bytes[start + 8]) / 10.0,
-        rotation: bytes[start + 9],
-    }))
-}
-
-fn ascii_tag(bytes: &[u8], start: usize) -> Result<&str> {
-    require_range(bytes, start, 4)?;
-    std::str::from_utf8(&bytes[start..start + 4])
-        .map_err(|_| ParseError(format!("non-ASCII chunk tag at offset {start}")))
-}
-
-fn read_u16_be(bytes: &[u8], start: usize) -> Result<u16> {
-    require_range(bytes, start, 2)?;
-    Ok(u16::from_be_bytes([bytes[start], bytes[start + 1]]))
-}
-
-fn read_u32_be(bytes: &[u8], start: usize) -> Result<u32> {
-    require_range(bytes, start, 4)?;
-    Ok(u32::from_be_bytes([
-        bytes[start],
-        bytes[start + 1],
-        bytes[start + 2],
-        bytes[start + 3],
-    ]))
-}
-
-fn checked_add(lhs: usize, rhs: usize) -> Result<usize> {
-    lhs.checked_add(rhs)
-        .ok_or_else(|| ParseError("offset overflow".to_string()))
-}
-
-fn require_range(bytes: &[u8], start: usize, len: usize) -> Result<()> {
-    let end = checked_add(start, len)?;
-    if end > bytes.len() {
-        return Err(ParseError(format!(
-            "need bytes [{start}..{end}), but file only has {} bytes",
-            bytes.len()
-        )));
-    }
     Ok(())
 }
