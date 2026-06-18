@@ -137,6 +137,11 @@ pub fn read_u16_be(bytes: &[u8], start: usize) -> Result<u16> {
     Ok(u16::from_be_bytes([bytes[start], bytes[start + 1]]))
 }
 
+pub fn read_u16_le(bytes: &[u8], start: usize) -> Result<u16> {
+    require_range(bytes, start, 2)?;
+    Ok(u16::from_le_bytes([bytes[start], bytes[start + 1]]))
+}
+
 pub fn read_u32_be(bytes: &[u8], start: usize) -> Result<u32> {
     require_range(bytes, start, 4)?;
     Ok(u32::from_be_bytes([
