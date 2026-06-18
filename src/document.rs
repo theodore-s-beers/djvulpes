@@ -2,6 +2,7 @@ use crate::chunk::{Chunk, Form, parse_chunks, parse_document_root, parse_form_at
 use crate::dirm::{Dirm, parse_dirm};
 use crate::error::Result;
 use crate::info::{PageInfo, read_page_info};
+use crate::page::{PageDetails, read_page_details};
 
 #[derive(Debug, Clone)]
 pub struct Document<'a> {
@@ -32,6 +33,17 @@ pub struct Page<'a> {
     pub offset: u32,
     pub form: Form<'a>,
     pub info: Option<PageInfo>,
+}
+
+impl<'a> Page<'a> {
+    /// Reads typed structural details for this page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the page form's child chunk stream is malformed.
+    pub fn details(&self, bytes: &'a [u8]) -> Result<PageDetails<'a>> {
+        read_page_details(bytes, &self.form)
+    }
 }
 
 impl<'a> Document<'a> {

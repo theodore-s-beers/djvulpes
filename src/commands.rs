@@ -1,5 +1,6 @@
 use djvulpes::{
-    Chunk, Document, DocumentFormKind, Form, Result, parse_chunks, parse_form_at, read_page_info,
+    Chunk, Document, DocumentFormKind, Form, PageChunkKind, Result, parse_form_at,
+    read_page_details,
 };
 use std::fs;
 use std::path::Path;
@@ -110,7 +111,7 @@ pub fn run_page(path: &Path, number: usize) -> std::result::Result<(), Box<dyn s
 
     println!("file: {}", path.display());
     println!("page: {number}");
-    print_form_detail(&bytes, &document_form.form, document_form.offset)?;
+    print_page_detail(&bytes, &document_form.form, document_form.offset)?;
 
     Ok(())
 }
@@ -224,13 +225,18 @@ fn print_dirm_summary(document: &Document<'_>, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn print_form_detail(bytes: &[u8], form: &Form<'_>, offset: u32) -> Result<()> {
+fn print_page_detail(bytes: &[u8], form: &Form<'_>, offset: u32) -> Result<()> {
+    let details = read_page_details(bytes, form)?;
+
     println!(
         "form: @{offset} FORM:{} size={} data=[{}..{})",
-        form.kind, form.chunk.size, form.chunk.data_start, form.chunk.data_end
+        details.form.kind,
+        details.form.chunk.size,
+        details.form.chunk.data_start,
+        details.form.chunk.data_end
     );
 
-    if let Some(info) = read_page_info(bytes, form)? {
+    if let Some(info) = details.info {
         println!(
             "INFO: {}x{} dpi={} gamma={:.1} version={} rotation={}",
             info.width, info.height, info.dpi, info.gamma, info.version, info.rotation
@@ -239,8 +245,35 @@ fn print_form_detail(bytes: &[u8], form: &Form<'_>, offset: u32) -> Result<()> {
 
     println!();
     println!("child chunks:");
-    for chunk in parse_chunks(bytes, form.children_start, form.chunk.data_end)? {
-        print_chunk_line(bytes, &chunk)?;
+    for page_chunk in details.chunks {
+        print_page_chunk_line(bytes, &page_chunk.chunk, page_chunk.kind)?;
+    }
+
+    Ok(())
+}
+
+fn print_page_chunk_line(bytes: &[u8], chunk: &Chunk<'_>, kind: PageChunkKind) -> Result<()> {
+    if chunk.id == "FORM" {
+        let form = parse_form_at(bytes, chunk.data_start - 8)?;
+        println!(
+            "    @{:<8} FORM:{:<4} {:<8} size={:<8} data=[{}..{})",
+            chunk.data_start - 8,
+            form.kind,
+            kind.as_str(),
+            form.chunk.size,
+            form.chunk.data_start,
+            form.chunk.data_end
+        );
+    } else {
+        println!(
+            "    @{:<8} {:<4} {:<8} size={:<8} data=[{}..{})",
+            chunk.data_start - 8,
+            chunk.id,
+            kind.as_str(),
+            chunk.size,
+            chunk.data_start,
+            chunk.data_end
+        );
     }
 
     Ok(())
