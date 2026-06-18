@@ -1,6 +1,6 @@
 use djvulpes::{
     Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkPayload, Result,
-    parse_dirm_tail, parse_form_at, read_page_details,
+    parse_chunks, parse_dirm_tail, parse_form_at, read_page_details,
 };
 use std::fs;
 use std::path::Path;
@@ -86,6 +86,37 @@ pub fn run_forms(path: &Path) -> std::result::Result<(), Box<dyn std::error::Err
             document_form.form.chunk.size
         );
     }
+
+    Ok(())
+}
+
+pub fn run_form(path: &Path, offset: usize) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let bytes = fs::read(path)?;
+    let document = Document::parse(&bytes)?;
+    let form = parse_form_at(&bytes, offset)?;
+
+    println!("file: {}", path.display());
+    if let Some(decoded_tail) = decode_document_directory_tail(&bytes, &document)
+        .ok()
+        .flatten()
+        && let Some(dirm) = &document.directory
+    {
+        let entries = parse_dirm_tail(dirm, &decoded_tail)?;
+        let directory_entries = document.directory_entries(&entries);
+        if let Some(entry) = directory_entries
+            .iter()
+            .find(|entry| entry.offset as usize == offset)
+        {
+            println!(
+                "directory: name={} size={} flags=0x{:02x} kind={}",
+                entry.name,
+                entry.size,
+                entry.flags,
+                entry.kind.map_or("-", display_form_kind)
+            );
+        }
+    }
+    print_form_detail(&bytes, &form, offset)?;
 
     Ok(())
 }
@@ -245,6 +276,50 @@ fn print_chunk_line(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
             chunk.size,
             chunk.data_start,
             chunk.data_end
+        );
+    }
+
+    Ok(())
+}
+
+fn print_form_detail(bytes: &[u8], form: &Form<'_>, offset: usize) -> Result<()> {
+    println!(
+        "form: @{offset} FORM:{} size={} data=[{}..{})",
+        form.kind, form.chunk.size, form.chunk.data_start, form.chunk.data_end
+    );
+
+    println!();
+    println!("child chunks:");
+    let chunks = parse_chunks(bytes, form.children_start, form.chunk.data_end)?;
+    for chunk in chunks {
+        print_form_child_chunk_line(bytes, &chunk)?;
+    }
+
+    Ok(())
+}
+
+fn print_form_child_chunk_line(bytes: &[u8], chunk: &Chunk<'_>) -> Result<()> {
+    if chunk.id == "FORM" {
+        let form = parse_form_at(bytes, chunk.data_start - 8)?;
+        println!(
+            "    @{:<8} FORM:{:<4} {:<8} size={:<8} data=[{}..{})",
+            chunk.data_start - 8,
+            form.kind,
+            display_chunk_role(chunk.id, Some(form.kind)),
+            form.chunk.size,
+            form.chunk.data_start,
+            form.chunk.data_end
+        );
+    } else {
+        println!(
+            "    @{:<8} {:<4} {:<8} size={:<8} data=[{}..{}){}",
+            chunk.data_start - 8,
+            chunk.id,
+            display_chunk_role(chunk.id, None),
+            chunk.size,
+            chunk.data_start,
+            chunk.data_end,
+            format_chunk_payload(bytes, chunk)
         );
     }
 
@@ -502,4 +577,33 @@ const fn display_form_kind(kind: DocumentFormKind) -> &'static str {
         DocumentFormKind::Thumbnails => "thumbs",
         DocumentFormKind::Other => "other",
     }
+}
+
+fn display_chunk_role(id: &str, form_kind: Option<&str>) -> &'static str {
+    match (id, form_kind) {
+        ("FORM", Some("DJVU")) => "page",
+        ("FORM", Some("DJVI")) => "shared",
+        ("FORM", Some("THUM")) => "thumbs",
+        ("FORM", _) => "form",
+        ("DIRM", _) => "directory",
+        ("NAVM", _) => "nav",
+        ("INFO", _) => "info",
+        ("INCL", _) => "include",
+        ("Djbz", _) => "djbz",
+        ("Sjbz", _) => "sjbz",
+        ("FG44", _) => "fg44",
+        ("BG44", _) => "bg44",
+        ("TXTa", _) => "txta",
+        ("TXTz", _) => "txtz",
+        _ => "unknown",
+    }
+}
+
+fn format_chunk_payload(bytes: &[u8], chunk: &Chunk<'_>) -> String {
+    if chunk.id != "INCL" {
+        return String::new();
+    }
+
+    std::str::from_utf8(&bytes[chunk.data_start..chunk.data_end])
+        .map_or_else(|_| String::new(), |id| format!(" id={id}"))
 }
