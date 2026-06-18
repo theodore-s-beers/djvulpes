@@ -1,5 +1,5 @@
 use crate::chunk::{Chunk, Form, parse_chunks, parse_document_root, parse_form_at};
-use crate::dirm::{Dirm, parse_dirm};
+use crate::dirm::{Dirm, DirmTailEntry, parse_dirm};
 use crate::error::Result;
 use crate::info::{PageInfo, read_page_info};
 use crate::page::{PageDetails, read_page_details};
@@ -26,6 +26,16 @@ pub enum DocumentFormKind {
     Shared,
     Thumbnails,
     Other,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DirectoryEntry<'a> {
+    pub offset: u32,
+    pub size: u32,
+    pub flags: u8,
+    pub name: &'a str,
+    pub form_index: Option<usize>,
+    pub kind: Option<DocumentFormKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +157,59 @@ impl<'a> Document<'a> {
         }
 
         Ok(counts)
+    }
+
+    #[must_use]
+    pub fn directory_entries<'tail>(
+        &self,
+        tail_entries: &'tail [DirmTailEntry<'tail>],
+    ) -> Vec<DirectoryEntry<'tail>> {
+        tail_entries
+            .iter()
+            .map(|entry| {
+                let form_index = self
+                    .forms
+                    .iter()
+                    .position(|form| form.offset == entry.offset);
+                let kind = form_index.map(|index| self.forms[index].kind);
+
+                DirectoryEntry {
+                    offset: entry.offset,
+                    size: entry.size,
+                    flags: entry.flags,
+                    name: entry.name,
+                    form_index,
+                    kind,
+                }
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn find_directory_entry_by_name<'tail>(
+        &self,
+        tail_entries: &'tail [DirmTailEntry<'tail>],
+        name: &str,
+    ) -> Option<DirectoryEntry<'tail>> {
+        tail_entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| {
+                let form_index = self
+                    .forms
+                    .iter()
+                    .position(|form| form.offset == entry.offset);
+                let kind = form_index.map(|index| self.forms[index].kind);
+
+                DirectoryEntry {
+                    offset: entry.offset,
+                    size: entry.size,
+                    flags: entry.flags,
+                    name: entry.name,
+                    form_index,
+                    kind,
+                }
+            })
     }
 }
 
@@ -316,5 +379,47 @@ mod tests {
 
         assert_eq!(document.forms.len(), 0);
         assert_eq!(document.unresolved_directory_offsets, 1);
+    }
+
+    #[test]
+    fn document_resolves_directory_tail_entries_to_forms() {
+        let shared_form = form(*b"DJVI", &[]);
+        let shared_offset = 36;
+        let page_offset = shared_offset + u32::try_from(shared_form.len()).unwrap();
+
+        let mut forms = shared_form;
+        forms.extend_from_slice(&form(*b"DJVU", &info_chunk()));
+        let bytes = multipage_document_with_directory(&[shared_offset, page_offset], &forms);
+        let document = Document::parse(&bytes).expect("document should parse");
+        let tail_entries = vec![
+            DirmTailEntry {
+                offset: shared_offset,
+                size: 20,
+                flags: 0,
+                name: "shared.djbz",
+            },
+            DirmTailEntry {
+                offset: page_offset,
+                size: 30,
+                flags: 1,
+                name: "page.djvu",
+            },
+        ];
+
+        let entries = document.directory_entries(&tail_entries);
+        let shared = document
+            .find_directory_entry_by_name(&tail_entries, "shared.djbz")
+            .expect("shared entry should resolve");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].form_index, Some(0));
+        assert_eq!(entries[0].kind, Some(DocumentFormKind::Shared));
+        assert_eq!(entries[1].form_index, Some(1));
+        assert_eq!(entries[1].kind, Some(DocumentFormKind::Page));
+        assert_eq!(shared, entries[0]);
+        assert_eq!(
+            document.find_directory_entry_by_name(&tail_entries, "missing"),
+            None
+        );
     }
 }
