@@ -1,5 +1,5 @@
 use djvulpes::{
-    Chunk, Document, DocumentFormKind, Form, PageChunkKind, Result, parse_form_at,
+    Chunk, Document, DocumentFormKind, Form, PageChunk, PageChunkPayload, Result, parse_form_at,
     read_page_details,
 };
 use std::fs;
@@ -246,37 +246,48 @@ fn print_page_detail(bytes: &[u8], form: &Form<'_>, offset: u32) -> Result<()> {
     println!();
     println!("child chunks:");
     for page_chunk in details.chunks {
-        print_page_chunk_line(bytes, &page_chunk.chunk, page_chunk.kind)?;
+        print_page_chunk_line(bytes, &page_chunk)?;
     }
 
     Ok(())
 }
 
-fn print_page_chunk_line(bytes: &[u8], chunk: &Chunk<'_>, kind: PageChunkKind) -> Result<()> {
+fn print_page_chunk_line(bytes: &[u8], page_chunk: &PageChunk<'_>) -> Result<()> {
+    let chunk = &page_chunk.chunk;
+
     if chunk.id == "FORM" {
         let form = parse_form_at(bytes, chunk.data_start - 8)?;
         println!(
-            "    @{:<8} FORM:{:<4} {:<8} size={:<8} data=[{}..{})",
+            "    @{:<8} FORM:{:<4} {:<8} size={:<8} data=[{}..{}){}",
             chunk.data_start - 8,
             form.kind,
-            kind.as_str(),
+            page_chunk.kind.as_str(),
             form.chunk.size,
             form.chunk.data_start,
-            form.chunk.data_end
+            form.chunk.data_end,
+            format_page_chunk_payload(page_chunk)
         );
     } else {
         println!(
-            "    @{:<8} {:<4} {:<8} size={:<8} data=[{}..{})",
+            "    @{:<8} {:<4} {:<8} size={:<8} data=[{}..{}){}",
             chunk.data_start - 8,
             chunk.id,
-            kind.as_str(),
+            page_chunk.kind.as_str(),
             chunk.size,
             chunk.data_start,
-            chunk.data_end
+            chunk.data_end,
+            format_page_chunk_payload(page_chunk)
         );
     }
 
     Ok(())
+}
+
+fn format_page_chunk_payload(page_chunk: &PageChunk<'_>) -> String {
+    match page_chunk.payload {
+        PageChunkPayload::Include { id } => format!(" id={id}"),
+        PageChunkPayload::Raw => String::new(),
+    }
 }
 
 const fn display_form_kind(kind: DocumentFormKind) -> &'static str {

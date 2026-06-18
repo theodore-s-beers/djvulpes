@@ -13,6 +13,7 @@ pub struct PageDetails<'a> {
 pub struct PageChunk<'a> {
     pub chunk: Chunk<'a>,
     pub kind: PageChunkKind,
+    pub payload: PageChunkPayload<'a>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -28,6 +29,12 @@ pub enum PageChunkKind {
     Unknown,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum PageChunkPayload<'a> {
+    Include { id: &'a str },
+    Raw,
+}
+
 /// Reads the typed child chunk structure for a `FORM:DJVU` page.
 ///
 /// # Errors
@@ -39,6 +46,7 @@ pub fn read_page_details<'a>(bytes: &'a [u8], form: &Form<'a>) -> Result<PageDet
         .into_iter()
         .map(|chunk| PageChunk {
             kind: PageChunkKind::from_chunk_id(chunk.id),
+            payload: PageChunkPayload::from_chunk(bytes, &chunk),
             chunk,
         })
         .collect();
@@ -79,6 +87,18 @@ impl PageChunkKind {
             Self::Txtz => "txtz",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+impl<'a> PageChunkPayload<'a> {
+    #[must_use]
+    pub fn from_chunk(bytes: &'a [u8], chunk: &Chunk<'_>) -> Self {
+        if chunk.id != "INCL" {
+            return Self::Raw;
+        }
+
+        std::str::from_utf8(&bytes[chunk.data_start..chunk.data_end])
+            .map_or(Self::Raw, |id| Self::Include { id })
     }
 }
 
@@ -137,6 +157,10 @@ mod tests {
         assert_eq!(details.chunks[1].kind, PageChunkKind::Include);
         assert_eq!(details.chunks[2].kind, PageChunkKind::Sjbz);
         assert_eq!(details.chunks[3].kind, PageChunkKind::Unknown);
+        assert_eq!(
+            details.chunks[1].payload,
+            PageChunkPayload::Include { id: "shared" }
+        );
         assert_eq!(details.chunks_of_kind(PageChunkKind::Include).count(), 1);
     }
 }

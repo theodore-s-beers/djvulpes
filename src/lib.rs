@@ -15,4 +15,4 @@ pub use document::{
 };
 pub use error::{ParseError, Result};
 pub use info::{PageInfo, read_page_info};
-pub use page::{PageChunk, PageChunkKind, PageDetails, read_page_details};
+pub use page::{PageChunk, PageChunkKind, PageChunkPayload, PageDetails, read_page_details};
