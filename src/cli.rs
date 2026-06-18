@@ -1,4 +1,4 @@
-use crate::commands::{run_forms, run_page, run_pages, run_summary};
+use crate::commands::{run_dirm, run_forms, run_page, run_pages, run_summary};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -31,6 +31,11 @@ enum Command {
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
+    /// Inspect the bundled document directory.
+    Dirm {
+        #[arg(default_value = DEFAULT_FILE)]
+        file: PathBuf,
+    },
     /// Inspect one page by 1-based page number.
     Page {
         number: usize,
@@ -46,6 +51,7 @@ pub fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Command::Summary { file } => run_summary(&file)?,
         Command::Pages { file } => run_pages(&file)?,
         Command::Forms { file } => run_forms(&file)?,
+        Command::Dirm { file } => run_dirm(&file)?,
         Command::Page { number, file } => run_page(&file, number)?,
     }
 

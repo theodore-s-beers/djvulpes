@@ -1,9 +1,10 @@
 use djvulpes::{
-    Chunk, Document, DocumentFormKind, Form, PageChunk, PageChunkPayload, Result, parse_form_at,
-    read_page_details,
+    Chunk, DirmTailEntry, Document, DocumentForm, DocumentFormKind, Form, PageChunk,
+    PageChunkPayload, Result, parse_dirm_tail, parse_form_at, read_page_details,
 };
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 pub fn run_summary(path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let bytes = fs::read(path)?;
@@ -85,6 +86,66 @@ pub fn run_forms(path: &Path) -> std::result::Result<(), Box<dyn std::error::Err
             document_form.form.chunk.size
         );
     }
+
+    Ok(())
+}
+
+pub fn run_dirm(path: &Path) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let bytes = fs::read(path)?;
+    let document = Document::parse(&bytes)?;
+    let Some(dirm) = &document.directory else {
+        return Err("document has no DIRM chunk".into());
+    };
+
+    println!("file: {}", path.display());
+    print_dirm_summary(&document, &bytes)?;
+
+    let tail = dirm.compressed_tail(&bytes)?;
+    println!();
+    println!(
+        "compressed tail: [{}..{}) len={}",
+        dirm.compressed_tail_start,
+        dirm.compressed_tail_end(),
+        tail.len()
+    );
+
+    let decoded_tail = match decode_bzz_with_local_tool(tail) {
+        Ok(decoded_tail) => decoded_tail,
+        Err(error) => {
+            println!("decoded tail: unavailable ({error})");
+            return Ok(());
+        }
+    };
+
+    let entries = parse_dirm_tail(dirm, &decoded_tail)?;
+    println!("decoded tail: {} bytes", decoded_tail.len());
+    println!();
+    println!("first directory entries:");
+    println!("index  offset    size      flags  kind    name");
+
+    for (index, entry) in entries.iter().take(24).enumerate() {
+        let form_kind = document
+            .forms
+            .iter()
+            .find(|form| form.offset == entry.offset)
+            .map_or("-", display_document_form_kind);
+
+        println!(
+            "{:<6} @{:<8} {:<9} 0x{:02x}   {:<7} {}",
+            index + 1,
+            entry.offset,
+            entry.size,
+            entry.flags,
+            form_kind,
+            entry.name
+        );
+    }
+
+    if entries.len() > 24 {
+        println!("... {} more directory entries omitted", entries.len() - 24);
+    }
+
+    print_include_resolution(&bytes, &document, &entries)?;
 
     Ok(())
 }
@@ -288,6 +349,92 @@ fn format_page_chunk_payload(page_chunk: &PageChunk<'_>) -> String {
         PageChunkPayload::Include { id } => format!(" id={id}"),
         PageChunkPayload::Raw => String::new(),
     }
+}
+
+fn decode_bzz_with_local_tool(bytes: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let temp_dir = std::env::temp_dir();
+    let unique = format!("djvulpes-dirm-{}-{:p}", std::process::id(), bytes.as_ptr());
+    let input_path = temp_dir.join(format!("{unique}.bzz"));
+    let output_path = temp_dir.join(format!("{unique}.raw"));
+
+    fs::write(&input_path, bytes).map_err(|error| {
+        format!(
+            "could not write {}: {error}",
+            input_path.as_path().display()
+        )
+    })?;
+
+    let output = Command::new("bzz")
+        .arg("-d")
+        .arg(&input_path)
+        .arg(&output_path)
+        .output()
+        .map_err(|error| format!("could not run bzz: {error}"))?;
+
+    let _ = fs::remove_file(&input_path);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_file(&output_path);
+        return Err(format!("bzz exited with {}: {stderr}", output.status));
+    }
+
+    let decoded = fs::read(&output_path).map_err(|error| {
+        format!(
+            "could not read {}: {error}",
+            output_path.as_path().display()
+        )
+    })?;
+    let _ = fs::remove_file(&output_path);
+
+    Ok(decoded)
+}
+
+fn print_include_resolution(
+    bytes: &[u8],
+    document: &Document<'_>,
+    entries: &[DirmTailEntry<'_>],
+) -> Result<()> {
+    println!();
+    println!("first page includes:");
+
+    let mut printed = 0usize;
+    for (page_index, page) in document.pages(bytes).enumerate() {
+        let page = page?;
+        for chunk in page.details(bytes)?.chunks {
+            let PageChunkPayload::Include { id } = chunk.payload else {
+                continue;
+            };
+            let target = entries.iter().find(|entry| entry.name == id);
+
+            match target {
+                Some(target) => println!(
+                    "  page {:<4} {} -> @{} size={} flags=0x{:02x}",
+                    page_index + 1,
+                    id,
+                    target.offset,
+                    target.size,
+                    target.flags
+                ),
+                None => println!("  page {:<4} {} -> unresolved", page_index + 1, id),
+            }
+
+            printed += 1;
+            if printed == 12 {
+                return Ok(());
+            }
+        }
+    }
+
+    if printed == 0 {
+        println!("  none found");
+    }
+
+    Ok(())
+}
+
+const fn display_document_form_kind(form: &DocumentForm<'_>) -> &'static str {
+    display_form_kind(form.kind)
 }
 
 const fn display_form_kind(kind: DocumentFormKind) -> &'static str {

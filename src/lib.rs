@@ -9,7 +9,7 @@ pub(crate) mod info;
 pub(crate) mod page;
 
 pub use chunk::{Chunk, Form, parse_chunk_at, parse_chunks, parse_document_root, parse_form_at};
-pub use dirm::{Dirm, parse_dirm};
+pub use dirm::{Dirm, DirmTailEntry, parse_dirm, parse_dirm_tail};
 pub use document::{
     Document, DocumentForm, DocumentFormKind, FormKindCounts, Page, Pages, RootChunkCounts,
 };
