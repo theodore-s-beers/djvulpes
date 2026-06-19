@@ -316,7 +316,7 @@ const ENTROPY_CONTEXTS: usize = 300;
 const RANK_ZERO_CONTEXT: usize = 0;
 const RANK_ONE_CONTEXT: usize = 1;
 const RANK_TREE_CONTEXT_START: usize = 2;
-const RANK_TREE_BITS: usize = 8;
+const RANK_GROUPS: usize = 7;
 
 fn read_entropy_rank<R>(model: &mut BitModel, reader: &mut R) -> BzzResult<usize>
 where
@@ -329,13 +329,24 @@ where
         return Ok(1);
     }
 
-    let mut offset = 0usize;
-    for bit_index in 0..RANK_TREE_BITS {
-        let bit = model.read_bit(reader, RANK_TREE_CONTEXT_START + bit_index)?;
-        offset = (offset << 1) | usize::from(bit);
+    let mut group_start = 2usize;
+    let mut context = RANK_TREE_CONTEXT_START;
+
+    for group_bits in 1..=RANK_GROUPS {
+        if model.read_bit(reader, context)? == 1 {
+            let mut offset = 0usize;
+            for bit_index in 0..group_bits {
+                let bit = model.read_bit(reader, context + 1 + bit_index)?;
+                offset = (offset << 1) | usize::from(bit);
+            }
+            return Ok(group_start + offset);
+        }
+
+        context += 1 + group_bits;
+        group_start <<= 1;
     }
 
-    Ok(2 + offset)
+    Ok(BWT_MARKER_RANK)
 }
 
 trait ModeledBitReader {
@@ -834,22 +845,57 @@ mod tests {
     #[test]
     fn read_entropy_rank_decodes_large_rank() {
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
-        let mut reader = ScriptedModeledBitReader::new([0, 0, 0, 0, 0, 0, 0, 1, 0, 1]);
+        let mut reader = ScriptedModeledBitReader::new([0, 0, 0, 1, 1, 1]);
 
         let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
 
         assert_eq!(rank, 7);
-        assert_eq!(reader.bits_read(), 10);
+        assert_eq!(reader.bits_read(), 6);
     }
 
     #[test]
     fn read_entropy_rank_decodes_marker_rank() {
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
-        let mut reader = ScriptedModeledBitReader::new([0, 0, 1, 1, 1, 1, 1, 1, 1, 0]);
+        let mut reader = ScriptedModeledBitReader::new([0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
         let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
 
         assert_eq!(rank, BWT_MARKER_RANK);
+        assert_eq!(reader.bits_read(), 9);
+    }
+
+    #[test]
+    fn entropy_decisions_for_rank_encode_rank_tree_paths() {
+        assert_eq!(entropy_decisions_for_rank(0), vec![(RANK_ZERO_CONTEXT, 1)]);
+        assert_eq!(
+            entropy_decisions_for_rank(1),
+            vec![(RANK_ZERO_CONTEXT, 0), (RANK_ONE_CONTEXT, 1)]
+        );
+        assert_eq!(
+            entropy_decisions_for_rank(7),
+            vec![
+                (RANK_ZERO_CONTEXT, 0),
+                (RANK_ONE_CONTEXT, 0),
+                (RANK_TREE_CONTEXT_START, 0),
+                (RANK_TREE_CONTEXT_START + 2, 1),
+                (RANK_TREE_CONTEXT_START + 3, 1),
+                (RANK_TREE_CONTEXT_START + 4, 1),
+            ]
+        );
+        assert_eq!(
+            entropy_decisions_for_rank(BWT_MARKER_RANK),
+            vec![
+                (RANK_ZERO_CONTEXT, 0),
+                (RANK_ONE_CONTEXT, 0),
+                (RANK_TREE_CONTEXT_START, 0),
+                (RANK_TREE_CONTEXT_START + 2, 0),
+                (RANK_TREE_CONTEXT_START + 5, 0),
+                (RANK_TREE_CONTEXT_START + 9, 0),
+                (RANK_TREE_CONTEXT_START + 14, 0),
+                (RANK_TREE_CONTEXT_START + 20, 0),
+                (RANK_TREE_CONTEXT_START + 27, 0),
+            ]
+        );
     }
 
     #[test]
@@ -865,9 +911,119 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[test]
+    #[ignore = "tracks provisional bit model convergence against expected fixture decisions"]
+    fn fixture_modeled_bits_match_expected_rank_decisions() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let _ = decoder.next_block_len();
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let trace = trace_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
+            .expect("modeled fixture bits should decode");
+
+        assert_modeled_bit_trace_matches(&trace);
+    }
+
     fn expected_ranks_from_raw(raw: &[u8]) -> Vec<usize> {
         let block = expected_block_symbols_from_raw(raw);
         ranks_from_block_symbols(&block).expect("derived BWT block should convert to ranks")
+    }
+
+    fn entropy_decisions_from_ranks(ranks: &[usize]) -> Vec<(usize, u8)> {
+        let mut decisions = Vec::new();
+        for rank in ranks {
+            decisions.extend(entropy_decisions_for_rank(*rank));
+        }
+        decisions
+    }
+
+    fn entropy_decisions_for_rank(rank: usize) -> Vec<(usize, u8)> {
+        let mut decisions = vec![(RANK_ZERO_CONTEXT, u8::from(rank == 0))];
+        if rank == 0 {
+            return decisions;
+        }
+
+        decisions.push((RANK_ONE_CONTEXT, u8::from(rank == 1)));
+        if rank == 1 {
+            return decisions;
+        }
+
+        let mut group_start = 2usize;
+        let mut context = RANK_TREE_CONTEXT_START;
+        for group_bits in 1..=RANK_GROUPS {
+            let group_end = (group_start << 1) - 1;
+            let rank_is_in_group = rank >= group_start && rank <= group_end;
+            decisions.push((context, u8::from(rank_is_in_group)));
+
+            if rank_is_in_group {
+                let offset = rank - group_start;
+                for bit_index in (0..group_bits).rev() {
+                    let bit = u8::from((offset & (1usize << bit_index)) != 0);
+                    decisions.push((context + 1 + (group_bits - 1 - bit_index), bit));
+                }
+                return decisions;
+            }
+
+            context += 1 + group_bits;
+            group_start <<= 1;
+        }
+
+        decisions
+    }
+
+    fn trace_modeled_bits<R>(
+        model: &mut BitModel,
+        reader: &mut R,
+        expected_decisions: &[(usize, u8)],
+    ) -> BzzResult<Vec<ModeledBitTrace>>
+    where
+        R: ModeledBitReader,
+    {
+        let mut trace = Vec::with_capacity(expected_decisions.len());
+
+        for (index, (context_id, expected_bit)) in expected_decisions.iter().copied().enumerate() {
+            let state_before = model.context(context_id).state;
+            let split_before = model.tables.split(state_before);
+            let actual_bit = model.read_bit(reader, context_id)?;
+            let state_after = model.context(context_id).state;
+            trace.push(ModeledBitTrace {
+                index,
+                context_id,
+                state_before,
+                split_before,
+                expected_bit,
+                actual_bit,
+                state_after,
+            });
+        }
+
+        Ok(trace)
+    }
+
+    fn assert_modeled_bit_trace_matches(trace: &[ModeledBitTrace]) {
+        for entry in trace {
+            assert_eq!(
+                entry.actual_bit,
+                entry.expected_bit,
+                "modeled bit mismatch at decision {}, context {}, state_before {}, split {}, state_after {}",
+                entry.index,
+                entry.context_id,
+                entry.state_before,
+                entry.split_before,
+                entry.state_after,
+            );
+        }
+    }
+
+    struct ModeledBitTrace {
+        index: usize,
+        context_id: usize,
+        state_before: u8,
+        split_before: u16,
+        expected_bit: u8,
+        actual_bit: u8,
+        state_after: u8,
     }
 
     fn expected_block_symbols_from_raw(raw: &[u8]) -> BlockSymbols {
