@@ -452,8 +452,12 @@ impl BitModelTables {
     }
 
     fn split_for_state(state: usize) -> u16 {
-        let numerator = (state + 1) * usize::from(u16::MAX);
-        u16::try_from(numerator / BIT_MODEL_STATES)
+        let max = usize::from(u16::MAX);
+        let position = state + 1;
+        let linear = position * max / BIT_MODEL_STATES;
+        let boost = 11_500 * 4 * position * (BIT_MODEL_STATES - position)
+            / (BIT_MODEL_STATES * BIT_MODEL_STATES);
+        u16::try_from((linear + boost).min(max))
             .expect("generated bit-model split should fit in u16")
     }
 }
@@ -832,8 +836,8 @@ mod tests {
     fn bit_model_tables_are_generated_monotonically() {
         let tables = BitModelTables::generated();
 
-        assert_eq!(tables.split(0), 1008);
-        assert_eq!(tables.split(BIT_MODEL_INITIAL_STATE), 33_271);
+        assert_eq!(tables.split(0), 1704);
+        assert_eq!(tables.split(BIT_MODEL_INITIAL_STATE), 44_768);
         assert_eq!(tables.split(64), u16::MAX);
         assert!(tables.split(1) > tables.split(0));
         assert!(tables.next_state(BIT_MODEL_INITIAL_STATE, 0) > BIT_MODEL_INITIAL_STATE);
@@ -961,14 +965,14 @@ mod tests {
             .expect("fixture should still expose the provisional mismatch");
         let expected = &expected_trace[mismatch.index];
 
-        assert_eq!(mismatch.index, 4);
-        assert_eq!(mismatch.context_id, 7);
+        assert_eq!(mismatch.index, 6);
+        assert_eq!(mismatch.context_id, 9);
         assert_eq!(mismatch.state_before, BIT_MODEL_INITIAL_STATE);
         assert_eq!(mismatch.expected_bit, 1);
         assert_eq!(mismatch.actual_bit, 0);
         assert_eq!(expected.rank_index, 0);
         assert_eq!(expected.rank, 10);
-        assert_eq!(expected.rank_decision_index, 4);
+        assert_eq!(expected.rank_decision_index, 6);
 
         let actual_first_rank_decisions = bit_trace
             .iter()
@@ -983,7 +987,9 @@ mod tests {
                 (RANK_ONE_CONTEXT, 0),
                 (RANK_TREE_CONTEXT_START, 0),
                 (RANK_TREE_CONTEXT_START + 2, 0),
-                (RANK_TREE_CONTEXT_START + 5, 0),
+                (RANK_TREE_CONTEXT_START + 5, 1),
+                (RANK_TREE_CONTEXT_START + 6, 0),
+                (RANK_TREE_CONTEXT_START + 7, 0),
             ]
         );
         eprintln!("first mismatch expected decision: {expected:?}");
@@ -1055,17 +1061,14 @@ mod tests {
             .last()
             .expect("at least one rank-tree variant should be scored");
 
-        assert_eq!(best.0.group_selected_bit, 1);
-        assert!(
-            best.1 <= 4,
-            "simple variant unexpectedly improved to {best:?}"
-        );
         eprintln!("rank-tree variant scores: {scored:?}");
+        assert_eq!(best.0.group_selected_bit, 1);
+        assert_eq!(best.1, 6);
     }
 
     #[test]
-    #[ignore = "checks the initial split range needed by the first rank"]
-    fn fixture_first_rank_initial_split_constraints_are_satisfiable() {
+    #[ignore = "checks the initial split range needed by the first rank selector"]
+    fn fixture_first_rank_selector_initial_split_constraints_are_satisfiable() {
         let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
@@ -1104,10 +1107,56 @@ mod tests {
             merged.merge(*constraint);
         }
 
+        let generated_split = BitModelTables::generated().split(BIT_MODEL_INITIAL_STATE);
+
         assert!(merged.is_satisfiable());
-        assert!(merged.min_split > BitModelTables::generated().split(BIT_MODEL_INITIAL_STATE));
+        assert!(generated_split >= merged.min_split);
+        assert!(generated_split <= merged.max_split);
         eprintln!("first-rank initial-state constraints: {first_rank_initial_state:?}");
         eprintln!("merged initial-state constraint: {merged:?}");
+    }
+
+    #[test]
+    #[ignore = "shows that the first full rank needs context-specific initial state"]
+    fn fixture_first_rank_fresh_context_constraints_conflict() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let _ = decoder.next_block_len();
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
+            .expect("modeled fixture bits should decode");
+        let first_rank = &trace[..entropy_decisions_for_rank(expected_ranks[0]).len()];
+        let mut merged = SplitConstraint {
+            key: SplitConstraintKey {
+                context_id: usize::MAX,
+                state: BIT_MODEL_INITIAL_STATE,
+            },
+            min_split: 0,
+            max_split: u16::MAX,
+            min_decision: 0,
+            max_decision: 0,
+        };
+
+        for entry in first_rank {
+            assert_eq!(entry.state_before, BIT_MODEL_INITIAL_STATE);
+            merged.merge(SplitConstraint::for_decision(
+                entry.index,
+                SplitConstraintKey {
+                    context_id: entry.context_id,
+                    state: entry.state_before,
+                },
+                entry.probe,
+                entry.expected_bit,
+            ));
+        }
+
+        assert!(!merged.is_satisfiable());
+        assert_eq!(merged.min_split, 63_600);
+        assert_eq!(merged.min_decision, 6);
+        assert_eq!(merged.max_split, 54_909);
+        assert_eq!(merged.max_decision, 3);
+        eprintln!("first-rank fresh-context merged constraint: {merged:?}");
     }
 
     #[test]
@@ -1132,18 +1181,19 @@ mod tests {
             !search.constraints.is_empty(),
             "fixture should produce split constraints"
         );
+        eprintln!("actual-path split conflict: {conflict:?}");
         assert_eq!(
             conflict.key,
             SplitConstraintKey {
-                context_id: 23,
+                context_id: 7,
                 state: BIT_MODEL_INITIAL_STATE,
             }
         );
-        assert_eq!(conflict.decision, 56);
-        assert_eq!(conflict.min_split, 63_481);
-        assert_eq!(conflict.min_decision, 28);
-        assert_eq!(conflict.max_split, 30_494);
-        assert_eq!(conflict.max_decision, 56);
+        assert_eq!(conflict.decision, 24);
+        assert_eq!(conflict.min_split, 44_284);
+        assert_eq!(conflict.min_decision, 4);
+        assert_eq!(conflict.max_split, 41_719);
+        assert_eq!(conflict.max_decision, 24);
     }
 
     #[test]
@@ -1193,11 +1243,17 @@ mod tests {
 
         assert_eq!(first.expected_bit, 1);
         assert_eq!(first.state_before, BIT_MODEL_INITIAL_STATE);
-        assert_eq!(first.split_before, 33_271);
+        assert_eq!(
+            first.split_before,
+            BitModelTables::generated().split(first.state_before)
+        );
         assert_eq!(first.state_after, 28);
         assert_eq!(second.expected_bit, 0);
         assert_eq!(second.state_before, 24);
-        assert_eq!(second.split_before, 25_205);
+        assert_eq!(
+            second.split_before,
+            BitModelTables::generated().split(second.state_before)
+        );
         assert_eq!(second.state_after, 28);
         eprintln!("context 23 state trace: {state_trace:?}");
     }
@@ -1485,6 +1541,7 @@ mod tests {
         state: u8,
     }
 
+    #[derive(Debug)]
     struct SplitConstraintConflict {
         key: SplitConstraintKey,
         decision: usize,

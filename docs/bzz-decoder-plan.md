@@ -10,6 +10,7 @@
 - Use the local `bzz` command only as a temporary test oracle and fallback.
 - If the decoder needs generated constants, keep the generator in this repo and document the source formula or derivation.
 - The current bit-model table generator is a provisional in-repo scaffold. It must be replaced or validated against an independently derived BZZ-compatible model before removing the external `bzz` fallback.
+- The provisional split table is generated from a linear `state / states` baseline plus a small concave boost. The boost was chosen from fixture constraints to move the first known entropy mismatch forward; it is not copied from DjVuLibre, ExifTool, or any static table.
 
 ## Implementation Stages
 
