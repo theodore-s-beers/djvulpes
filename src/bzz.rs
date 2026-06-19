@@ -89,6 +89,10 @@ fn decode_bzz_with_local_tool(bytes: &[u8]) -> BzzResult<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::Dirm;
+    use std::io::ErrorKind;
+
+    const HELLO_BZZ: &[u8] = include_bytes!("../tests/fixtures/bzz/hello.bzz");
+    const HELLO_RAW: &[u8] = include_bytes!("../tests/fixtures/bzz/hello.raw");
 
     #[test]
     fn decode_dirm_tail_rejects_invalid_tail_range_before_decoding() {
@@ -104,5 +108,16 @@ mod tests {
             .expect_err("invalid tail range should fail before invoking bzz");
 
         assert!(matches!(error, BzzError::DirmTail(_)));
+    }
+
+    #[test]
+    fn decode_bzz_decodes_fixture_bytes() {
+        match decode_bzz(HELLO_BZZ) {
+            Ok(decoded) => assert_eq!(decoded, HELLO_RAW),
+            Err(BzzError::Run(error)) if error.kind() == ErrorKind::NotFound => {
+                eprintln!("skipping fixture decode test because `bzz` is not on PATH");
+            }
+            Err(error) => panic!("fixture decode failed: {error}"),
+        }
     }
 }
