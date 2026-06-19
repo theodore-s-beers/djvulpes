@@ -622,6 +622,19 @@ mod tests {
     }
 
     #[test]
+    fn test_fixture_bwt_derivation_matches_known_banana_block() {
+        let block = expected_block_symbols_from_raw(b"banana");
+
+        assert_eq!(
+            block,
+            BlockSymbols {
+                symbols: vec![b'a', b'n', b'n', b'b', 0, b'a', b'a'],
+                marker_pos: 4,
+            }
+        );
+    }
+
+    #[test]
     fn inverse_bwt_reconstructs_repeated_bytes() {
         let symbols = [b'a', b'a', b'a', 0];
 
@@ -699,6 +712,16 @@ mod tests {
             .expect("rank pipeline should decode");
 
         assert_eq!(decoded, b"aaa");
+    }
+
+    #[test]
+    fn expected_fixture_ranks_reconstruct_hello_raw() {
+        let ranks = expected_ranks_from_raw(HELLO_RAW);
+
+        let decoded = decode_block_from_ranks(HELLO_RAW.len() + 1, ranks)
+            .expect("rank fixture should decode");
+
+        assert_eq!(decoded, HELLO_RAW);
     }
 
     #[test]
@@ -827,6 +850,81 @@ mod tests {
         let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
 
         assert_eq!(rank, BWT_MARKER_RANK);
+    }
+
+    #[test]
+    #[ignore = "tracks convergence of provisional entropy model against the BZZ fixture"]
+    fn fixture_rank_stream_matches_expected_ranks() {
+        let expected = expected_ranks_from_raw(HELLO_RAW);
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let block_len = decoder.next_block_len();
+        let actual = decoder
+            .decode_block_ranks(block_len)
+            .expect("fixture ranks should decode");
+
+        assert_eq!(actual, expected);
+    }
+
+    fn expected_ranks_from_raw(raw: &[u8]) -> Vec<usize> {
+        let block = expected_block_symbols_from_raw(raw);
+        ranks_from_block_symbols(&block).expect("derived BWT block should convert to ranks")
+    }
+
+    fn expected_block_symbols_from_raw(raw: &[u8]) -> BlockSymbols {
+        let block_len = raw.len() + 1;
+        let mut rotations = (0..block_len).collect::<Vec<_>>();
+        rotations.sort_by(|&lhs, &rhs| {
+            (0..block_len)
+                .map(|offset| bwt_symbol_key(raw, (lhs + offset) % block_len))
+                .cmp((0..block_len).map(|offset| bwt_symbol_key(raw, (rhs + offset) % block_len)))
+        });
+
+        let mut symbols = Vec::with_capacity(block_len);
+        let mut marker_pos = None;
+        for (output_index, start) in rotations.into_iter().enumerate() {
+            let previous = (start + block_len - 1) % block_len;
+            if let Some(symbol) = bwt_symbol(raw, previous) {
+                symbols.push(symbol);
+            } else {
+                symbols.push(0);
+                marker_pos = Some(output_index);
+            }
+        }
+
+        BlockSymbols {
+            symbols,
+            marker_pos: marker_pos.expect("BWT output should contain the marker"),
+        }
+    }
+
+    fn ranks_from_block_symbols(block: &BlockSymbols) -> BzzResult<Vec<usize>> {
+        let mut table = MoveToFrontTable::new();
+        let mut ranks = Vec::with_capacity(block.symbols.len());
+
+        for (index, symbol) in block.symbols.iter().copied().enumerate() {
+            if index == block.marker_pos {
+                ranks.push(BWT_MARKER_RANK);
+                continue;
+            }
+
+            let rank = table
+                .symbols
+                .iter()
+                .position(|candidate| *candidate == symbol)
+                .expect("byte should exist in MTF table");
+            ranks.push(rank);
+            let _ = table.take(rank)?;
+        }
+
+        Ok(ranks)
+    }
+
+    fn bwt_symbol(raw: &[u8], index: usize) -> Option<u8> {
+        raw.get(index).copied()
+    }
+
+    fn bwt_symbol_key(raw: &[u8], index: usize) -> i16 {
+        bwt_symbol(raw, index).map_or(-1, i16::from)
     }
 
     struct ScriptedRankDecoder {
