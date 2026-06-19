@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::pedantic, clippy::nursery)]
 
+pub(crate) mod bzz;
 pub(crate) mod chunk;
 pub(crate) mod dirm;
 pub(crate) mod document;
@@ -9,6 +10,7 @@ pub(crate) mod info;
 pub(crate) mod page;
 pub(crate) mod text;
 
+pub use bzz::{BzzError, BzzResult, decode_bzz, decode_dirm_tail};
 pub use chunk::{Chunk, Form, parse_chunk_at, parse_chunks, parse_document_root, parse_form_at};
 pub use dirm::{Dirm, DirmTailEntry, parse_dirm, parse_dirm_tail};
 pub use document::{

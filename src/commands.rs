@@ -1,12 +1,12 @@
 use anyhow::{Context, bail};
 use djvulpes::{
-    Chunk, DirectoryEntry, Dirm, Document, DocumentFormKind, Form, PageChunk, PageChunkKind,
+    Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkKind,
     PageChunkPayload, ParseResult, TextZone, parse_chunks, parse_dirm_tail, parse_form_at,
     parse_text_payload, parse_text_zones, read_page_details,
 };
+use djvulpes::{decode_bzz, decode_dirm_tail};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 pub fn run_summary(path: &Path) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
@@ -499,7 +499,7 @@ fn print_text_chunk(
     let payload = match page_chunk.kind {
         PageChunkKind::Txta => encoded,
         PageChunkKind::Txtz => {
-            decoded = decode_bzz_with_local_tool(encoded)?;
+            decoded = decode_bzz(encoded)?;
             &decoded
         }
         _ => return Ok(()),
@@ -605,42 +605,6 @@ fn format_include_payload(
         " id={id} -> @{} FORM:{} size={}",
         entry.offset, form.form.kind, form.form.chunk.size
     )
-}
-
-fn decode_dirm_tail(bytes: &[u8], dirm: &Dirm) -> anyhow::Result<Vec<u8>> {
-    let tail = dirm.compressed_tail(bytes)?;
-    decode_bzz_with_local_tool(tail)
-}
-
-fn decode_bzz_with_local_tool(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let temp_dir = std::env::temp_dir();
-    let unique = format!("djvulpes-dirm-{}-{:p}", std::process::id(), bytes.as_ptr());
-    let input_path = temp_dir.join(format!("{unique}.bzz"));
-    let output_path = temp_dir.join(format!("{unique}.raw"));
-
-    fs::write(&input_path, bytes)
-        .with_context(|| format!("failed to write {}", input_path.as_path().display()))?;
-
-    let output = Command::new("bzz")
-        .arg("-d")
-        .arg(&input_path)
-        .arg(&output_path)
-        .output()
-        .context("failed to run bzz")?;
-
-    let _ = fs::remove_file(&input_path);
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = fs::remove_file(&output_path);
-        bail!("bzz exited with {}: {stderr}", output.status);
-    }
-
-    let decoded = fs::read(&output_path)
-        .with_context(|| format!("failed to read {}", output_path.as_path().display()))?;
-    let _ = fs::remove_file(&output_path);
-
-    Ok(decoded)
 }
 
 fn print_include_resolution(
