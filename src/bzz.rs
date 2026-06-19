@@ -381,6 +381,11 @@ impl BitModel {
     fn context(&self, context_id: usize) -> &BitContext {
         &self.contexts[context_id]
     }
+
+    #[cfg(test)]
+    fn context_mut(&mut self, context_id: usize) -> &mut BitContext {
+        &mut self.contexts[context_id]
+    }
 }
 
 impl ModeledBitReader for ZpBitReader<'_> {
@@ -426,10 +431,10 @@ impl BitModelTables {
 
         for state in 0..BIT_MODEL_STATES {
             split[state] = Self::split_for_state(state);
-            next_zero[state] = u8::try_from((state + 4).min(BIT_MODEL_STATES - 1))
+            next_zero[state] = u8::try_from((state + 3).min(BIT_MODEL_STATES - 1))
                 .expect("bit-model state should fit in u8");
             next_one[state] =
-                u8::try_from(state.saturating_sub(4)).expect("bit-model state should fit in u8");
+                u8::try_from(state.saturating_sub(3)).expect("bit-model state should fit in u8");
         }
 
         Self {
@@ -1160,6 +1165,143 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "maps first-rank split constraints back to possible initial states"]
+    fn fixture_first_rank_context_initial_state_ranges() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let _ = decoder.next_block_len();
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
+            .expect("modeled fixture bits should decode");
+        let first_rank = &trace[..entropy_decisions_for_rank(expected_ranks[0]).len()];
+        let state_ranges = first_rank
+            .iter()
+            .map(|entry| {
+                let constraint = SplitConstraint::for_decision(
+                    entry.index,
+                    SplitConstraintKey {
+                        context_id: entry.context_id,
+                        state: entry.state_before,
+                    },
+                    entry.probe,
+                    entry.expected_bit,
+                );
+                let states = states_satisfying_split_constraint(constraint);
+                (entry.context_id, entry.expected_bit, constraint, states)
+            })
+            .collect::<Vec<_>>();
+
+        let context_9 = state_ranges
+            .iter()
+            .find(|(context_id, _, _, _)| *context_id == 9)
+            .expect("first rank should use context 9");
+        let context_9_states = &context_9.3;
+
+        assert_eq!(context_9_states.first(), Some(&59));
+        assert_eq!(context_9_states.last(), Some(&64));
+        eprintln!("first-rank initial state ranges: {state_ranges:?}");
+    }
+
+    #[test]
+    #[ignore = "tests whether a context-9 initial-state adjustment moves the fixture mismatch"]
+    fn fixture_context_9_initial_state_adjustment_moves_mismatch() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_trace = expected_decision_trace_from_ranks(&expected_ranks);
+        let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let _ = decoder.next_block_len();
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        model.context_mut(9).state = 59;
+        let bit_trace =
+            trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
+                .expect("modeled fixture bits should decode");
+        let mismatch = first_modeled_bit_mismatch(&bit_trace)
+            .expect("fixture should still expose the provisional mismatch");
+        let expected = &expected_trace[mismatch.index];
+
+        assert!(mismatch.index > 6);
+        eprintln!("context-9 adjusted first mismatch: {mismatch:?}");
+        eprintln!("context-9 adjusted expected decision: {expected:?}");
+    }
+
+    #[test]
+    #[ignore = "tests whether discovered high-probability context initial states advance the fixture"]
+    fn fixture_selected_context_initial_state_adjustments_move_mismatch() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_trace = expected_decision_trace_from_ranks(&expected_ranks);
+        let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let _ = decoder.next_block_len();
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        model.context_mut(9).state = 59;
+        model.context_mut(16).state = 59;
+        let bit_trace =
+            trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
+                .expect("modeled fixture bits should decode");
+        let mismatch = first_modeled_bit_mismatch(&bit_trace)
+            .expect("fixture should still expose the provisional mismatch");
+        let expected = &expected_trace[mismatch.index];
+
+        assert!(mismatch.index > 14);
+        eprintln!("selected-context adjusted first mismatch: {mismatch:?}");
+        eprintln!("selected-context adjusted expected decision: {expected:?}");
+    }
+
+    #[test]
+    #[ignore = "scores simple entropy context initializers against the fixture"]
+    fn fixture_entropy_context_initializer_variants() {
+        let variants = [
+            EntropyInitializerVariant::Uniform,
+            EntropyInitializerVariant::HighDiscovered,
+            EntropyInitializerVariant::HighDiscoveredLowRankConservative,
+            EntropyInitializerVariant::HighDiscoveredLowRankVeryConservative,
+            EntropyInitializerVariant::HighDiscoveredEarlySelectorsVeryConservative,
+            EntropyInitializerVariant::RankTreeSelectedHigh,
+            EntropyInitializerVariant::RankTreeSelectedHighLowRankVeryConservative,
+        ];
+        let mut scored = variants
+            .into_iter()
+            .map(|variant| {
+                let mismatch = first_fixture_mismatch_with_initializer(|model| {
+                    apply_entropy_initializer_variant(model, variant);
+                });
+                (variant, mismatch.index)
+            })
+            .collect::<Vec<_>>();
+
+        scored.sort_by_key(|(_, mismatch_index)| *mismatch_index);
+        let best = scored
+            .last()
+            .expect("at least one initializer variant should be scored");
+
+        eprintln!("entropy initializer variant scores: {scored:?}");
+        assert_eq!(
+            best.0,
+            EntropyInitializerVariant::HighDiscoveredLowRankVeryConservative
+        );
+        assert_eq!(best.1, 22);
+    }
+
+    #[test]
+    #[ignore = "prints the next mismatch after the best simple initializer"]
+    fn fixture_best_simple_initializer_identifies_next_mismatch() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_trace = expected_decision_trace_from_ranks(&expected_ranks);
+        let mismatch = first_fixture_mismatch_with_initializer(|model| {
+            apply_entropy_initializer_variant(
+                model,
+                EntropyInitializerVariant::HighDiscoveredLowRankVeryConservative,
+            );
+        });
+        let expected = &expected_trace[mismatch.index];
+
+        assert_eq!(mismatch.index, 22);
+        eprintln!("best simple initializer first mismatch: {mismatch:?}");
+        eprintln!("best simple initializer expected decision: {expected:?}");
+    }
+
+    #[test]
     #[ignore = "calibrates provisional bit-model splits against expected fixture decisions"]
     fn fixture_expected_decisions_have_consistent_split_constraints() {
         let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
@@ -1185,15 +1327,15 @@ mod tests {
         assert_eq!(
             conflict.key,
             SplitConstraintKey {
-                context_id: 7,
+                context_id: 16,
                 state: BIT_MODEL_INITIAL_STATE,
             }
         );
-        assert_eq!(conflict.decision, 24);
-        assert_eq!(conflict.min_split, 44_284);
-        assert_eq!(conflict.min_decision, 4);
-        assert_eq!(conflict.max_split, 41_719);
-        assert_eq!(conflict.max_decision, 24);
+        assert_eq!(conflict.decision, 68);
+        assert_eq!(conflict.min_split, 40_363);
+        assert_eq!(conflict.min_decision, 14);
+        assert_eq!(conflict.max_split, 10_512);
+        assert_eq!(conflict.max_decision, 68);
     }
 
     #[test]
@@ -1247,14 +1389,19 @@ mod tests {
             first.split_before,
             BitModelTables::generated().split(first.state_before)
         );
-        assert_eq!(first.state_after, 28);
+        assert_eq!(
+            first.state_after,
+            BitModelTables::generated().next_state(first.state_before, first.expected_bit)
+        );
         assert_eq!(second.expected_bit, 0);
-        assert_eq!(second.state_before, 24);
         assert_eq!(
             second.split_before,
             BitModelTables::generated().split(second.state_before)
         );
-        assert_eq!(second.state_after, 28);
+        assert_eq!(
+            second.state_after,
+            BitModelTables::generated().next_state(second.state_before, second.expected_bit)
+        );
         eprintln!("context 23 state trace: {state_trace:?}");
     }
 
@@ -1483,6 +1630,77 @@ mod tests {
             .find(|entry| entry.actual_bit != entry.expected_bit)
     }
 
+    fn first_fixture_mismatch_with_initializer(
+        initialize: impl FnOnce(&mut BitModel),
+    ) -> ModeledBitTrace {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let _ = decoder.next_block_len();
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        initialize(&mut model);
+        let bit_trace =
+            trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
+                .expect("modeled fixture bits should decode");
+
+        first_modeled_bit_mismatch(&bit_trace)
+            .expect("fixture should still expose the provisional mismatch")
+            .clone()
+    }
+
+    fn apply_entropy_initializer_variant(model: &mut BitModel, variant: EntropyInitializerVariant) {
+        match variant {
+            EntropyInitializerVariant::Uniform => {}
+            EntropyInitializerVariant::HighDiscovered => {
+                model.context_mut(9).state = 59;
+                model.context_mut(16).state = 59;
+            }
+            EntropyInitializerVariant::HighDiscoveredLowRankConservative => {
+                model.context_mut(RANK_ZERO_CONTEXT).state = 24;
+                model.context_mut(RANK_ONE_CONTEXT).state = 24;
+                model.context_mut(9).state = 59;
+                model.context_mut(16).state = 59;
+            }
+            EntropyInitializerVariant::HighDiscoveredLowRankVeryConservative => {
+                model.context_mut(RANK_ZERO_CONTEXT).state = 18;
+                model.context_mut(RANK_ONE_CONTEXT).state = 18;
+                model.context_mut(9).state = 59;
+                model.context_mut(16).state = 59;
+            }
+            EntropyInitializerVariant::HighDiscoveredEarlySelectorsVeryConservative => {
+                for context_id in [RANK_ZERO_CONTEXT, RANK_ONE_CONTEXT, 2, 4] {
+                    model.context_mut(context_id).state = 18;
+                }
+                model.context_mut(9).state = 59;
+                model.context_mut(16).state = 59;
+            }
+            EntropyInitializerVariant::RankTreeSelectedHigh => {
+                for context_id in [7, 9, 16, 23] {
+                    model.context_mut(context_id).state = 59;
+                }
+            }
+            EntropyInitializerVariant::RankTreeSelectedHighLowRankVeryConservative => {
+                model.context_mut(RANK_ZERO_CONTEXT).state = 18;
+                model.context_mut(RANK_ONE_CONTEXT).state = 18;
+                for context_id in [7, 9, 16, 23] {
+                    model.context_mut(context_id).state = 59;
+                }
+            }
+        }
+    }
+
+    fn states_satisfying_split_constraint(constraint: SplitConstraint) -> Vec<u8> {
+        let tables = BitModelTables::generated();
+        (0..BIT_MODEL_STATES)
+            .filter_map(|state| {
+                let state = u8::try_from(state).expect("bit-model state should fit in u8");
+                let split = tables.split(state);
+                (split >= constraint.min_split && split <= constraint.max_split).then_some(state)
+            })
+            .collect()
+    }
+
+    #[derive(Debug, Clone)]
     struct ModeledBitTrace {
         index: usize,
         context_id: usize,
@@ -1518,6 +1736,17 @@ mod tests {
         group_selected_bit: u8,
         offset_msb_first: bool,
         invert_offset_bits: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EntropyInitializerVariant {
+        Uniform,
+        HighDiscovered,
+        HighDiscoveredLowRankConservative,
+        HighDiscoveredLowRankVeryConservative,
+        HighDiscoveredEarlySelectorsVeryConservative,
+        RankTreeSelectedHigh,
+        RankTreeSelectedHighLowRankVeryConservative,
     }
 
     impl Default for RankDecisionOptions {
