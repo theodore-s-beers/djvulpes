@@ -15,6 +15,20 @@ pub enum BzzError {
     IncompleteDecoder(&'static str),
     #[error("BZZ block declares unsupported size {size} bytes")]
     UnsupportedBlockSize { size: usize },
+    #[error(
+        "BZZ block has invalid Burrows-Wheeler marker position {marker_pos} for block size {block_len}"
+    )]
+    InvalidBwtMarker { marker_pos: usize, block_len: usize },
+    #[error("BZZ block failed Burrows-Wheeler reconstruction check")]
+    InvalidBwtTransform,
+    #[error("BZZ rank stream ended before {expected_len} block symbols were decoded")]
+    TruncatedRankStream { expected_len: usize },
+    #[error("BZZ rank stream contains invalid rank {rank}")]
+    InvalidSymbolRank { rank: usize },
+    #[error("BZZ rank stream does not contain a Burrows-Wheeler marker")]
+    MissingBwtMarker,
+    #[error("BZZ rank stream contains multiple Burrows-Wheeler markers")]
+    DuplicateBwtMarker,
     #[error("failed to write {path}: {source}")]
     Write { path: PathBuf, source: io::Error },
     #[error("failed to run bzz: {0}")]
@@ -93,8 +107,8 @@ fn decode_bzz_with_local_tool(bytes: &[u8]) -> BzzResult<Vec<u8>> {
 }
 
 fn decode_bzz_in_memory(bytes: &[u8]) -> BzzResult<Vec<u8>> {
-    let mut decoder = InMemoryDecoder::new(bytes);
-    let block_size = decoder.decode_block_size();
+    let mut decoder = BzzDecoder::new(bytes);
+    let block_size = decoder.next_block_len();
 
     if block_size == 0 {
         return Ok(Vec::new());
@@ -103,126 +117,350 @@ fn decode_bzz_in_memory(bytes: &[u8]) -> BzzResult<Vec<u8>> {
         return Err(BzzError::UnsupportedBlockSize { size: block_size });
     }
 
-    Err(BzzError::IncompleteDecoder(
-        "block symbol decoding and inverse BWT are not implemented yet",
-    ))
+    let ranks = decoder.decode_block_ranks(block_size)?;
+    decode_block_from_ranks(block_size, ranks)
 }
 
 const MAX_BLOCK_BYTES: usize = 4096 * 1024;
+const BWT_MARKER_RANK: usize = 256;
 
-struct InMemoryDecoder<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    a: u16,
-    buffer: u64,
-    code: u16,
-    fence: u16,
-    byte: u8,
-    delay: u8,
-    scount: u8,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockSymbols {
+    symbols: Vec<u8>,
+    marker_pos: usize,
 }
 
-impl<'a> InMemoryDecoder<'a> {
+fn inverse_bwt_block(symbols: &[u8], marker_pos: usize) -> BzzResult<Vec<u8>> {
+    if marker_pos == 0 || marker_pos >= symbols.len() {
+        return Err(BzzError::InvalidBwtMarker {
+            marker_pos,
+            block_len: symbols.len(),
+        });
+    }
+
+    let mut counts = [0usize; 256];
+    let mut links = vec![0usize; symbols.len()];
+
+    for (index, symbol) in symbols.iter().copied().enumerate() {
+        if index == marker_pos {
+            continue;
+        }
+
+        let symbol_index = usize::from(symbol);
+        links[index] = (symbol_index << 24) | counts[symbol_index];
+        counts[symbol_index] += 1;
+    }
+
+    let mut next_sorted_index = 1usize;
+    for count in &mut counts {
+        let symbol_count = *count;
+        *count = next_sorted_index;
+        next_sorted_index += symbol_count;
+    }
+
+    let mut decoded = vec![0; symbols.len() - 1];
+    let mut link_index = 0usize;
+    for output_index in (0..decoded.len()).rev() {
+        let link = links[link_index];
+        let symbol = link >> 24;
+        decoded[output_index] =
+            u8::try_from(symbol).expect("BWT link symbol should fit in one byte");
+        link_index = counts[symbol] + (link & 0x00ff_ffff);
+    }
+
+    if link_index != marker_pos {
+        return Err(BzzError::InvalidBwtTransform);
+    }
+
+    Ok(decoded)
+}
+
+fn decode_block_from_ranks<I>(block_len: usize, ranks: I) -> BzzResult<Vec<u8>>
+where
+    I: IntoIterator<Item = usize>,
+{
+    let block = block_symbols_from_ranks(block_len, ranks)?;
+    inverse_bwt_block(&block.symbols, block.marker_pos)
+}
+
+fn collect_block_ranks<R>(block_len: usize, decoder: &mut R) -> BzzResult<Vec<usize>>
+where
+    R: RankDecoder,
+{
+    let mut ranks = Vec::with_capacity(block_len);
+    for _ in 0..block_len {
+        ranks.push(decoder.next_rank()?);
+    }
+    Ok(ranks)
+}
+
+fn block_symbols_from_ranks<I>(block_len: usize, ranks: I) -> BzzResult<BlockSymbols>
+where
+    I: IntoIterator<Item = usize>,
+{
+    let mut table = MoveToFrontTable::new();
+    let mut symbols = Vec::with_capacity(block_len);
+    let mut marker_pos = None;
+    let mut ranks = ranks.into_iter();
+
+    for index in 0..block_len {
+        let Some(rank) = ranks.next() else {
+            return Err(BzzError::TruncatedRankStream {
+                expected_len: block_len,
+            });
+        };
+
+        if rank == BWT_MARKER_RANK {
+            if marker_pos.replace(index).is_some() {
+                return Err(BzzError::DuplicateBwtMarker);
+            }
+            symbols.push(0);
+        } else {
+            symbols.push(table.take(rank)?);
+        }
+    }
+
+    let Some(marker_pos) = marker_pos else {
+        return Err(BzzError::MissingBwtMarker);
+    };
+
+    Ok(BlockSymbols {
+        symbols,
+        marker_pos,
+    })
+}
+
+struct MoveToFrontTable {
+    symbols: Vec<u8>,
+}
+
+impl MoveToFrontTable {
+    fn new() -> Self {
+        Self {
+            symbols: (0..=u8::MAX).collect(),
+        }
+    }
+
+    fn take(&mut self, rank: usize) -> BzzResult<u8> {
+        if rank >= self.symbols.len() {
+            return Err(BzzError::InvalidSymbolRank { rank });
+        }
+
+        let symbol = self.symbols.remove(rank);
+        self.symbols.insert(0, symbol);
+        Ok(symbol)
+    }
+}
+
+struct BzzDecoder<'a> {
+    bits: ZpBitReader<'a>,
+}
+
+impl<'a> BzzDecoder<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        let (code, pos) = match bytes {
+        Self {
+            bits: ZpBitReader::new(bytes),
+        }
+    }
+
+    fn next_block_len(&mut self) -> usize {
+        let mut value = 1usize;
+        let block_len_marker = 1usize << 24;
+
+        while value < block_len_marker {
+            let split = 0x8000 + (u32::from(self.bits.lower_bound()) >> 1);
+            value = (value << 1) | usize::from(self.bits.read_split_bit(split));
+        }
+
+        value - block_len_marker
+    }
+
+    fn decode_block_ranks(&mut self, block_len: usize) -> BzzResult<Vec<usize>> {
+        let mut ranks = EntropyRankDecoder::new(&mut self.bits);
+        collect_block_ranks(block_len, &mut ranks)
+    }
+}
+
+trait RankDecoder {
+    fn next_rank(&mut self) -> BzzResult<usize>;
+}
+
+struct EntropyRankDecoder<'bits, 'input> {
+    bits: &'bits mut ZpBitReader<'input>,
+    model: BitModel,
+}
+
+impl<'bits, 'input> EntropyRankDecoder<'bits, 'input> {
+    fn new(bits: &'bits mut ZpBitReader<'input>) -> Self {
+        Self {
+            bits,
+            model: BitModel::with_contexts(ENTROPY_CONTEXTS),
+        }
+    }
+}
+
+impl RankDecoder for EntropyRankDecoder<'_, '_> {
+    fn next_rank(&mut self) -> BzzResult<usize> {
+        let _ = self.model.read_bit(self.bits, 0)?;
+        Err(BzzError::IncompleteDecoder(
+            "entropy rank tree is not implemented yet",
+        ))
+    }
+}
+
+const ENTROPY_CONTEXTS: usize = 300;
+
+trait ModeledBitReader {
+    fn read_modeled_bit(&mut self, split: u16) -> BzzResult<u8>;
+}
+
+#[derive(Debug, Clone)]
+struct BitModel {
+    contexts: Vec<BitContext>,
+}
+
+impl BitModel {
+    fn with_contexts(count: usize) -> Self {
+        Self {
+            contexts: vec![BitContext::default(); count],
+        }
+    }
+
+    fn read_bit<R>(&mut self, reader: &mut R, context_id: usize) -> BzzResult<u8>
+    where
+        R: ModeledBitReader,
+    {
+        let context = &mut self.contexts[context_id];
+        let bit = reader.read_modeled_bit(context.split)?;
+        context.observe(bit);
+        Ok(bit)
+    }
+
+    #[cfg(test)]
+    fn context(&self, context_id: usize) -> &BitContext {
+        &self.contexts[context_id]
+    }
+}
+
+impl ModeledBitReader for ZpBitReader<'_> {
+    fn read_modeled_bit(&mut self, split: u16) -> BzzResult<u8> {
+        Ok(self.read_split_bit(u32::from(split)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BitContext {
+    split: u16,
+}
+
+impl Default for BitContext {
+    fn default() -> Self {
+        Self { split: 0x8000 }
+    }
+}
+
+impl BitContext {
+    fn observe(&mut self, bit: u8) {
+        let target = if bit == 0 { 0xffff } else { 1 };
+        let delta = target - i32::from(self.split);
+        let next = i32::from(self.split) + delta / 8;
+        self.split = u16::try_from(next.clamp(1, 0xffff))
+            .expect("clamped bit-model split should fit in u16");
+    }
+}
+
+struct ZpBitReader<'a> {
+    input: &'a [u8],
+    cursor: usize,
+    lower_bound: u16,
+    code_window: u16,
+    shift_buffer: u64,
+    buffered_bits: u8,
+    end_padding: u8,
+}
+
+impl<'a> ZpBitReader<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        let (code_window, cursor) = match input {
             [first, second, ..] => (u16::from_be_bytes([*first, *second]), 2),
             [first] => ((u16::from(*first) << 8) | 0x00ff, 1),
             [] => (0xffff, 0),
         };
-        let fence = if code >= 0x8000 { 0x7fff } else { code };
 
         Self {
-            bytes,
-            pos,
-            a: 0,
-            buffer: 0,
-            code,
-            fence,
-            byte: (code & 0x00ff) as u8,
-            delay: 25,
-            scount: 0,
+            input,
+            cursor,
+            lower_bound: 0,
+            code_window,
+            shift_buffer: 0,
+            buffered_bits: 0,
+            end_padding: 25,
         }
     }
 
-    fn decode_block_size(&mut self) -> usize {
-        let mut n = 1usize;
-        let marker = 1usize << 24;
-
-        while n < marker {
-            let z = 0x8000 + (u32::from(self.a) >> 1);
-            let bit = self.decode_sub(z, None);
-            n = (n << 1) | usize::from(bit);
-        }
-
-        n - marker
+    const fn lower_bound(&self) -> u16 {
+        self.lower_bound
     }
 
-    fn decode_sub(&mut self, mut z: u32, ctx: Option<u8>) -> u8 {
-        self.ensure_code_bits();
+    fn read_split_bit(&mut self, mut split: u32) -> u8 {
+        self.refill();
 
-        let mut a = u32::from(self.a);
-        let mut bit = ctx.map_or(0, |ctx| ctx & 1);
-        if ctx.is_some() {
-            let d = 0x6000 + ((z + a) >> 2);
-            z = z.min(d);
-        }
+        let mut lower_bound = u32::from(self.lower_bound);
+        let mut code_window = u32::from(self.code_window);
+        let bit;
 
-        let mut code = u32::from(self.code);
-        if z > code {
-            bit ^= 1;
-            z = 0x10000 - z;
-            a += z;
-            code += z;
+        if split > code_window {
+            bit = 1;
+            split = 0x10000 - split;
+            lower_bound += split;
+            code_window += split;
 
-            let shift = if a >= 0xff00 {
-                first_zero_bit((a & 0x00ff) as u8) + 8
+            let shift = if lower_bound >= 0xff00 {
+                leading_one_bits((lower_bound & 0x00ff) as u8) + 8
             } else {
-                first_zero_bit(((a >> 8) & 0x00ff) as u8)
+                leading_one_bits(((lower_bound >> 8) & 0x00ff) as u8)
             };
-            self.scount = self.scount.saturating_sub(shift);
-            self.a = ((a << shift) & 0xffff) as u16;
-            code = ((code << shift) & 0xffff) | self.buffer_bits(shift);
+            self.buffered_bits = self.buffered_bits.saturating_sub(shift);
+            lower_bound = (lower_bound << shift) & 0xffff;
+            code_window = ((code_window << shift) & 0xffff) | self.take_buffered_bits(shift);
         } else {
-            self.scount = self.scount.saturating_sub(1);
-            self.a = ((z << 1) & 0xffff) as u16;
-            code = ((code << 1) & 0xffff) | self.buffer_bits(1);
+            bit = 0;
+            self.buffered_bits = self.buffered_bits.saturating_sub(1);
+            lower_bound = (split << 1) & 0xffff;
+            code_window = ((code_window << 1) & 0xffff) | self.take_buffered_bits(1);
         }
 
-        self.fence = if code >= 0x8000 {
-            0x7fff
-        } else {
-            u16::try_from(code).expect("code below 0x8000 should fit in u16")
-        };
-        self.code = u16::try_from(code).expect("renormalized code should fit in u16");
+        self.lower_bound = u16::try_from(lower_bound).expect("renormalized bound should fit u16");
+        self.code_window = u16::try_from(code_window).expect("renormalized code should fit u16");
         bit
     }
 
-    fn ensure_code_bits(&mut self) {
-        if self.scount >= 16 {
+    fn refill(&mut self) {
+        if self.buffered_bits >= 16 {
             return;
         }
 
-        while self.scount <= 24 {
-            if let Some(byte) = self.bytes.get(self.pos) {
-                self.byte = *byte;
-                self.pos += 1;
+        while self.buffered_bits <= 24 {
+            let byte = if let Some(byte) = self.input.get(self.cursor) {
+                self.cursor += 1;
+                *byte
             } else {
-                self.byte = 0xff;
-                self.delay = self.delay.saturating_sub(1);
-            }
+                self.end_padding = self.end_padding.saturating_sub(1);
+                0xff
+            };
 
-            self.buffer = (self.buffer << 8) | u64::from(self.byte);
-            self.scount += 8;
+            self.shift_buffer = (self.shift_buffer << 8) | u64::from(byte);
+            self.buffered_bits += 8;
         }
     }
 
-    fn buffer_bits(&self, shift: u8) -> u32 {
-        u32::try_from((self.buffer >> self.scount) & ((1u64 << shift) - 1))
+    fn take_buffered_bits(&self, count: u8) -> u32 {
+        u32::try_from((self.shift_buffer >> self.buffered_bits) & ((1u64 << count) - 1))
             .expect("requested bit buffer slice should fit in u32")
     }
 }
 
-const fn first_zero_bit(byte: u8) -> u8 {
+const fn leading_one_bits(byte: u8) -> u8 {
     let mut count = 0;
     let mut value = byte;
 
@@ -271,10 +509,10 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_decoder_reads_fixture_block_size() {
-        let mut decoder = InMemoryDecoder::new(HELLO_BZZ);
+    fn bzz_decoder_reads_fixture_block_len() {
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
 
-        assert_eq!(decoder.decode_block_size(), HELLO_RAW.len() + 1);
+        assert_eq!(decoder.next_block_len(), HELLO_RAW.len() + 1);
     }
 
     #[test]
@@ -282,6 +520,238 @@ mod tests {
         let error =
             decode_bzz_in_memory(HELLO_BZZ).expect_err("full in-memory decode is not complete yet");
 
-        assert!(matches!(error, BzzError::IncompleteDecoder(_)));
+        assert!(matches!(
+            error,
+            BzzError::IncompleteDecoder("entropy rank tree is not implemented yet")
+        ));
+    }
+
+    #[test]
+    fn bzz_decoder_rank_decode_seam_is_explicit() {
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let block_len = decoder.next_block_len();
+        let error = decoder
+            .decode_block_ranks(block_len)
+            .expect_err("rank entropy decode should be the remaining seam");
+
+        assert!(matches!(
+            error,
+            BzzError::IncompleteDecoder("entropy rank tree is not implemented yet")
+        ));
+    }
+
+    #[test]
+    fn inverse_bwt_reconstructs_banana_block() {
+        let symbols = [b'a', b'n', b'n', b'b', 0, b'a', b'a'];
+
+        let decoded = inverse_bwt_block(&symbols, 4).expect("BWT block should reconstruct");
+
+        assert_eq!(decoded, b"banana");
+    }
+
+    #[test]
+    fn inverse_bwt_reconstructs_repeated_bytes() {
+        let symbols = [b'a', b'a', b'a', 0];
+
+        let decoded = inverse_bwt_block(&symbols, 3).expect("BWT block should reconstruct");
+
+        assert_eq!(decoded, b"aaa");
+    }
+
+    #[test]
+    fn inverse_bwt_rejects_invalid_marker_position() {
+        let error = inverse_bwt_block(b"abc", 0).expect_err("marker 0 should fail");
+
+        assert!(matches!(error, BzzError::InvalidBwtMarker { .. }));
+    }
+
+    #[test]
+    fn block_symbols_from_ranks_applies_move_to_front_updates() {
+        let block = block_symbols_from_ranks(5, [98, 98, 0, BWT_MARKER_RANK, 0])
+            .expect("rank stream should decode");
+
+        assert_eq!(
+            block,
+            BlockSymbols {
+                symbols: vec![b'b', b'a', b'a', 0, b'a'],
+                marker_pos: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn block_symbols_from_ranks_rejects_missing_marker() {
+        let error = block_symbols_from_ranks(3, [0, 1, 2]).expect_err("marker should be required");
+
+        assert!(matches!(error, BzzError::MissingBwtMarker));
+    }
+
+    #[test]
+    fn block_symbols_from_ranks_rejects_duplicate_marker() {
+        let error = block_symbols_from_ranks(3, [0, BWT_MARKER_RANK, BWT_MARKER_RANK])
+            .expect_err("duplicate marker should fail");
+
+        assert!(matches!(error, BzzError::DuplicateBwtMarker));
+    }
+
+    #[test]
+    fn block_symbols_from_ranks_rejects_out_of_range_rank() {
+        let error =
+            block_symbols_from_ranks(2, [257, BWT_MARKER_RANK]).expect_err("bad rank should fail");
+
+        assert!(matches!(error, BzzError::InvalidSymbolRank { rank: 257 }));
+    }
+
+    #[test]
+    fn block_symbols_from_ranks_rejects_truncated_input() {
+        let error =
+            block_symbols_from_ranks(2, [BWT_MARKER_RANK]).expect_err("short ranks should fail");
+
+        assert!(matches!(
+            error,
+            BzzError::TruncatedRankStream { expected_len: 2 }
+        ));
+    }
+
+    #[test]
+    fn decode_block_from_ranks_reconstructs_banana() {
+        let decoded = decode_block_from_ranks(7, [97, 110, 0, 99, BWT_MARKER_RANK, 2, 0])
+            .expect("rank pipeline should decode");
+
+        assert_eq!(decoded, b"banana");
+    }
+
+    #[test]
+    fn decode_block_from_ranks_reconstructs_repeated_bytes() {
+        let decoded = decode_block_from_ranks(4, [97, 0, 0, BWT_MARKER_RANK])
+            .expect("rank pipeline should decode");
+
+        assert_eq!(decoded, b"aaa");
+    }
+
+    #[test]
+    fn decode_block_from_ranks_propagates_rank_errors() {
+        let error =
+            decode_block_from_ranks(2, [257, BWT_MARKER_RANK]).expect_err("bad rank should fail");
+
+        assert!(matches!(error, BzzError::InvalidSymbolRank { rank: 257 }));
+    }
+
+    #[test]
+    fn collect_block_ranks_reads_exact_block_len() {
+        let mut decoder = ScriptedRankDecoder::new([1, 2, BWT_MARKER_RANK]);
+
+        let ranks = collect_block_ranks(3, &mut decoder).expect("ranks should collect");
+
+        assert_eq!(ranks, [1, 2, BWT_MARKER_RANK]);
+        assert_eq!(decoder.remaining(), 0);
+    }
+
+    #[test]
+    fn collect_block_ranks_propagates_decoder_errors() {
+        let mut decoder = ScriptedRankDecoder::new([1]);
+
+        let error = collect_block_ranks(2, &mut decoder).expect_err("short decoder should fail");
+
+        assert!(matches!(
+            error,
+            BzzError::TruncatedRankStream { expected_len: 2 }
+        ));
+    }
+
+    #[test]
+    fn bit_model_reads_from_context_and_updates_toward_zero() {
+        let mut model = BitModel::with_contexts(1);
+        let mut reader = ScriptedModeledBitReader::new([0]);
+
+        let bit = model
+            .read_bit(&mut reader, 0)
+            .expect("modeled bit should read");
+
+        assert_eq!(bit, 0);
+        assert_eq!(reader.splits, [0x8000]);
+        assert!(model.context(0).split > 0x8000);
+    }
+
+    #[test]
+    fn bit_model_reads_from_context_and_updates_toward_one() {
+        let mut model = BitModel::with_contexts(1);
+        let mut reader = ScriptedModeledBitReader::new([1]);
+
+        let bit = model
+            .read_bit(&mut reader, 0)
+            .expect("modeled bit should read");
+
+        assert_eq!(bit, 1);
+        assert_eq!(reader.splits, [0x8000]);
+        assert!(model.context(0).split < 0x8000);
+    }
+
+    #[test]
+    fn bit_model_keeps_contexts_independent() {
+        let mut model = BitModel::with_contexts(2);
+        let mut reader = ScriptedModeledBitReader::new([0]);
+
+        model
+            .read_bit(&mut reader, 1)
+            .expect("modeled bit should read");
+
+        assert_eq!(model.context(0).split, 0x8000);
+        assert_ne!(model.context(1).split, 0x8000);
+    }
+
+    struct ScriptedRankDecoder {
+        ranks: std::vec::IntoIter<usize>,
+        original_len: usize,
+    }
+
+    impl ScriptedRankDecoder {
+        fn new<I>(ranks: I) -> Self
+        where
+            I: IntoIterator<Item = usize>,
+        {
+            let ranks = ranks.into_iter().collect::<Vec<_>>();
+            let original_len = ranks.len();
+            Self {
+                ranks: ranks.into_iter(),
+                original_len,
+            }
+        }
+
+        fn remaining(&self) -> usize {
+            self.ranks.len()
+        }
+    }
+
+    impl RankDecoder for ScriptedRankDecoder {
+        fn next_rank(&mut self) -> BzzResult<usize> {
+            self.ranks.next().ok_or(BzzError::TruncatedRankStream {
+                expected_len: self.original_len + 1,
+            })
+        }
+    }
+
+    struct ScriptedModeledBitReader {
+        bits: std::vec::IntoIter<u8>,
+        splits: Vec<u16>,
+    }
+
+    impl ScriptedModeledBitReader {
+        fn new<I>(bits: I) -> Self
+        where
+            I: IntoIterator<Item = u8>,
+        {
+            Self {
+                bits: bits.into_iter().collect::<Vec<_>>().into_iter(),
+                splits: Vec::new(),
+            }
+        }
+    }
+
+    impl ModeledBitReader for ScriptedModeledBitReader {
+        fn read_modeled_bit(&mut self, split: u16) -> BzzResult<u8> {
+            self.splits.push(split);
+            Ok(self.bits.next().unwrap_or(0))
+        }
     }
 }
