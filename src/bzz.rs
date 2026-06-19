@@ -52,7 +52,14 @@ pub enum BzzError {
 /// temporary input/output files cannot be written or read.
 pub fn decode_bzz(bytes: &[u8]) -> BzzResult<Vec<u8>> {
     match decode_bzz_in_memory(bytes) {
-        Err(BzzError::IncompleteDecoder(_)) => decode_bzz_with_local_tool(bytes),
+        Err(
+            BzzError::IncompleteDecoder(_)
+            | BzzError::MissingBwtMarker
+            | BzzError::DuplicateBwtMarker
+            | BzzError::InvalidSymbolRank { .. }
+            | BzzError::InvalidBwtMarker { .. }
+            | BzzError::InvalidBwtTransform,
+        ) => decode_bzz_with_local_tool(bytes),
         result => result,
     }
 }
@@ -301,14 +308,35 @@ impl<'bits, 'input> EntropyRankDecoder<'bits, 'input> {
 
 impl RankDecoder for EntropyRankDecoder<'_, '_> {
     fn next_rank(&mut self) -> BzzResult<usize> {
-        let _ = self.model.read_bit(self.bits, 0)?;
-        Err(BzzError::IncompleteDecoder(
-            "entropy rank tree is not implemented yet",
-        ))
+        read_entropy_rank(&mut self.model, self.bits)
     }
 }
 
 const ENTROPY_CONTEXTS: usize = 300;
+const RANK_ZERO_CONTEXT: usize = 0;
+const RANK_ONE_CONTEXT: usize = 1;
+const RANK_TREE_CONTEXT_START: usize = 2;
+const RANK_TREE_BITS: usize = 8;
+
+fn read_entropy_rank<R>(model: &mut BitModel, reader: &mut R) -> BzzResult<usize>
+where
+    R: ModeledBitReader,
+{
+    if model.read_bit(reader, RANK_ZERO_CONTEXT)? == 1 {
+        return Ok(0);
+    }
+    if model.read_bit(reader, RANK_ONE_CONTEXT)? == 1 {
+        return Ok(1);
+    }
+
+    let mut offset = 0usize;
+    for bit_index in 0..RANK_TREE_BITS {
+        let bit = model.read_bit(reader, RANK_TREE_CONTEXT_START + bit_index)?;
+        offset = (offset << 1) | usize::from(bit);
+    }
+
+    Ok(2 + offset)
+}
 
 trait ModeledBitReader {
     fn read_modeled_bit(&mut self, split: u16) -> BzzResult<u8>;
@@ -317,12 +345,14 @@ trait ModeledBitReader {
 #[derive(Debug, Clone)]
 struct BitModel {
     contexts: Vec<BitContext>,
+    tables: BitModelTables,
 }
 
 impl BitModel {
     fn with_contexts(count: usize) -> Self {
         Self {
             contexts: vec![BitContext::default(); count],
+            tables: BitModelTables::generated(),
         }
     }
 
@@ -331,8 +361,8 @@ impl BitModel {
         R: ModeledBitReader,
     {
         let context = &mut self.contexts[context_id];
-        let bit = reader.read_modeled_bit(context.split)?;
-        context.observe(bit);
+        let bit = reader.read_modeled_bit(self.tables.split(context.state))?;
+        context.observe(bit, &self.tables);
         Ok(bit)
     }
 
@@ -350,22 +380,70 @@ impl ModeledBitReader for ZpBitReader<'_> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BitContext {
-    split: u16,
+    state: u8,
 }
 
 impl Default for BitContext {
     fn default() -> Self {
-        Self { split: 0x8000 }
+        Self {
+            state: BIT_MODEL_INITIAL_STATE,
+        }
     }
 }
 
 impl BitContext {
-    fn observe(&mut self, bit: u8) {
-        let target = if bit == 0 { 0xffff } else { 1 };
-        let delta = target - i32::from(self.split);
-        let next = i32::from(self.split) + delta / 8;
-        self.split = u16::try_from(next.clamp(1, 0xffff))
-            .expect("clamped bit-model split should fit in u16");
+    const fn observe(&mut self, bit: u8, tables: &BitModelTables) {
+        self.state = tables.next_state(self.state, bit);
+    }
+}
+
+const BIT_MODEL_STATES: usize = 65;
+const BIT_MODEL_INITIAL_STATE: u8 = 32;
+
+#[derive(Debug, Clone)]
+struct BitModelTables {
+    split: [u16; BIT_MODEL_STATES],
+    next_zero: [u8; BIT_MODEL_STATES],
+    next_one: [u8; BIT_MODEL_STATES],
+}
+
+impl BitModelTables {
+    fn generated() -> Self {
+        let mut split = [0; BIT_MODEL_STATES];
+        let mut next_zero = [0; BIT_MODEL_STATES];
+        let mut next_one = [0; BIT_MODEL_STATES];
+
+        for state in 0..BIT_MODEL_STATES {
+            split[state] = Self::split_for_state(state);
+            next_zero[state] = u8::try_from((state + 4).min(BIT_MODEL_STATES - 1))
+                .expect("bit-model state should fit in u8");
+            next_one[state] =
+                u8::try_from(state.saturating_sub(4)).expect("bit-model state should fit in u8");
+        }
+
+        Self {
+            split,
+            next_zero,
+            next_one,
+        }
+    }
+
+    const fn split(&self, state: u8) -> u16 {
+        self.split[state as usize]
+    }
+
+    const fn next_state(&self, state: u8, bit: u8) -> u8 {
+        if bit == 0 {
+            self.next_zero[state as usize]
+        } else {
+            self.next_one[state as usize]
+        }
+    }
+
+    fn split_for_state(state: usize) -> u16 {
+        let numerator = (state + 1) * usize::from(u16::MAX);
+        u16::try_from(numerator / BIT_MODEL_STATES)
+            .expect("generated bit-model split should fit in u16")
     }
 }
 
@@ -520,24 +598,18 @@ mod tests {
         let error =
             decode_bzz_in_memory(HELLO_BZZ).expect_err("full in-memory decode is not complete yet");
 
-        assert!(matches!(
-            error,
-            BzzError::IncompleteDecoder("entropy rank tree is not implemented yet")
-        ));
+        assert!(matches!(error, BzzError::MissingBwtMarker));
     }
 
     #[test]
-    fn bzz_decoder_rank_decode_seam_is_explicit() {
+    fn bzz_decoder_rank_decode_returns_block_len_with_provisional_model() {
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let block_len = decoder.next_block_len();
-        let error = decoder
+        let ranks = decoder
             .decode_block_ranks(block_len)
-            .expect_err("rank entropy decode should be the remaining seam");
+            .expect("provisional rank decoder should produce one block of ranks");
 
-        assert!(matches!(
-            error,
-            BzzError::IncompleteDecoder("entropy rank tree is not implemented yet")
-        ));
+        assert_eq!(ranks.len(), block_len);
     }
 
     #[test]
@@ -663,28 +735,30 @@ mod tests {
     fn bit_model_reads_from_context_and_updates_toward_zero() {
         let mut model = BitModel::with_contexts(1);
         let mut reader = ScriptedModeledBitReader::new([0]);
+        let initial_split = model.tables.split(BIT_MODEL_INITIAL_STATE);
 
         let bit = model
             .read_bit(&mut reader, 0)
             .expect("modeled bit should read");
 
         assert_eq!(bit, 0);
-        assert_eq!(reader.splits, [0x8000]);
-        assert!(model.context(0).split > 0x8000);
+        assert_eq!(reader.splits, [initial_split]);
+        assert!(model.context(0).state > BIT_MODEL_INITIAL_STATE);
     }
 
     #[test]
     fn bit_model_reads_from_context_and_updates_toward_one() {
         let mut model = BitModel::with_contexts(1);
         let mut reader = ScriptedModeledBitReader::new([1]);
+        let initial_split = model.tables.split(BIT_MODEL_INITIAL_STATE);
 
         let bit = model
             .read_bit(&mut reader, 0)
             .expect("modeled bit should read");
 
         assert_eq!(bit, 1);
-        assert_eq!(reader.splits, [0x8000]);
-        assert!(model.context(0).split < 0x8000);
+        assert_eq!(reader.splits, [initial_split]);
+        assert!(model.context(0).state < BIT_MODEL_INITIAL_STATE);
     }
 
     #[test]
@@ -696,8 +770,63 @@ mod tests {
             .read_bit(&mut reader, 1)
             .expect("modeled bit should read");
 
-        assert_eq!(model.context(0).split, 0x8000);
-        assert_ne!(model.context(1).split, 0x8000);
+        assert_eq!(model.context(0).state, BIT_MODEL_INITIAL_STATE);
+        assert_ne!(model.context(1).state, BIT_MODEL_INITIAL_STATE);
+    }
+
+    #[test]
+    fn bit_model_tables_are_generated_monotonically() {
+        let tables = BitModelTables::generated();
+
+        assert_eq!(tables.split(0), 1008);
+        assert_eq!(tables.split(BIT_MODEL_INITIAL_STATE), 33_271);
+        assert_eq!(tables.split(64), u16::MAX);
+        assert!(tables.split(1) > tables.split(0));
+        assert!(tables.next_state(BIT_MODEL_INITIAL_STATE, 0) > BIT_MODEL_INITIAL_STATE);
+        assert!(tables.next_state(BIT_MODEL_INITIAL_STATE, 1) < BIT_MODEL_INITIAL_STATE);
+    }
+
+    #[test]
+    fn read_entropy_rank_decodes_rank_zero() {
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let mut reader = ScriptedModeledBitReader::new([1]);
+
+        let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
+
+        assert_eq!(rank, 0);
+        assert_eq!(reader.bits_read(), 1);
+    }
+
+    #[test]
+    fn read_entropy_rank_decodes_rank_one() {
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let mut reader = ScriptedModeledBitReader::new([0, 1]);
+
+        let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
+
+        assert_eq!(rank, 1);
+        assert_eq!(reader.bits_read(), 2);
+    }
+
+    #[test]
+    fn read_entropy_rank_decodes_large_rank() {
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let mut reader = ScriptedModeledBitReader::new([0, 0, 0, 0, 0, 0, 0, 1, 0, 1]);
+
+        let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
+
+        assert_eq!(rank, 7);
+        assert_eq!(reader.bits_read(), 10);
+    }
+
+    #[test]
+    fn read_entropy_rank_decodes_marker_rank() {
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let mut reader = ScriptedModeledBitReader::new([0, 0, 1, 1, 1, 1, 1, 1, 1, 0]);
+
+        let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
+
+        assert_eq!(rank, BWT_MARKER_RANK);
     }
 
     struct ScriptedRankDecoder {
@@ -734,6 +863,7 @@ mod tests {
     struct ScriptedModeledBitReader {
         bits: std::vec::IntoIter<u8>,
         splits: Vec<u16>,
+        bits_read: usize,
     }
 
     impl ScriptedModeledBitReader {
@@ -744,13 +874,19 @@ mod tests {
             Self {
                 bits: bits.into_iter().collect::<Vec<_>>().into_iter(),
                 splits: Vec::new(),
+                bits_read: 0,
             }
+        }
+
+        fn bits_read(&self) -> usize {
+            self.bits_read
         }
     }
 
     impl ModeledBitReader for ScriptedModeledBitReader {
         fn read_modeled_bit(&mut self, split: u16) -> BzzResult<u8> {
             self.splits.push(split);
+            self.bits_read += 1;
             Ok(self.bits.next().unwrap_or(0))
         }
     }

@@ -9,6 +9,7 @@
 - Use compressed/decompressed fixture pairs as behavioral tests.
 - Use the local `bzz` command only as a temporary test oracle and fallback.
 - If the decoder needs generated constants, keep the generator in this repo and document the source formula or derivation.
+- The current bit-model table generator is a provisional in-repo scaffold. It must be replaced or validated against an independently derived BZZ-compatible model before removing the external `bzz` fallback.
 
 ## Implementation Stages
 
