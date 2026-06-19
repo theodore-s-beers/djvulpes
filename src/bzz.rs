@@ -524,6 +524,17 @@ impl<'a> ZpBitReader<'a> {
         bit
     }
 
+    #[cfg(test)]
+    fn decision_probe(&mut self) -> DecisionProbe {
+        self.refill();
+        DecisionProbe {
+            lower_bound: self.lower_bound,
+            code_window: self.code_window,
+            cursor: self.cursor,
+            buffered_bits: self.buffered_bits,
+        }
+    }
+
     fn refill(&mut self) {
         if self.buffered_bits >= 16 {
             return;
@@ -547,6 +558,15 @@ impl<'a> ZpBitReader<'a> {
         u32::try_from((self.shift_buffer >> self.buffered_bits) & ((1u64 << count) - 1))
             .expect("requested bit buffer slice should fit in u32")
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct DecisionProbe {
+    lower_bound: u16,
+    code_window: u16,
+    cursor: usize,
+    buffered_bits: u8,
 }
 
 const fn leading_one_bits(byte: u8) -> u8 {
@@ -919,10 +939,267 @@ mod tests {
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
-        let trace = trace_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
+        let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
             .expect("modeled fixture bits should decode");
 
         assert_modeled_bit_trace_matches(&trace);
+    }
+
+    #[test]
+    #[ignore = "pinpoints the first fixture entropy decision mismatch"]
+    fn fixture_first_entropy_mismatch_identifies_rank_path() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_trace = expected_decision_trace_from_ranks(&expected_ranks);
+        let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let _ = decoder.next_block_len();
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let bit_trace =
+            trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
+                .expect("modeled fixture bits should decode");
+        let mismatch = first_modeled_bit_mismatch(&bit_trace)
+            .expect("fixture should still expose the provisional mismatch");
+        let expected = &expected_trace[mismatch.index];
+
+        assert_eq!(mismatch.index, 4);
+        assert_eq!(mismatch.context_id, 7);
+        assert_eq!(mismatch.state_before, BIT_MODEL_INITIAL_STATE);
+        assert_eq!(mismatch.expected_bit, 1);
+        assert_eq!(mismatch.actual_bit, 0);
+        assert_eq!(expected.rank_index, 0);
+        assert_eq!(expected.rank, 10);
+        assert_eq!(expected.rank_decision_index, 4);
+
+        let actual_first_rank_decisions = bit_trace
+            .iter()
+            .take_while(|entry| entry.index <= mismatch.index)
+            .map(|entry| (entry.context_id, entry.actual_bit))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual_first_rank_decisions,
+            vec![
+                (RANK_ZERO_CONTEXT, 0),
+                (RANK_ONE_CONTEXT, 0),
+                (RANK_TREE_CONTEXT_START, 0),
+                (RANK_TREE_CONTEXT_START + 2, 0),
+                (RANK_TREE_CONTEXT_START + 5, 0),
+            ]
+        );
+        eprintln!("first mismatch expected decision: {expected:?}");
+    }
+
+    #[test]
+    #[ignore = "checks whether simple rank-tree variants explain the fixture mismatch"]
+    fn fixture_rank_tree_variants_do_not_explain_first_mismatch() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let variants = [
+            RankDecisionOptions {
+                group_selected_bit: 1,
+                offset_msb_first: true,
+                invert_offset_bits: false,
+            },
+            RankDecisionOptions {
+                group_selected_bit: 0,
+                offset_msb_first: true,
+                invert_offset_bits: false,
+            },
+            RankDecisionOptions {
+                group_selected_bit: 1,
+                offset_msb_first: false,
+                invert_offset_bits: false,
+            },
+            RankDecisionOptions {
+                group_selected_bit: 1,
+                offset_msb_first: true,
+                invert_offset_bits: true,
+            },
+            RankDecisionOptions {
+                group_selected_bit: 0,
+                offset_msb_first: false,
+                invert_offset_bits: false,
+            },
+            RankDecisionOptions {
+                group_selected_bit: 0,
+                offset_msb_first: true,
+                invert_offset_bits: true,
+            },
+            RankDecisionOptions {
+                group_selected_bit: 1,
+                offset_msb_first: false,
+                invert_offset_bits: true,
+            },
+            RankDecisionOptions {
+                group_selected_bit: 0,
+                offset_msb_first: false,
+                invert_offset_bits: true,
+            },
+        ];
+        let mut scored = variants
+            .into_iter()
+            .map(|options| {
+                let decisions = entropy_decisions_from_ranks_with_options(&expected_ranks, options);
+                let mut decoder = BzzDecoder::new(HELLO_BZZ);
+                let _ = decoder.next_block_len();
+                let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+                let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &decisions)
+                    .expect("modeled fixture bits should decode");
+                let matched = first_modeled_bit_mismatch(&trace)
+                    .map_or(trace.len(), |mismatch| mismatch.index);
+                (options, matched)
+            })
+            .collect::<Vec<_>>();
+
+        scored.sort_by_key(|(_, matched)| *matched);
+        let best = scored
+            .last()
+            .expect("at least one rank-tree variant should be scored");
+
+        assert_eq!(best.0.group_selected_bit, 1);
+        assert!(
+            best.1 <= 4,
+            "simple variant unexpectedly improved to {best:?}"
+        );
+        eprintln!("rank-tree variant scores: {scored:?}");
+    }
+
+    #[test]
+    #[ignore = "checks the initial split range needed by the first rank"]
+    fn fixture_first_rank_initial_split_constraints_are_satisfiable() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let _ = decoder.next_block_len();
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
+            .expect("modeled fixture bits should decode");
+        let first_rank_initial_state = trace
+            .iter()
+            .take(5)
+            .map(|entry| {
+                SplitConstraint::for_decision(
+                    entry.index,
+                    SplitConstraintKey {
+                        context_id: entry.context_id,
+                        state: entry.state_before,
+                    },
+                    entry.probe,
+                    entry.expected_bit,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut merged = SplitConstraint {
+            key: SplitConstraintKey {
+                context_id: usize::MAX,
+                state: BIT_MODEL_INITIAL_STATE,
+            },
+            min_split: 0,
+            max_split: u16::MAX,
+            min_decision: 0,
+            max_decision: 0,
+        };
+
+        for constraint in &first_rank_initial_state {
+            assert_eq!(constraint.key.state, BIT_MODEL_INITIAL_STATE);
+            merged.merge(*constraint);
+        }
+
+        assert!(merged.is_satisfiable());
+        assert!(merged.min_split > BitModelTables::generated().split(BIT_MODEL_INITIAL_STATE));
+        eprintln!("first-rank initial-state constraints: {first_rank_initial_state:?}");
+        eprintln!("merged initial-state constraint: {merged:?}");
+    }
+
+    #[test]
+    #[ignore = "calibrates provisional bit-model splits against expected fixture decisions"]
+    fn fixture_expected_decisions_have_consistent_split_constraints() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+        let _ = decoder.next_block_len();
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let search = split_constraints_for_expected_decisions(
+            &mut model,
+            &mut decoder.bits,
+            &expected_decisions,
+        )
+        .expect("fixture split constraints should compute");
+        let conflict = search
+            .conflict
+            .expect("actual-path split calibration should expose its first conflict");
+
+        assert!(
+            !search.constraints.is_empty(),
+            "fixture should produce split constraints"
+        );
+        assert_eq!(
+            conflict.key,
+            SplitConstraintKey {
+                context_id: 23,
+                state: BIT_MODEL_INITIAL_STATE,
+            }
+        );
+        assert_eq!(conflict.decision, 56);
+        assert_eq!(conflict.min_split, 63_481);
+        assert_eq!(conflict.min_decision, 28);
+        assert_eq!(conflict.max_split, 30_494);
+        assert_eq!(conflict.max_decision, 56);
+    }
+
+    #[test]
+    #[ignore = "prints expected rank-decision context around calibration conflicts"]
+    fn fixture_expected_decision_trace_identifies_context_conflicts() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let trace = expected_decision_trace_from_ranks(&expected_ranks);
+
+        let first = trace
+            .iter()
+            .find(|entry| entry.decision_index == 28)
+            .expect("decision 28 should exist");
+        let second = trace
+            .iter()
+            .find(|entry| entry.decision_index == 56)
+            .expect("decision 56 should exist");
+
+        assert_eq!(first.context_id, 23);
+        assert_eq!(first.rank_index, 2);
+        assert_eq!(first.rank, 115);
+        assert_eq!(first.rank_decision_index, 8);
+        assert_eq!(first.expected_bit, 1);
+        assert_eq!(second.context_id, 23);
+        assert_eq!(second.rank_index, 4);
+        assert_eq!(second.rank, 92);
+        assert_eq!(second.rank_decision_index, 8);
+        assert_eq!(second.expected_bit, 0);
+        eprintln!("decision 28: {first:?}");
+        eprintln!("decision 56: {second:?}");
+    }
+
+    #[test]
+    #[ignore = "prints context state evolution for conflicting expected decisions"]
+    fn fixture_context_23_state_trace_under_expected_bits() {
+        let expected_ranks = expected_ranks_from_raw(HELLO_RAW);
+        let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
+        let state_trace = expected_state_trace_for_context(&expected_decisions, 23);
+
+        let first = state_trace
+            .iter()
+            .find(|entry| entry.decision_index == 28)
+            .expect("decision 28 should be in context 23 trace");
+        let second = state_trace
+            .iter()
+            .find(|entry| entry.decision_index == 56)
+            .expect("decision 56 should be in context 23 trace");
+
+        assert_eq!(first.expected_bit, 1);
+        assert_eq!(first.state_before, BIT_MODEL_INITIAL_STATE);
+        assert_eq!(first.split_before, 33_271);
+        assert_eq!(first.state_after, 28);
+        assert_eq!(second.expected_bit, 0);
+        assert_eq!(second.state_before, 24);
+        assert_eq!(second.split_before, 25_205);
+        assert_eq!(second.state_after, 28);
+        eprintln!("context 23 state trace: {state_trace:?}");
     }
 
     fn expected_ranks_from_raw(raw: &[u8]) -> Vec<usize> {
@@ -931,14 +1208,76 @@ mod tests {
     }
 
     fn entropy_decisions_from_ranks(ranks: &[usize]) -> Vec<(usize, u8)> {
+        entropy_decisions_from_ranks_with_options(ranks, RankDecisionOptions::default())
+    }
+
+    fn entropy_decisions_from_ranks_with_options(
+        ranks: &[usize],
+        options: RankDecisionOptions,
+    ) -> Vec<(usize, u8)> {
         let mut decisions = Vec::new();
         for rank in ranks {
-            decisions.extend(entropy_decisions_for_rank(*rank));
+            decisions.extend(entropy_decisions_for_rank_with_options(*rank, options));
         }
         decisions
     }
 
+    fn expected_decision_trace_from_ranks(ranks: &[usize]) -> Vec<ExpectedDecisionTrace> {
+        let mut trace = Vec::new();
+        for (rank_index, rank) in ranks.iter().copied().enumerate() {
+            for (rank_decision_index, (context_id, expected_bit)) in
+                entropy_decisions_for_rank(rank).into_iter().enumerate()
+            {
+                trace.push(ExpectedDecisionTrace {
+                    decision_index: trace.len(),
+                    rank_index,
+                    rank,
+                    rank_decision_index,
+                    context_id,
+                    expected_bit,
+                });
+            }
+        }
+        trace
+    }
+
+    fn expected_state_trace_for_context(
+        expected_decisions: &[(usize, u8)],
+        target_context: usize,
+    ) -> Vec<ExpectedStateTrace> {
+        let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
+        let mut trace = Vec::new();
+
+        for (decision_index, (context_id, expected_bit)) in
+            expected_decisions.iter().copied().enumerate()
+        {
+            let state_before = model.context(context_id).state;
+            let split_before = model.tables.split(state_before);
+            model.contexts[context_id].observe(expected_bit, &model.tables);
+            let state_after = model.context(context_id).state;
+
+            if context_id == target_context {
+                trace.push(ExpectedStateTrace {
+                    decision_index,
+                    expected_bit,
+                    state_before,
+                    split_before,
+                    state_after,
+                });
+            }
+        }
+
+        trace
+    }
+
     fn entropy_decisions_for_rank(rank: usize) -> Vec<(usize, u8)> {
+        entropy_decisions_for_rank_with_options(rank, RankDecisionOptions::default())
+    }
+
+    fn entropy_decisions_for_rank_with_options(
+        rank: usize,
+        options: RankDecisionOptions,
+    ) -> Vec<(usize, u8)> {
         let mut decisions = vec![(RANK_ZERO_CONTEXT, u8::from(rank == 0))];
         if rank == 0 {
             return decisions;
@@ -954,12 +1293,27 @@ mod tests {
         for group_bits in 1..=RANK_GROUPS {
             let group_end = (group_start << 1) - 1;
             let rank_is_in_group = rank >= group_start && rank <= group_end;
-            decisions.push((context, u8::from(rank_is_in_group)));
+            decisions.push((
+                context,
+                if rank_is_in_group {
+                    options.group_selected_bit
+                } else {
+                    1 - options.group_selected_bit
+                },
+            ));
 
             if rank_is_in_group {
                 let offset = rank - group_start;
-                for bit_index in (0..group_bits).rev() {
-                    let bit = u8::from((offset & (1usize << bit_index)) != 0);
+                let bit_indexes = if options.offset_msb_first {
+                    (0..group_bits).rev().collect::<Vec<_>>()
+                } else {
+                    (0..group_bits).collect::<Vec<_>>()
+                };
+                for bit_index in bit_indexes {
+                    let mut bit = u8::from((offset & (1usize << bit_index)) != 0);
+                    if options.invert_offset_bits {
+                        bit = 1 - bit;
+                    }
                     decisions.push((context + 1 + (group_bits - 1 - bit_index), bit));
                 }
                 return decisions;
@@ -972,19 +1326,17 @@ mod tests {
         decisions
     }
 
-    fn trace_modeled_bits<R>(
+    fn trace_fixture_modeled_bits(
         model: &mut BitModel,
-        reader: &mut R,
+        reader: &mut ZpBitReader<'_>,
         expected_decisions: &[(usize, u8)],
-    ) -> BzzResult<Vec<ModeledBitTrace>>
-    where
-        R: ModeledBitReader,
-    {
+    ) -> BzzResult<Vec<ModeledBitTrace>> {
         let mut trace = Vec::with_capacity(expected_decisions.len());
 
         for (index, (context_id, expected_bit)) in expected_decisions.iter().copied().enumerate() {
             let state_before = model.context(context_id).state;
             let split_before = model.tables.split(state_before);
+            let probe = reader.decision_probe();
             let actual_bit = model.read_bit(reader, context_id)?;
             let state_after = model.context(context_id).state;
             trace.push(ModeledBitTrace {
@@ -995,10 +1347,58 @@ mod tests {
                 expected_bit,
                 actual_bit,
                 state_after,
+                probe,
             });
         }
 
         Ok(trace)
+    }
+
+    fn split_constraints_for_expected_decisions(
+        model: &mut BitModel,
+        reader: &mut ZpBitReader<'_>,
+        expected_decisions: &[(usize, u8)],
+    ) -> BzzResult<SplitConstraintSearch> {
+        let mut constraints: Vec<SplitConstraint> = Vec::new();
+
+        for (index, (context_id, expected_bit)) in expected_decisions.iter().copied().enumerate() {
+            let state_before = model.context(context_id).state;
+            let probe = reader.decision_probe();
+            let key = SplitConstraintKey {
+                context_id,
+                state: state_before,
+            };
+            let constraint = SplitConstraint::for_decision(index, key, probe, expected_bit);
+
+            if let Some(existing_index) =
+                constraints.iter().position(|existing| existing.key == key)
+            {
+                constraints[existing_index].merge(constraint);
+                let existing = constraints[existing_index];
+                if !existing.is_satisfiable() {
+                    return Ok(SplitConstraintSearch {
+                        constraints,
+                        conflict: Some(SplitConstraintConflict {
+                            key,
+                            decision: index,
+                            min_split: existing.min_split,
+                            max_split: existing.max_split,
+                            min_decision: existing.min_decision,
+                            max_decision: existing.max_decision,
+                        }),
+                    });
+                }
+            } else {
+                constraints.push(constraint);
+            }
+
+            let _ = model.read_bit(reader, context_id)?;
+        }
+
+        Ok(SplitConstraintSearch {
+            constraints,
+            conflict: None,
+        })
     }
 
     fn assert_modeled_bit_trace_matches(trace: &[ModeledBitTrace]) {
@@ -1006,14 +1406,25 @@ mod tests {
             assert_eq!(
                 entry.actual_bit,
                 entry.expected_bit,
-                "modeled bit mismatch at decision {}, context {}, state_before {}, split {}, state_after {}",
+                "modeled bit mismatch at decision {}, context {}, state_before {}, split {}, state_after {}, code_window {}, lower_bound {}, cursor {}, buffered_bits {}, split_needed_for_one {}",
                 entry.index,
                 entry.context_id,
                 entry.state_before,
                 entry.split_before,
                 entry.state_after,
+                entry.probe.code_window,
+                entry.probe.lower_bound,
+                entry.probe.cursor,
+                entry.probe.buffered_bits,
+                entry.probe.code_window.saturating_add(1),
             );
         }
+    }
+
+    fn first_modeled_bit_mismatch(trace: &[ModeledBitTrace]) -> Option<&ModeledBitTrace> {
+        trace
+            .iter()
+            .find(|entry| entry.actual_bit != entry.expected_bit)
     }
 
     struct ModeledBitTrace {
@@ -1024,6 +1435,114 @@ mod tests {
         expected_bit: u8,
         actual_bit: u8,
         state_after: u8,
+        probe: DecisionProbe,
+    }
+
+    #[derive(Debug)]
+    struct ExpectedDecisionTrace {
+        decision_index: usize,
+        rank_index: usize,
+        rank: usize,
+        rank_decision_index: usize,
+        context_id: usize,
+        expected_bit: u8,
+    }
+
+    #[derive(Debug)]
+    struct ExpectedStateTrace {
+        decision_index: usize,
+        expected_bit: u8,
+        state_before: u8,
+        split_before: u16,
+        state_after: u8,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct RankDecisionOptions {
+        group_selected_bit: u8,
+        offset_msb_first: bool,
+        invert_offset_bits: bool,
+    }
+
+    impl Default for RankDecisionOptions {
+        fn default() -> Self {
+            Self {
+                group_selected_bit: 1,
+                offset_msb_first: true,
+                invert_offset_bits: false,
+            }
+        }
+    }
+
+    struct SplitConstraintSearch {
+        constraints: Vec<SplitConstraint>,
+        conflict: Option<SplitConstraintConflict>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SplitConstraintKey {
+        context_id: usize,
+        state: u8,
+    }
+
+    struct SplitConstraintConflict {
+        key: SplitConstraintKey,
+        decision: usize,
+        min_split: u16,
+        max_split: u16,
+        min_decision: usize,
+        max_decision: usize,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct SplitConstraint {
+        key: SplitConstraintKey,
+        min_split: u16,
+        max_split: u16,
+        min_decision: usize,
+        max_decision: usize,
+    }
+
+    impl SplitConstraint {
+        fn for_decision(
+            index: usize,
+            key: SplitConstraintKey,
+            probe: DecisionProbe,
+            expected_bit: u8,
+        ) -> Self {
+            if expected_bit == 1 {
+                Self {
+                    key,
+                    min_split: probe.code_window.saturating_add(1),
+                    max_split: u16::MAX,
+                    min_decision: index,
+                    max_decision: index,
+                }
+            } else {
+                Self {
+                    key,
+                    min_split: 0,
+                    max_split: probe.code_window,
+                    min_decision: index,
+                    max_decision: index,
+                }
+            }
+        }
+
+        fn merge(&mut self, other: Self) {
+            if other.min_split > self.min_split {
+                self.min_split = other.min_split;
+                self.min_decision = other.min_decision;
+            }
+            if other.max_split < self.max_split {
+                self.max_split = other.max_split;
+                self.max_decision = other.max_decision;
+            }
+        }
+
+        const fn is_satisfiable(self) -> bool {
+            self.min_split <= self.max_split
+        }
     }
 
     fn expected_block_symbols_from_raw(raw: &[u8]) -> BlockSymbols {
