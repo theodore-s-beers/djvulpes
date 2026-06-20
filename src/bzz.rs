@@ -129,7 +129,7 @@ fn decode_bzz_in_memory(bytes: &[u8]) -> BzzResult<Vec<u8>> {
 
     let fshift = decoder.next_fshift()?;
     let ranks = decoder.decode_block_ranks(block_size, fshift)?;
-    decode_block_from_ranks(block_size, ranks)
+    decode_block_from_ranks(block_size, fshift, ranks)
 }
 
 const MAX_BLOCK_BYTES: usize = 4096 * 1024;
@@ -186,11 +186,11 @@ fn inverse_bwt_block(symbols: &[u8], marker_pos: usize) -> BzzResult<Vec<u8>> {
     Ok(decoded)
 }
 
-fn decode_block_from_ranks<I>(block_len: usize, ranks: I) -> BzzResult<Vec<u8>>
+fn decode_block_from_ranks<I>(block_len: usize, fshift: u8, ranks: I) -> BzzResult<Vec<u8>>
 where
     I: IntoIterator<Item = usize>,
 {
-    let block = block_symbols_from_ranks(block_len, ranks)?;
+    let block = block_symbols_from_ranks(block_len, fshift, ranks)?;
     inverse_bwt_block(&block.symbols, block.marker_pos)
 }
 
@@ -205,11 +205,11 @@ where
     Ok(ranks)
 }
 
-fn block_symbols_from_ranks<I>(block_len: usize, ranks: I) -> BzzResult<BlockSymbols>
+fn block_symbols_from_ranks<I>(block_len: usize, fshift: u8, ranks: I) -> BzzResult<BlockSymbols>
 where
     I: IntoIterator<Item = usize>,
 {
-    let mut table = MoveToFrontTable::new();
+    let mut table = BzzMoveToFrontTable::new(fshift);
     let mut symbols = Vec::with_capacity(block_len);
     let mut marker_pos = None;
     let mut ranks = ranks.into_iter();
@@ -241,14 +241,20 @@ where
     })
 }
 
-struct MoveToFrontTable {
+struct BzzMoveToFrontTable {
     symbols: Vec<u8>,
+    freq: [u32; 4],
+    fadd: u32,
+    fshift: u8,
 }
 
-impl MoveToFrontTable {
-    fn new() -> Self {
+impl BzzMoveToFrontTable {
+    fn new(fshift: u8) -> Self {
         Self {
             symbols: (0..=u8::MAX).collect(),
+            freq: [0; 4],
+            fadd: 4,
+            fshift,
         }
     }
 
@@ -257,9 +263,63 @@ impl MoveToFrontTable {
             return Err(BzzError::InvalidSymbolRank { rank });
         }
 
+        self.update_fadd();
         let symbol = self.symbols.remove(rank);
-        self.symbols.insert(0, symbol);
+        let symbol_freq = self
+            .freq
+            .get(rank)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(self.fadd);
+        let insert_at = self.insertion_index(rank, symbol_freq);
+        self.symbols.insert(insert_at, symbol);
+        self.rotate_freq(rank, insert_at, symbol_freq);
         Ok(symbol)
+    }
+
+    #[cfg(test)]
+    fn rank_of(&self, symbol: u8) -> Option<usize> {
+        self.symbols
+            .iter()
+            .position(|candidate| *candidate == symbol)
+    }
+
+    fn update_fadd(&mut self) {
+        self.fadd = self
+            .fadd
+            .saturating_add(self.fadd >> u32::from(self.fshift));
+
+        if self.fadd > 0x1000_0000 {
+            self.fadd /= 0x1000_0000;
+            for freq in &mut self.freq {
+                *freq /= 0x1000_0000;
+            }
+        }
+    }
+
+    fn insertion_index(&self, rank: usize, symbol_freq: u32) -> usize {
+        let max_insert = rank.min(3);
+        let mut insert_at = 0;
+
+        while insert_at < max_insert && self.freq[insert_at] >= symbol_freq {
+            insert_at += 1;
+        }
+
+        insert_at
+    }
+
+    fn rotate_freq(&mut self, rank: usize, insert_at: usize, symbol_freq: u32) {
+        if rank < 4 {
+            for index in (insert_at + 1..=rank).rev() {
+                self.freq[index] = self.freq[index - 1];
+            }
+        } else {
+            for index in (insert_at + 1..4).rev() {
+                self.freq[index] = self.freq[index - 1];
+            }
+        }
+
+        self.freq[insert_at] = symbol_freq;
     }
 }
 
@@ -991,6 +1051,38 @@ mod tests {
     }
 
     #[test]
+    fn spec_zp_mixed_passthrough_and_context_decode_matches_djvu_zp_oracle() {
+        let tables = candidate_zp_table_set();
+        let mut ours = SpecZpDecoder::new(HELLO_BZZ);
+        let mut oracle = djvu_zp::ZpDecoder::new(HELLO_BZZ).expect("fixture should initialize ZP");
+
+        for step in 0..26 {
+            assert_eq!(
+                ours.decode_raw() != 0,
+                oracle.decode_passthrough(),
+                "passthrough mismatch at step {step}"
+            );
+        }
+
+        let mut our_contexts = [0; 16];
+        let mut oracle_contexts = [0; 16];
+        for step in 0..256 {
+            let context = (step * 7) % our_contexts.len();
+            let our_bit = ours.decode_bit(&mut our_contexts[context], &tables) != 0;
+            let oracle_bit = oracle.decode_bit(&mut oracle_contexts[context]);
+
+            assert_eq!(
+                our_bit, oracle_bit,
+                "bit mismatch after passthrough at step {step}, context {context}"
+            );
+            assert_eq!(
+                our_contexts[context], oracle_contexts[context],
+                "context mismatch after passthrough at step {step}, context {context}"
+            );
+        }
+    }
+
+    #[test]
     fn djvu_zp_oracle_tables_have_expected_public_shape() {
         assert_eq!(djvu_zp::tables::PROB.len(), 256);
         assert_eq!(djvu_zp::tables::THRESHOLD.len(), 256);
@@ -1136,6 +1228,244 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "tracks true ZP rank decoding against BWT-derived fixture ranks"]
+    fn spec_zp_rank_stream_matches_expected_fixture_ranks() {
+        let tables = candidate_zp_table_set();
+        let mut decoder = SpecZpDecoder::new(HELLO_BZZ);
+        let block_len = spec_zp_next_block_len(&mut decoder);
+        let fshift = spec_zp_next_fshift(&mut decoder);
+        let mut contexts = [0; BZZ_MTF_CONTEXTS];
+        let mut previous_mtfno = 0;
+        let mut ranks = Vec::with_capacity(block_len);
+
+        for _ in 0..block_len {
+            let rank =
+                read_spec_zp_entropy_rank(&mut decoder, &mut contexts, &tables, previous_mtfno);
+            previous_mtfno = rank;
+            ranks.push(rank);
+        }
+
+        let expected = expected_ranks_from_raw_with_fshift(HELLO_RAW, fshift);
+        if ranks != expected {
+            let mismatch = ranks
+                .iter()
+                .zip(&expected)
+                .position(|(actual, expected)| actual != expected)
+                .expect("rank vectors should differ");
+            eprintln!(
+                "first mismatch at rank {mismatch}: actual={} expected={}",
+                ranks[mismatch], expected[mismatch]
+            );
+            eprintln!("actual ranks: {ranks:?}");
+            eprintln!("expected ranks: {expected:?}");
+        }
+
+        assert_eq!(ranks, expected);
+    }
+
+    #[test]
+    #[ignore = "prints first true-ZP rank under previous-MTFNO context class variants"]
+    fn fixture_first_spec_zp_rank_previous_context_variants() {
+        let tables = candidate_zp_table_set();
+
+        for previous_mtfno in [0, 1, 2, BWT_MARKER_RANK] {
+            let mut decoder = SpecZpDecoder::new(HELLO_BZZ);
+            let block_len = spec_zp_next_block_len(&mut decoder);
+            let fshift = spec_zp_next_fshift(&mut decoder);
+            let mut contexts = [0; BZZ_MTF_CONTEXTS];
+            let rank =
+                read_spec_zp_entropy_rank(&mut decoder, &mut contexts, &tables, previous_mtfno);
+
+            eprintln!(
+                "previous_mtfno={previous_mtfno} previous_class={} first_rank={rank} block_len={block_len} fshift={fshift}",
+                previous_mtfno.min(2)
+            );
+        }
+
+        eprintln!(
+            "expected_first_rank={}",
+            expected_ranks_from_raw_with_fshift(HELLO_RAW, 0)[0]
+        );
+    }
+
+    #[test]
+    #[ignore = "prints the first true-ZP rank decision path beside the expected path"]
+    fn fixture_first_spec_zp_rank_decision_path() {
+        let tables = candidate_zp_table_set();
+        let mut decoder = SpecZpDecoder::new(HELLO_BZZ);
+        let _ = spec_zp_next_block_len(&mut decoder);
+        let _ = spec_zp_next_fshift(&mut decoder);
+        let mut contexts = [0; BZZ_MTF_CONTEXTS];
+        let mut actual_path = Vec::new();
+
+        let previous_class = 0;
+        let bit = decoder.decode_bit(
+            &mut contexts[RANK_ZERO_CONTEXT_START + previous_class],
+            &tables,
+        );
+        actual_path.push((RANK_ZERO_CONTEXT_START + previous_class, bit));
+        if bit == 0 {
+            let bit = decoder.decode_bit(
+                &mut contexts[RANK_ONE_CONTEXT_START + previous_class],
+                &tables,
+            );
+            actual_path.push((RANK_ONE_CONTEXT_START + previous_class, bit));
+            if bit == 0 {
+                'ranges: for range in BZZ_MTF_RANGES {
+                    let bit = decoder.decode_bit(&mut contexts[range.selector_context], &tables);
+                    actual_path.push((range.selector_context, bit));
+                    if bit == 1 {
+                        let mut node = 0;
+                        for _ in 0..range.bits {
+                            let context = range.tree_context + node;
+                            let bit = decoder.decode_bit(&mut contexts[context], &tables);
+                            actual_path.push((context, bit));
+                            node = (node << 1) + 1 + usize::from(bit);
+                        }
+                        break 'ranges;
+                    }
+                }
+            }
+        }
+
+        let expected_rank = expected_ranks_from_raw_with_fshift(HELLO_RAW, 0)[0];
+        let expected_path = bzz_mtfno_context_path(expected_rank, 0);
+
+        eprintln!("actual first-rank path: {actual_path:?}");
+        eprintln!("expected rank: {expected_rank}");
+        eprintln!("expected first-rank path: {expected_path:?}");
+    }
+
+    #[test]
+    #[ignore = "prints first true-ZP rank for candidate raw-bit skips after the block length"]
+    fn fixture_first_spec_zp_rank_raw_skip_variants() {
+        let tables = candidate_zp_table_set();
+        let expected = expected_ranks_from_raw_with_fshift(HELLO_RAW, 0);
+
+        for raw_skip in 0..=32 {
+            let mut decoder = SpecZpDecoder::new(HELLO_BZZ);
+            let block_len = spec_zp_next_block_len(&mut decoder);
+            let mut raw_bits = Vec::new();
+            for _ in 0..raw_skip {
+                raw_bits.push(decoder.decode_raw());
+            }
+
+            let mut contexts = [0; BZZ_MTF_CONTEXTS];
+            let mut previous_mtfno = 0;
+            let mut ranks = Vec::new();
+            for _ in 0..expected.len() {
+                let rank =
+                    read_spec_zp_entropy_rank(&mut decoder, &mut contexts, &tables, previous_mtfno);
+                previous_mtfno = rank;
+                ranks.push(rank);
+            }
+            let matching_prefix = ranks
+                .iter()
+                .zip(&expected)
+                .take_while(|(actual, expected)| actual == expected)
+                .count();
+
+            eprintln!(
+                "raw_skip={raw_skip} raw_bits={raw_bits:?} first_rank={} expected_first={} matching_prefix={matching_prefix} block_len={block_len}",
+                ranks[0], expected[0]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "prints true-ZP rank stream after the one-raw-bit alignment candidate"]
+    fn fixture_spec_zp_one_raw_skip_rank_stream() {
+        let tables = candidate_zp_table_set();
+        let expected = expected_ranks_from_raw_with_fshift(HELLO_RAW, 0);
+        let mut decoder = SpecZpDecoder::new(HELLO_BZZ);
+        let block_len = spec_zp_next_block_len(&mut decoder);
+        let skipped = decoder.decode_raw();
+        let mut contexts = [0; BZZ_MTF_CONTEXTS];
+        let mut previous_mtfno = 0;
+        let mut ranks = Vec::with_capacity(block_len);
+
+        for _ in 0..block_len {
+            let rank =
+                read_spec_zp_entropy_rank(&mut decoder, &mut contexts, &tables, previous_mtfno);
+            previous_mtfno = rank;
+            ranks.push(rank);
+        }
+
+        let mismatch = ranks
+            .iter()
+            .zip(&expected)
+            .position(|(actual, expected)| actual != expected);
+
+        eprintln!("skipped_raw_bit={skipped}");
+        eprintln!("first_mismatch={mismatch:?}");
+        eprintln!("actual ranks: {ranks:?}");
+        eprintln!("expected ranks: {expected:?}");
+    }
+
+    #[test]
+    #[ignore = "prints first rank for selector-layout variants around the 4..7 group"]
+    fn fixture_first_spec_zp_rank_selector_layout_variants() {
+        let tables = candidate_zp_table_set();
+        let expected = expected_ranks_from_raw_with_fshift(HELLO_RAW, 0);
+        let variants: &[(&str, &[BzzMtfRange])] = &[
+            ("spec", &BZZ_MTF_RANGES),
+            (
+                "skip_4_7",
+                &[
+                    BzzMtfRange::new(2, 6, 7, 1),
+                    BzzMtfRange::new(8, 12, 13, 3),
+                    BzzMtfRange::new(16, 20, 21, 4),
+                    BzzMtfRange::new(32, 36, 37, 5),
+                    BzzMtfRange::new(64, 68, 69, 6),
+                    BzzMtfRange::new(128, 132, 133, 7),
+                ],
+            ),
+            (
+                "swap_4_7_and_8_15",
+                &[
+                    BzzMtfRange::new(2, 6, 7, 1),
+                    BzzMtfRange::new(8, 12, 13, 3),
+                    BzzMtfRange::new(4, 8, 9, 2),
+                    BzzMtfRange::new(16, 20, 21, 4),
+                    BzzMtfRange::new(32, 36, 37, 5),
+                    BzzMtfRange::new(64, 68, 69, 6),
+                    BzzMtfRange::new(128, 132, 133, 7),
+                ],
+            ),
+        ];
+
+        for (name, ranges) in variants {
+            let mut decoder = SpecZpDecoder::new(HELLO_BZZ);
+            let _ = spec_zp_next_block_len(&mut decoder);
+            let _ = spec_zp_next_fshift(&mut decoder);
+            let mut contexts = [0; BZZ_MTF_CONTEXTS];
+            let mut ranks = Vec::with_capacity(expected.len());
+            let mut previous_mtfno = 0;
+            for _ in 0..expected.len() {
+                let rank = read_spec_zp_entropy_rank_with_ranges(
+                    &mut decoder,
+                    &mut contexts,
+                    &tables,
+                    previous_mtfno,
+                    ranges,
+                );
+                previous_mtfno = rank;
+                ranks.push(rank);
+            }
+            let matching_prefix = ranks
+                .iter()
+                .zip(&expected)
+                .take_while(|(actual, expected)| actual == expected)
+                .count();
+
+            eprintln!(
+                "variant={name} first_rank={} expected_first={} matching_prefix={matching_prefix}",
+                ranks[0], expected[0]
+            );
+        }
+    }
+
+    #[test]
     fn inverse_bwt_reconstructs_banana_block() {
         let symbols = [b'a', b'n', b'n', b'b', 0, b'a', b'a'];
 
@@ -1175,7 +1505,7 @@ mod tests {
 
     #[test]
     fn block_symbols_from_ranks_applies_move_to_front_updates() {
-        let block = block_symbols_from_ranks(5, [98, 98, 0, BWT_MARKER_RANK, 0])
+        let block = block_symbols_from_ranks(5, 0, [98, 98, 0, BWT_MARKER_RANK, 0])
             .expect("rank stream should decode");
 
         assert_eq!(
@@ -1188,15 +1518,29 @@ mod tests {
     }
 
     #[test]
+    fn bzz_move_to_front_keeps_high_frequency_symbols_near_front() {
+        let mut table = BzzMoveToFrontTable::new(0);
+
+        assert_eq!(table.take(3).expect("rank 3 should decode"), 3);
+        assert_eq!(table.take(3).expect("rank 3 should decode"), 2);
+        assert_eq!(table.take(3).expect("rank 3 should decode"), 1);
+        assert_eq!(table.take(3).expect("rank 3 should decode"), 0);
+
+        assert_eq!(&table.symbols[..4], &[0, 1, 2, 3]);
+        assert!(table.freq.windows(2).all(|pair| pair[0] >= pair[1]));
+    }
+
+    #[test]
     fn block_symbols_from_ranks_rejects_missing_marker() {
-        let error = block_symbols_from_ranks(3, [0, 1, 2]).expect_err("marker should be required");
+        let error =
+            block_symbols_from_ranks(3, 0, [0, 1, 2]).expect_err("marker should be required");
 
         assert!(matches!(error, BzzError::MissingBwtMarker));
     }
 
     #[test]
     fn block_symbols_from_ranks_rejects_duplicate_marker() {
-        let error = block_symbols_from_ranks(3, [0, BWT_MARKER_RANK, BWT_MARKER_RANK])
+        let error = block_symbols_from_ranks(3, 0, [0, BWT_MARKER_RANK, BWT_MARKER_RANK])
             .expect_err("duplicate marker should fail");
 
         assert!(matches!(error, BzzError::DuplicateBwtMarker));
@@ -1204,8 +1548,8 @@ mod tests {
 
     #[test]
     fn block_symbols_from_ranks_rejects_out_of_range_rank() {
-        let error =
-            block_symbols_from_ranks(2, [257, BWT_MARKER_RANK]).expect_err("bad rank should fail");
+        let error = block_symbols_from_ranks(2, 0, [257, BWT_MARKER_RANK])
+            .expect_err("bad rank should fail");
 
         assert!(matches!(error, BzzError::InvalidSymbolRank { rank: 257 }));
     }
@@ -1213,7 +1557,7 @@ mod tests {
     #[test]
     fn block_symbols_from_ranks_rejects_truncated_input() {
         let error =
-            block_symbols_from_ranks(2, [BWT_MARKER_RANK]).expect_err("short ranks should fail");
+            block_symbols_from_ranks(2, 0, [BWT_MARKER_RANK]).expect_err("short ranks should fail");
 
         assert!(matches!(
             error,
@@ -1223,7 +1567,7 @@ mod tests {
 
     #[test]
     fn decode_block_from_ranks_reconstructs_banana() {
-        let decoded = decode_block_from_ranks(7, [97, 110, 0, 99, BWT_MARKER_RANK, 2, 0])
+        let decoded = decode_block_from_ranks(7, 0, [97, 110, 0, 99, BWT_MARKER_RANK, 2, 0])
             .expect("rank pipeline should decode");
 
         assert_eq!(decoded, b"banana");
@@ -1231,7 +1575,7 @@ mod tests {
 
     #[test]
     fn decode_block_from_ranks_reconstructs_repeated_bytes() {
-        let decoded = decode_block_from_ranks(4, [97, 0, 0, BWT_MARKER_RANK])
+        let decoded = decode_block_from_ranks(4, 0, [97, 0, 0, BWT_MARKER_RANK])
             .expect("rank pipeline should decode");
 
         assert_eq!(decoded, b"aaa");
@@ -1241,7 +1585,7 @@ mod tests {
     fn expected_fixture_ranks_reconstruct_hello_raw() {
         let ranks = expected_ranks_from_raw(HELLO_RAW);
 
-        let decoded = decode_block_from_ranks(HELLO_RAW.len() + 1, ranks)
+        let decoded = decode_block_from_ranks(HELLO_RAW.len() + 1, 0, ranks)
             .expect("rank fixture should decode");
 
         assert_eq!(decoded, HELLO_RAW);
@@ -1249,8 +1593,8 @@ mod tests {
 
     #[test]
     fn decode_block_from_ranks_propagates_rank_errors() {
-        let error =
-            decode_block_from_ranks(2, [257, BWT_MARKER_RANK]).expect_err("bad rank should fail");
+        let error = decode_block_from_ranks(2, 0, [257, BWT_MARKER_RANK])
+            .expect_err("bad rank should fail");
 
         assert!(matches!(error, BzzError::InvalidSymbolRank { rank: 257 }));
     }
@@ -1911,8 +2255,12 @@ mod tests {
     }
 
     fn expected_ranks_from_raw(raw: &[u8]) -> Vec<usize> {
+        expected_ranks_from_raw_with_fshift(raw, 0)
+    }
+
+    fn expected_ranks_from_raw_with_fshift(raw: &[u8], fshift: u8) -> Vec<usize> {
         let block = expected_block_symbols_from_raw(raw);
-        ranks_from_block_symbols(&block).expect("derived BWT block should convert to ranks")
+        ranks_from_block_symbols(&block, fshift).expect("derived BWT block should convert to ranks")
     }
 
     fn spec_zp_next_block_len(decoder: &mut SpecZpDecoder<'_>) -> usize {
@@ -1928,6 +2276,79 @@ mod tests {
 
     fn spec_zp_next_fshift(decoder: &mut SpecZpDecoder<'_>) -> u8 {
         (decoder.decode_raw() << 1) | decoder.decode_raw()
+    }
+
+    fn read_spec_zp_entropy_rank(
+        decoder: &mut SpecZpDecoder<'_>,
+        contexts: &mut [u8; BZZ_MTF_CONTEXTS],
+        tables: &ZpTableSet,
+        previous_mtfno: usize,
+    ) -> usize {
+        read_spec_zp_entropy_rank_with_ranges(
+            decoder,
+            contexts,
+            tables,
+            previous_mtfno,
+            &BZZ_MTF_RANGES,
+        )
+    }
+
+    fn read_spec_zp_entropy_rank_with_ranges(
+        decoder: &mut SpecZpDecoder<'_>,
+        contexts: &mut [u8; BZZ_MTF_CONTEXTS],
+        tables: &ZpTableSet,
+        previous_mtfno: usize,
+        ranges: &[BzzMtfRange],
+    ) -> usize {
+        let previous_class = previous_mtfno.min(2);
+        if decoder.decode_bit(
+            &mut contexts[RANK_ZERO_CONTEXT_START + previous_class],
+            tables,
+        ) == 1
+        {
+            return 0;
+        }
+        if decoder.decode_bit(
+            &mut contexts[RANK_ONE_CONTEXT_START + previous_class],
+            tables,
+        ) == 1
+        {
+            return 1;
+        }
+
+        for range in ranges {
+            if decoder.decode_bit(&mut contexts[range.selector_context], tables) == 1 {
+                let offset = read_spec_zp_mtfno_bin(
+                    decoder,
+                    contexts,
+                    tables,
+                    range.bits,
+                    range.tree_context,
+                );
+                return range.start + offset;
+            }
+        }
+
+        BWT_MARKER_RANK
+    }
+
+    fn read_spec_zp_mtfno_bin(
+        decoder: &mut SpecZpDecoder<'_>,
+        contexts: &mut [u8; BZZ_MTF_CONTEXTS],
+        tables: &ZpTableSet,
+        bits: usize,
+        context_start: usize,
+    ) -> usize {
+        let mut value = 0;
+        let mut node = 0;
+
+        for _ in 0..bits {
+            let bit = decoder.decode_bit(&mut contexts[context_start + node], tables);
+            value = (value << 1) | usize::from(bit);
+            node = (node << 1) + 1 + usize::from(bit);
+        }
+
+        value
     }
 
     fn entropy_decisions_from_ranks(ranks: &[usize]) -> Vec<(usize, u8)> {
@@ -2451,8 +2872,8 @@ mod tests {
         }
     }
 
-    fn ranks_from_block_symbols(block: &BlockSymbols) -> BzzResult<Vec<usize>> {
-        let mut table = MoveToFrontTable::new();
+    fn ranks_from_block_symbols(block: &BlockSymbols, fshift: u8) -> BzzResult<Vec<usize>> {
+        let mut table = BzzMoveToFrontTable::new(fshift);
         let mut ranks = Vec::with_capacity(block.symbols.len());
 
         for (index, symbol) in block.symbols.iter().copied().enumerate() {
@@ -2462,9 +2883,7 @@ mod tests {
             }
 
             let rank = table
-                .symbols
-                .iter()
-                .position(|candidate| *candidate == symbol)
+                .rank_of(symbol)
                 .expect("byte should exist in MTF table");
             ranks.push(rank);
             let _ = table.take(rank)?;
