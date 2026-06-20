@@ -17,16 +17,14 @@ pub enum BzzError {
         "BZZ block has invalid Burrows-Wheeler marker position {marker_pos} for block size {block_len}"
     )]
     InvalidBwtMarker { marker_pos: usize, block_len: usize },
-    #[error("BZZ block failed Burrows-Wheeler reconstruction check")]
-    InvalidBwtTransform,
     #[error("BZZ rank stream ended before {expected_len} block symbols were decoded")]
     TruncatedRankStream { expected_len: usize },
     #[error("BZZ rank stream contains invalid rank {rank}")]
     InvalidSymbolRank { rank: usize },
     #[error("BZZ rank stream does not contain a Burrows-Wheeler marker")]
     MissingBwtMarker,
-    #[error("BZZ rank stream contains multiple Burrows-Wheeler markers")]
-    DuplicateBwtMarker,
+    #[error("BZZ rank stream contains an unusable Burrows-Wheeler marker")]
+    InvalidBwtMarkerStream,
 }
 
 /// Decodes `DjVu` BZZ-compressed bytes.
@@ -72,7 +70,7 @@ fn decode_bzz_in_memory(bytes: &[u8]) -> BzzResult<Vec<u8>> {
     }
 }
 
-const MAX_BLOCK_BYTES: usize = 4096 * 1024;
+const MAX_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 const BWT_MARKER_RANK: usize = 256;
 const BZZ_FREQ_SLOTS: usize = 4;
 const INITIAL_PREVIOUS_MTFNO: usize = 3;
@@ -121,10 +119,6 @@ fn inverse_bwt_block(symbols: &[u8], marker_pos: usize) -> BzzResult<Vec<u8>> {
         link_index = counts[symbol] + (link & 0x00ff_ffff);
     }
 
-    if link_index != marker_pos {
-        return Err(BzzError::InvalidBwtTransform);
-    }
-
     Ok(decoded)
 }
 
@@ -153,9 +147,7 @@ where
         };
 
         if rank == BWT_MARKER_RANK {
-            if marker_pos.replace(index).is_some() {
-                return Err(BzzError::DuplicateBwtMarker);
-            }
+            marker_pos = Some(index);
             symbols.push(0);
         } else {
             symbols.push(table.take(rank)?);
@@ -990,11 +982,17 @@ mod tests {
     }
 
     #[test]
-    fn block_symbols_from_ranks_rejects_duplicate_marker() {
-        let error = block_symbols_from_ranks(3, 0, [0, BWT_MARKER_RANK, BWT_MARKER_RANK])
-            .expect_err("duplicate marker should fail");
+    fn block_symbols_from_ranks_keeps_last_marker() {
+        let block = block_symbols_from_ranks(3, 0, [0, BWT_MARKER_RANK, BWT_MARKER_RANK])
+            .expect("duplicate marker-shaped ranks should keep the last marker");
 
-        assert!(matches!(error, BzzError::DuplicateBwtMarker));
+        assert_eq!(
+            block,
+            BlockSymbols {
+                symbols: vec![0, 0, 0],
+                marker_pos: 2,
+            }
+        );
     }
 
     #[test]

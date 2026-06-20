@@ -8,6 +8,7 @@ pub(crate) mod document;
 pub(crate) mod error;
 pub(crate) mod info;
 pub(crate) mod page;
+pub(crate) mod pdf;
 pub(crate) mod render;
 pub(crate) mod text;
 
@@ -21,8 +22,6 @@ pub use document::{
 pub use error::{ParseError, ParseResult};
 pub use info::{PageInfo, read_page_info};
 pub use page::{PageChunk, PageChunkKind, PageChunkPayload, PageDetails, read_page_details};
-pub use render::{
-    BitonalBitmap, OwnedRenderChunkPayload, PageBitmap, PageRenderPlan, PixelFormat,
-    RenderChunkPayload,
-};
+pub use pdf::{PdfError, PdfResult, write_bitmap_pdf};
+pub use render::{BitonalBitmap, PageBitmap, PageRenderPlan, PixelFormat, RenderChunkPayload};
 pub use text::{TextPayload, TextZone, TextZoneKind, parse_text_payload, parse_text_zones};

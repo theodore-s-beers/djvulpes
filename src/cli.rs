@@ -1,6 +1,6 @@
 use crate::commands::{
     run_dirm, run_dump_bitonal, run_form, run_forms, run_page, run_pages, run_render_page,
-    run_render_plan, run_summary, run_text,
+    run_render_page_pdf, run_render_plan, run_summary, run_text,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -64,11 +64,16 @@ enum Command {
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
-    /// Dump raw Djbz/Sjbz bitonal payloads for one page.
+    /// Render a page-sized RGB PDF image.
+    RenderPagePdf {
+        number: usize,
+        output: PathBuf,
+        #[arg(default_value = DEFAULT_FILE)]
+        file: PathBuf,
+    },
+    /// Dump Djbz/Sjbz JB2 bitonal payloads for one page.
     DumpBitonal {
         number: usize,
-        #[arg(long)]
-        decoded: bool,
         output_dir: PathBuf,
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
@@ -99,12 +104,16 @@ pub fn run() -> anyhow::Result<()> {
             output,
             file,
         } => run_render_page(&file, number, &output)?,
+        Command::RenderPagePdf {
+            number,
+            output,
+            file,
+        } => run_render_page_pdf(&file, number, &output)?,
         Command::DumpBitonal {
             number,
-            decoded,
             output_dir,
             file,
-        } => run_dump_bitonal(&file, number, &output_dir, decoded)?,
+        } => run_dump_bitonal(&file, number, &output_dir)?,
         Command::Text {
             number,
             zones,

@@ -1,4 +1,3 @@
-use crate::bzz::{BzzResult, decode_bzz};
 use crate::dirm::DirmTailEntry;
 use crate::document::{Document, Page, ResolvedPageChunk};
 use crate::error::{ParseError, ParseResult};
@@ -201,12 +200,6 @@ pub struct RenderChunkPayload<'a> {
     pub bytes: &'a [u8],
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct OwnedRenderChunkPayload {
-    pub index: usize,
-    pub bytes: Vec<u8>,
-}
-
 impl<'a> PageRenderPlan<'a> {
     #[must_use]
     pub fn new(info: PageInfo, chunks: Vec<ResolvedPageChunk<'a>>) -> Self {
@@ -293,26 +286,6 @@ impl<'a> PageRenderPlan<'a> {
             .collect()
     }
 
-    /// Returns the JB2 payloads obtained by BZZ-decoding each `Sjbz` chunk.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any `Sjbz` payload fails BZZ decompression.
-    pub fn decoded_bitonal_image_payloads(
-        &self,
-        bytes: &[u8],
-    ) -> BzzResult<Vec<OwnedRenderChunkPayload>> {
-        self.bitonal_image_payloads(bytes)
-            .into_iter()
-            .map(|payload| {
-                decode_bzz(payload.bytes).map(|decoded| OwnedRenderChunkPayload {
-                    index: payload.index,
-                    bytes: decoded,
-                })
-            })
-            .collect()
-    }
-
     #[must_use]
     pub fn render_base_bitmap(&self) -> PageBitmap {
         PageBitmap::white_rgb8(&self.info)
@@ -362,9 +335,6 @@ mod tests {
             rotation: 1,
         }
     }
-
-    const HELLO_BZZ: &[u8] = include_bytes!("../tests/fixtures/bzz/hello.bzz");
-    const HELLO_RAW: &[u8] = include_bytes!("../tests/fixtures/bzz/hello.raw");
 
     #[test]
     fn page_bitmap_allocates_rgb_pixels_and_writes_in_bounds() {
@@ -544,23 +514,21 @@ mod tests {
     }
 
     #[test]
-    fn render_plan_decodes_bzz_wrapped_bitonal_payloads() {
+    fn render_plan_returns_sjbz_payloads_without_bzz_decoding() {
         let mut plan = PageRenderPlan::new(
             page_info(),
             vec![resolved_chunk(PageChunkKind::Sjbz, "Sjbz")],
         );
         plan.chunks[0].chunk.chunk.data_start = 0;
-        plan.chunks[0].chunk.chunk.data_end = HELLO_BZZ.len();
+        plan.chunks[0].chunk.chunk.data_end = 3;
 
-        let decoded = plan
-            .decoded_bitonal_image_payloads(HELLO_BZZ)
-            .expect("BZZ payload should decode");
+        let images = plan.bitonal_image_payloads(b"jb2");
 
         assert_eq!(
-            decoded,
-            [OwnedRenderChunkPayload {
+            images,
+            [RenderChunkPayload {
                 index: 0,
-                bytes: HELLO_RAW.to_vec()
+                bytes: b"jb2"
             }]
         );
     }

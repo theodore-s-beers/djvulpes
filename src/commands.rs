@@ -3,6 +3,7 @@ use djvulpes::{
     Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkKind,
     PageChunkPayload, PageChunkSource, PageRenderPlan, ParseResult, TextZone, parse_chunks,
     parse_dirm_tail, parse_form_at, parse_text_payload, parse_text_zones, read_page_details,
+    write_bitmap_pdf,
 };
 use djvulpes::{decode_bzz, decode_dirm_tail};
 use std::fs;
@@ -296,12 +297,51 @@ pub fn run_render_page(path: &Path, number: usize, output: &Path) -> anyhow::Res
     Ok(())
 }
 
-pub fn run_dump_bitonal(
-    path: &Path,
-    number: usize,
-    output_dir: &Path,
-    decoded: bool,
-) -> anyhow::Result<()> {
+pub fn run_render_page_pdf(path: &Path, number: usize, output: &Path) -> anyhow::Result<()> {
+    if number == 0 {
+        bail!("page number must be 1 or greater");
+    }
+
+    let bytes = read_file(path)?;
+    let document = Document::parse(&bytes)?;
+    let page = document
+        .pages(&bytes)
+        .nth(number - 1)
+        .transpose()?
+        .with_context(|| {
+            format!(
+                "page {number} not found; document has {} pages",
+                document.form_kind_counts().pages
+            )
+        })?;
+    let decoded_tail;
+    let tail_entries = if let Some(dirm) = &document.directory {
+        decoded_tail = decode_dirm_tail(&bytes, dirm)?;
+        parse_dirm_tail(dirm, &decoded_tail)?
+    } else {
+        Vec::new()
+    };
+    let plan = document.page_render_plan(&bytes, &page, &tail_entries)?;
+    let bitmap = plan.render_base_bitmap();
+    let pdf = write_bitmap_pdf(std::slice::from_ref(&bitmap))?;
+
+    fs::write(output, pdf).with_context(|| format!("failed to write {}", output.display()))?;
+
+    println!("file: {}", path.display());
+    println!("page: {number}");
+    println!(
+        "rendered: {}x{} dpi={} format=PDF",
+        bitmap.width, bitmap.height, bitmap.dpi
+    );
+    println!("output: {}", output.display());
+    if plan.has_image_data() {
+        println!("image layers: pending decoder support");
+    }
+
+    Ok(())
+}
+
+pub fn run_dump_bitonal(path: &Path, number: usize, output_dir: &Path) -> anyhow::Result<()> {
     if number == 0 {
         bail!("page number must be 1 or greater");
     }
@@ -334,7 +374,7 @@ pub fn run_dump_bitonal(
     println!("file: {}", path.display());
     println!("page: {number}");
     println!("output dir: {}", output_dir.display());
-    println!("decoded Sjbz: {decoded}");
+    println!("Sjbz payloads: raw JB2");
 
     let mut written = 0usize;
     for payload in dictionaries {
@@ -348,30 +388,16 @@ pub fn run_dump_bitonal(
         );
         written += 1;
     }
-    if decoded {
-        for payload in plan.decoded_bitonal_image_payloads(&bytes)? {
-            let output = output_dir.join(format!("page-{number}-chunk-{}.jb2", payload.index));
-            fs::write(&output, &payload.bytes)
-                .with_context(|| format!("failed to write {}", output.display()))?;
-            println!(
-                "wrote {} bytes to {}",
-                payload.bytes.len(),
-                output.display()
-            );
-            written += 1;
-        }
-    } else {
-        for payload in plan.bitonal_image_payloads(&bytes) {
-            let output = output_dir.join(format!("page-{number}-chunk-{}.sjbz", payload.index));
-            fs::write(&output, payload.bytes)
-                .with_context(|| format!("failed to write {}", output.display()))?;
-            println!(
-                "wrote {} bytes to {}",
-                payload.bytes.len(),
-                output.display()
-            );
-            written += 1;
-        }
+    for payload in plan.bitonal_image_payloads(&bytes) {
+        let output = output_dir.join(format!("page-{number}-chunk-{}.jb2", payload.index));
+        fs::write(&output, payload.bytes)
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        println!(
+            "wrote {} bytes to {}",
+            payload.bytes.len(),
+            output.display()
+        );
+        written += 1;
     }
 
     if written == 0 {
