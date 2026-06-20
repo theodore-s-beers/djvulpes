@@ -1,5 +1,6 @@
 use crate::commands::{
-    run_dirm, run_form, run_forms, run_page, run_pages, run_render_plan, run_summary, run_text,
+    run_dirm, run_form, run_forms, run_page, run_pages, run_render_page, run_render_plan,
+    run_summary, run_text,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -56,6 +57,13 @@ enum Command {
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
+    /// Render a page-sized RGB PPM image.
+    RenderPage {
+        number: usize,
+        output: PathBuf,
+        #[arg(default_value = DEFAULT_FILE)]
+        file: PathBuf,
+    },
     /// Extract hidden text from one page by 1-based page number.
     Text {
         number: usize,
@@ -77,6 +85,11 @@ pub fn run() -> anyhow::Result<()> {
         Command::Dirm { file } => run_dirm(&file)?,
         Command::Page { number, file } => run_page(&file, number)?,
         Command::RenderPlan { number, file } => run_render_plan(&file, number)?,
+        Command::RenderPage {
+            number,
+            output,
+            file,
+        } => run_render_page(&file, number, &output)?,
         Command::Text {
             number,
             zones,

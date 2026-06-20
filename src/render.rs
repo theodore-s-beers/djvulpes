@@ -18,6 +18,96 @@ pub struct PageBitmap {
     pub pixels: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BitonalBitmap {
+    pub width: u32,
+    pub height: u32,
+    bits: Vec<u8>,
+}
+
+impl BitonalBitmap {
+    #[must_use]
+    pub fn new(width: u32, height: u32) -> Self {
+        let bit_count = (width as usize).saturating_mul(height as usize);
+        let bytes = bit_count.div_ceil(8);
+
+        Self {
+            width,
+            height,
+            bits: vec![0; bytes],
+        }
+    }
+
+    #[must_use]
+    pub fn from_bits(width: u32, height: u32, bits: Vec<u8>) -> Option<Self> {
+        let bit_count = (width as usize).checked_mul(height as usize)?;
+        if bits.len() != bit_count.div_ceil(8) {
+            return None;
+        }
+
+        Some(Self {
+            width,
+            height,
+            bits,
+        })
+    }
+
+    #[must_use]
+    pub fn bit(&self, x: u32, y: u32) -> Option<bool> {
+        let bit_index = self.bit_index(x, y)?;
+        let byte = self.bits[bit_index / 8];
+        let mask = 0x80 >> (bit_index % 8);
+
+        Some(byte & mask != 0)
+    }
+
+    pub fn set_bit(&mut self, x: u32, y: u32, value: bool) -> bool {
+        let Some(bit_index) = self.bit_index(x, y) else {
+            return false;
+        };
+        let byte = &mut self.bits[bit_index / 8];
+        let mask = 0x80 >> (bit_index % 8);
+
+        if value {
+            *byte |= mask;
+        } else {
+            *byte &= !mask;
+        }
+
+        true
+    }
+
+    #[must_use]
+    pub fn to_pbm_bytes(&self) -> Vec<u8> {
+        let mut bytes = format!("P4\n{} {}\n", self.width, self.height).into_bytes();
+        let row_bytes = (self.width as usize).div_ceil(8);
+
+        for y in 0..self.height {
+            let mut row = vec![0; row_bytes];
+            for x in 0..self.width {
+                if self.bit(x, y).unwrap_or(false) {
+                    let x = x as usize;
+                    row[x / 8] |= 0x80 >> (x % 8);
+                }
+            }
+            bytes.extend_from_slice(&row);
+        }
+
+        bytes
+    }
+
+    fn bit_index(&self, x: u32, y: u32) -> Option<usize> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+
+        let width = usize::try_from(self.width).ok()?;
+        let x = usize::try_from(x).ok()?;
+        let y = usize::try_from(y).ok()?;
+        y.checked_mul(width)?.checked_add(x)
+    }
+}
+
 impl PageBitmap {
     #[must_use]
     pub fn new_rgb8(width: u32, height: u32, dpi: u16, fill: [u8; 3]) -> Self {
@@ -66,6 +156,29 @@ impl PageBitmap {
 
         self.pixels[offset..offset + 3].copy_from_slice(&color);
         true
+    }
+
+    pub fn paint_bitonal_mask(&mut self, mask: &BitonalBitmap, color: [u8; 3]) -> bool {
+        if mask.width != self.width || mask.height != self.height {
+            return false;
+        }
+
+        for y in 0..mask.height {
+            for x in 0..mask.width {
+                if mask.bit(x, y).unwrap_or(false) {
+                    self.set_rgb(x, y, color);
+                }
+            }
+        }
+
+        true
+    }
+
+    #[must_use]
+    pub fn to_ppm_bytes(&self) -> Vec<u8> {
+        let mut bytes = format!("P6\n{} {}\n255\n", self.width, self.height).into_bytes();
+        bytes.extend_from_slice(&self.pixels);
+        bytes
     }
 }
 
@@ -126,6 +239,11 @@ impl<'a> PageRenderPlan<'a> {
     pub fn chunk(&self, index: usize) -> Option<&ResolvedPageChunk<'a>> {
         self.chunks.get(index)
     }
+
+    #[must_use]
+    pub fn render_base_bitmap(&self) -> PageBitmap {
+        PageBitmap::white_rgb8(&self.info)
+    }
 }
 
 impl<'a> Document<'a> {
@@ -184,6 +302,60 @@ mod tests {
     }
 
     #[test]
+    fn bitonal_bitmap_sets_and_reads_msb_first_bits() {
+        let mut mask = BitonalBitmap::new(3, 3);
+
+        assert_eq!(mask.bit(0, 0), Some(false));
+        assert!(mask.set_bit(0, 0, true));
+        assert!(mask.set_bit(2, 1, true));
+        assert!(mask.set_bit(2, 1, false));
+        assert!(!mask.set_bit(3, 0, true));
+
+        assert_eq!(mask.bit(0, 0), Some(true));
+        assert_eq!(mask.bit(2, 1), Some(false));
+        assert_eq!(mask.bit(3, 0), None);
+        assert_eq!(mask.bits, [0b1000_0000, 0]);
+    }
+
+    #[test]
+    fn bitonal_bitmap_validates_packed_bit_length() {
+        assert!(BitonalBitmap::from_bits(9, 1, vec![0; 2]).is_some());
+        assert!(BitonalBitmap::from_bits(9, 1, vec![0; 1]).is_none());
+    }
+
+    #[test]
+    fn bitonal_bitmap_writes_binary_pbm_rows() {
+        let mut mask = BitonalBitmap::new(3, 2);
+        assert!(mask.set_bit(0, 0, true));
+        assert!(mask.set_bit(2, 1, true));
+
+        assert_eq!(mask.to_pbm_bytes(), b"P4\n3 2\n\x80\x20".to_vec());
+    }
+
+    #[test]
+    fn page_bitmap_paints_bitonal_mask_pixels() {
+        let mut bitmap = PageBitmap::new_rgb8(2, 2, 300, [0xff, 0xff, 0xff]);
+        let mut mask = BitonalBitmap::new(2, 2);
+
+        assert!(mask.set_bit(1, 0, true));
+        assert!(mask.set_bit(0, 1, true));
+        assert!(bitmap.paint_bitonal_mask(&mask, [0, 0, 0]));
+
+        assert_eq!(&bitmap.pixels[0..3], &[0xff, 0xff, 0xff]);
+        assert_eq!(&bitmap.pixels[3..6], &[0, 0, 0]);
+        assert_eq!(&bitmap.pixels[6..9], &[0, 0, 0]);
+        assert_eq!(&bitmap.pixels[9..12], &[0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn page_bitmap_rejects_mask_with_mismatched_dimensions() {
+        let mut bitmap = PageBitmap::new_rgb8(2, 2, 300, [0xff, 0xff, 0xff]);
+        let mask = BitonalBitmap::new(1, 2);
+
+        assert!(!bitmap.paint_bitonal_mask(&mask, [0, 0, 0]));
+    }
+
+    #[test]
     fn page_bitmap_can_be_created_from_page_info() {
         let bitmap = PageBitmap::white_rgb8(&page_info());
 
@@ -191,6 +363,27 @@ mod tests {
         assert_eq!(bitmap.height, 200);
         assert_eq!(bitmap.dpi, 300);
         assert!(bitmap.pixels.iter().all(|byte| *byte == 0xff));
+    }
+
+    #[test]
+    fn page_bitmap_writes_binary_ppm_bytes() {
+        let mut bitmap = PageBitmap::new_rgb8(1, 2, 300, [0xff, 0xff, 0xff]);
+        assert!(bitmap.set_rgb(0, 1, [0, 0, 0]));
+
+        assert_eq!(
+            bitmap.to_ppm_bytes(),
+            b"P6\n1 2\n255\n\xff\xff\xff\0\0\0".to_vec()
+        );
+    }
+
+    #[test]
+    fn render_plan_creates_base_bitmap_from_info() {
+        let plan = PageRenderPlan::new(page_info(), Vec::new());
+        let bitmap = plan.render_base_bitmap();
+
+        assert_eq!(bitmap.width, 100);
+        assert_eq!(bitmap.height, 200);
+        assert_eq!(bitmap.dpi, 300);
     }
 
     fn resolved_chunk(kind: PageChunkKind, id: &'static str) -> ResolvedPageChunk<'static> {

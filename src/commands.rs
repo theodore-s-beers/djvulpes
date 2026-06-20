@@ -252,6 +252,50 @@ pub fn run_render_plan(path: &Path, number: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn run_render_page(path: &Path, number: usize, output: &Path) -> anyhow::Result<()> {
+    if number == 0 {
+        bail!("page number must be 1 or greater");
+    }
+
+    let bytes = read_file(path)?;
+    let document = Document::parse(&bytes)?;
+    let page = document
+        .pages(&bytes)
+        .nth(number - 1)
+        .transpose()?
+        .with_context(|| {
+            format!(
+                "page {number} not found; document has {} pages",
+                document.form_kind_counts().pages
+            )
+        })?;
+    let decoded_tail;
+    let tail_entries = if let Some(dirm) = &document.directory {
+        decoded_tail = decode_dirm_tail(&bytes, dirm)?;
+        parse_dirm_tail(dirm, &decoded_tail)?
+    } else {
+        Vec::new()
+    };
+    let plan = document.page_render_plan(&bytes, &page, &tail_entries)?;
+    let bitmap = plan.render_base_bitmap();
+    let ppm = bitmap.to_ppm_bytes();
+
+    fs::write(output, ppm).with_context(|| format!("failed to write {}", output.display()))?;
+
+    println!("file: {}", path.display());
+    println!("page: {number}");
+    println!(
+        "rendered: {}x{} dpi={} format=PPM/P6",
+        bitmap.width, bitmap.height, bitmap.dpi
+    );
+    println!("output: {}", output.display());
+    if plan.has_image_data() {
+        println!("image layers: pending decoder support");
+    }
+
+    Ok(())
+}
+
 pub fn run_text(path: &Path, number: usize, show_zones: bool) -> anyhow::Result<()> {
     if number == 0 {
         bail!("page number must be 1 or greater");
