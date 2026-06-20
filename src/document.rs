@@ -1,8 +1,8 @@
 use crate::chunk::{Chunk, Form, parse_chunks, parse_document_root, parse_form_at};
 use crate::dirm::{Dirm, DirmTailEntry, parse_dirm};
-use crate::error::ParseResult;
+use crate::error::{ParseError, ParseResult};
 use crate::info::{PageInfo, read_page_info};
-use crate::page::{PageDetails, read_page_details};
+use crate::page::{PageChunk, PageChunkPayload, PageDetails, read_page_details};
 
 #[derive(Debug, Clone)]
 pub struct Document<'a> {
@@ -43,6 +43,18 @@ pub struct Page<'a> {
     pub offset: u32,
     pub form: Form<'a>,
     pub info: Option<PageInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedPageChunk<'a> {
+    pub source: PageChunkSource<'a>,
+    pub chunk: PageChunk<'a>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PageChunkSource<'a> {
+    Page,
+    Include { id: &'a str, offset: u32 },
 }
 
 impl<'a> Page<'a> {
@@ -210,6 +222,66 @@ impl<'a> Document<'a> {
                     kind,
                 }
             })
+    }
+
+    /// Reads a page's own chunks with `INCL` references expanded to their shared
+    /// form chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the page chunks are malformed, an include cannot be
+    /// resolved through the supplied directory tail entries, or an include points
+    /// at a non-shared form.
+    pub fn resolved_page_chunks<'tail>(
+        &'a self,
+        bytes: &'a [u8],
+        page: &Page<'a>,
+        tail_entries: &'tail [DirmTailEntry<'tail>],
+    ) -> ParseResult<Vec<ResolvedPageChunk<'a>>> {
+        let details = page.details(bytes)?;
+        let directory_entries = self.directory_entries(tail_entries);
+        let mut chunks = Vec::new();
+
+        for page_chunk in details.chunks {
+            let PageChunkPayload::Include { id } = page_chunk.payload else {
+                chunks.push(ResolvedPageChunk {
+                    source: PageChunkSource::Page,
+                    chunk: page_chunk,
+                });
+                continue;
+            };
+
+            let Some(entry) = directory_entries.iter().find(|entry| entry.name == id) else {
+                return Err(ParseError(format!(
+                    "page include `{id}` does not match a directory entry"
+                )));
+            };
+            let Some(form_index) = entry.form_index else {
+                return Err(ParseError(format!(
+                    "page include `{id}` points to unresolved form offset {}",
+                    entry.offset
+                )));
+            };
+            let included_form = &self.forms[form_index];
+            if included_form.kind != DocumentFormKind::Shared {
+                return Err(ParseError(format!(
+                    "page include `{id}` points to FORM:{} instead of shared FORM:DJVI",
+                    included_form.form.kind
+                )));
+            }
+
+            for chunk in read_page_details(bytes, &included_form.form)?.chunks {
+                chunks.push(ResolvedPageChunk {
+                    source: PageChunkSource::Include {
+                        id,
+                        offset: included_form.offset,
+                    },
+                    chunk,
+                });
+            }
+        }
+
+        Ok(chunks)
     }
 }
 
@@ -420,6 +492,85 @@ mod tests {
         assert_eq!(
             document.find_directory_entry_by_name(&tail_entries, "missing"),
             None
+        );
+    }
+
+    #[test]
+    fn resolved_page_chunks_expands_shared_includes() {
+        let mut shared_children = Vec::new();
+        shared_children.extend_from_slice(&chunk(*b"Djbz", b"dictionary"));
+        let shared_form = form(*b"DJVI", &shared_children);
+        let shared_offset = 36;
+        let page_offset = shared_offset + u32::try_from(shared_form.len()).unwrap();
+
+        let mut page_children = info_chunk();
+        page_children.extend_from_slice(&chunk(*b"INCL", b"shared"));
+        page_children.extend_from_slice(&chunk(*b"Sjbz", b"image"));
+
+        let mut forms = shared_form;
+        forms.extend_from_slice(&form(*b"DJVU", &page_children));
+        let bytes = multipage_document_with_directory(&[shared_offset, page_offset], &forms);
+        let document = Document::parse(&bytes).expect("document should parse");
+        let page = document
+            .pages(&bytes)
+            .next()
+            .expect("page should exist")
+            .expect("page should parse");
+        let tail_entries = vec![
+            DirmTailEntry {
+                offset: shared_offset,
+                size: 20,
+                flags: 0,
+                name: "shared",
+            },
+            DirmTailEntry {
+                offset: page_offset,
+                size: 30,
+                flags: 1,
+                name: "page",
+            },
+        ];
+
+        let chunks = document
+            .resolved_page_chunks(&bytes, &page, &tail_entries)
+            .expect("page includes should resolve");
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].source, PageChunkSource::Page);
+        assert_eq!(chunks[0].chunk.chunk.id, "INFO");
+        assert_eq!(
+            chunks[1].source,
+            PageChunkSource::Include {
+                id: "shared",
+                offset: shared_offset
+            }
+        );
+        assert_eq!(chunks[1].chunk.chunk.id, "Djbz");
+        assert_eq!(chunks[2].source, PageChunkSource::Page);
+        assert_eq!(chunks[2].chunk.chunk.id, "Sjbz");
+    }
+
+    #[test]
+    fn resolved_page_chunks_rejects_unresolved_include() {
+        let page_offset = 32;
+        let mut page_children = info_chunk();
+        page_children.extend_from_slice(&chunk(*b"INCL", b"missing"));
+        let page_form = form(*b"DJVU", &page_children);
+        let bytes = multipage_document_with_directory(&[page_offset], &page_form);
+        let document = Document::parse(&bytes).expect("document should parse");
+        let page = document
+            .pages(&bytes)
+            .next()
+            .expect("page should exist")
+            .expect("page should parse");
+
+        let error = document
+            .resolved_page_chunks(&bytes, &page, &[])
+            .expect_err("missing include should fail");
+
+        assert!(
+            error.message().contains("does not match a directory entry"),
+            "{error}"
         );
     }
 }

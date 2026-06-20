@@ -1,4 +1,6 @@
-use crate::commands::{run_dirm, run_form, run_forms, run_page, run_pages, run_summary, run_text};
+use crate::commands::{
+    run_dirm, run_form, run_forms, run_page, run_pages, run_render_plan, run_summary, run_text,
+};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -48,6 +50,12 @@ enum Command {
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
+    /// Show the renderer-facing chunk plan for one page.
+    RenderPlan {
+        number: usize,
+        #[arg(default_value = DEFAULT_FILE)]
+        file: PathBuf,
+    },
     /// Extract hidden text from one page by 1-based page number.
     Text {
         number: usize,
@@ -68,6 +76,7 @@ pub fn run() -> anyhow::Result<()> {
         Command::Form { offset, file } => run_form(&file, offset)?,
         Command::Dirm { file } => run_dirm(&file)?,
         Command::Page { number, file } => run_page(&file, number)?,
+        Command::RenderPlan { number, file } => run_render_plan(&file, number)?,
         Command::Text {
             number,
             zones,

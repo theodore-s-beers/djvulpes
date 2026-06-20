@@ -1,8 +1,8 @@
 use anyhow::{Context, bail};
 use djvulpes::{
     Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkKind,
-    PageChunkPayload, ParseResult, TextZone, parse_chunks, parse_dirm_tail, parse_form_at,
-    parse_text_payload, parse_text_zones, read_page_details,
+    PageChunkPayload, PageChunkSource, PageRenderPlan, ParseResult, TextZone, parse_chunks,
+    parse_dirm_tail, parse_form_at, parse_text_payload, parse_text_zones, read_page_details,
 };
 use djvulpes::{decode_bzz, decode_dirm_tail};
 use std::fs;
@@ -215,6 +215,39 @@ pub fn run_page(path: &Path, number: usize) -> anyhow::Result<()> {
     } else {
         print_page_detail(&bytes, &document_form.form, document_form.offset, None)?;
     }
+
+    Ok(())
+}
+
+pub fn run_render_plan(path: &Path, number: usize) -> anyhow::Result<()> {
+    if number == 0 {
+        bail!("page number must be 1 or greater");
+    }
+
+    let bytes = read_file(path)?;
+    let document = Document::parse(&bytes)?;
+    let page = document
+        .pages(&bytes)
+        .nth(number - 1)
+        .transpose()?
+        .with_context(|| {
+            format!(
+                "page {number} not found; document has {} pages",
+                document.form_kind_counts().pages
+            )
+        })?;
+    let decoded_tail;
+    let tail_entries = if let Some(dirm) = &document.directory {
+        decoded_tail = decode_dirm_tail(&bytes, dirm)?;
+        parse_dirm_tail(dirm, &decoded_tail)?
+    } else {
+        Vec::new()
+    };
+    let plan = document.page_render_plan(&bytes, &page, &tail_entries)?;
+
+    println!("file: {}", path.display());
+    println!("page: {number}");
+    print_render_plan(&plan);
 
     Ok(())
 }
@@ -451,6 +484,51 @@ fn print_page_detail(
     }
 
     Ok(())
+}
+
+fn print_render_plan(plan: &PageRenderPlan<'_>) {
+    println!(
+        "INFO: {}x{} dpi={} gamma={:.1} version={} rotation={}",
+        plan.info.width,
+        plan.info.height,
+        plan.info.dpi,
+        plan.info.gamma,
+        plan.info.version,
+        plan.info.rotation
+    );
+    println!(
+        "layers: bitonal dictionaries={} bitonal images={} foreground={} background={} text={} unknown={}",
+        plan.bitonal_dictionaries.len(),
+        plan.bitonal_images.len(),
+        plan.foreground_layers.len(),
+        plan.background_layers.len(),
+        plan.text_chunks.len(),
+        plan.unknown_chunks.len()
+    );
+    println!("has image data: {}", plan.has_image_data());
+    println!("has text: {}", plan.has_text());
+    println!();
+    println!("effective chunks:");
+    println!("index  source      chunk  role      size      offset");
+
+    for (index, chunk) in plan.chunks.iter().enumerate() {
+        println!(
+            "{:<6} {:<11} {:<5} {:<9} {:<9} @{}",
+            index,
+            format_page_chunk_source(chunk.source),
+            chunk.chunk.chunk.id,
+            chunk.chunk.kind.as_str(),
+            chunk.chunk.chunk.size,
+            chunk.chunk.chunk.data_start - 8
+        );
+    }
+}
+
+fn format_page_chunk_source(source: PageChunkSource<'_>) -> String {
+    match source {
+        PageChunkSource::Page => "page".to_string(),
+        PageChunkSource::Include { id, .. } => format!("include:{id}"),
+    }
 }
 
 fn print_page_chunk_line(
