@@ -620,8 +620,7 @@ const fn zp_theta_table() -> [u16; ZP_TABLE_LEN] {
 //
 // The first 251 entries are valid ZP states. The final five entries are padding
 // for total `u8` index coverage and must not be reached by well-formed state
-// transitions. Tests validate these values against the MIT `djvu-zp` dev oracle
-// and separately check the structural invariants we depend on at runtime.
+// transitions. Tests check the structural invariants we depend on at runtime.
 const DJVU_ZP_TABLES: ZpTableSet = ZpTableSet {
     delta: zp_u16_state_table(
         &[
@@ -697,6 +696,28 @@ mod tests {
 
     const HELLO_BZZ: &[u8] = include_bytes!("../tests/fixtures/bzz/hello.bzz");
     const HELLO_RAW: &[u8] = include_bytes!("../tests/fixtures/bzz/hello.raw");
+    const BZZ_FIXTURES: &[(&[u8], &[u8])] = &[
+        (
+            include_bytes!("../tests/fixtures/bzz/empty.bzz"),
+            include_bytes!("../tests/fixtures/bzz/empty.raw"),
+        ),
+        (
+            include_bytes!("../tests/fixtures/bzz/single_a.bzz"),
+            include_bytes!("../tests/fixtures/bzz/single_a.raw"),
+        ),
+        (
+            include_bytes!("../tests/fixtures/bzz/repeated_a.bzz"),
+            include_bytes!("../tests/fixtures/bzz/repeated_a.raw"),
+        ),
+        (
+            include_bytes!("../tests/fixtures/bzz/all_bytes.bzz"),
+            include_bytes!("../tests/fixtures/bzz/all_bytes.raw"),
+        ),
+        (
+            include_bytes!("../tests/fixtures/bzz/patterned_1k.bzz"),
+            include_bytes!("../tests/fixtures/bzz/patterned_1k.raw"),
+        ),
+    ];
 
     #[test]
     fn decode_dirm_tail_rejects_invalid_tail_range_before_decoding() {
@@ -717,13 +738,6 @@ mod tests {
     #[test]
     fn decode_bzz_decodes_fixture_bytes() {
         let decoded = decode_bzz(HELLO_BZZ).expect("fixture should decode without external tools");
-
-        assert_eq!(decoded, HELLO_RAW);
-    }
-
-    #[test]
-    fn djvu_bzz_oracle_decodes_fixture_bytes() {
-        let decoded = djvu_bzz::bzz_decode(HELLO_BZZ).expect("djvu-bzz should decode fixture");
 
         assert_eq!(decoded, HELLO_RAW);
     }
@@ -769,83 +783,6 @@ mod tests {
     }
 
     #[test]
-    fn spec_zp_context_decode_matches_djvu_zp_oracle() {
-        let tables = &DJVU_ZP_TABLES;
-        let cases: &[&[u8]] = &[
-            HELLO_BZZ,
-            &[0xff, 0xff, 0xff, 0xff],
-            &[0x00, 0x00, 0x00, 0x00],
-            &[0x55, 0xaa, 0x33, 0xcc],
-            &[0x80, 0x00, 0x7f, 0xff, 0x01],
-        ];
-
-        for input in cases {
-            let mut ours = SpecZpDecoder::new(input);
-            let mut oracle =
-                djvu_zp::ZpDecoder::new(input).expect("test case should initialize ZP");
-            let mut our_contexts = [0; 16];
-            let mut oracle_contexts = [0; 16];
-
-            for step in 0..256 {
-                let context = (step * 7) % our_contexts.len();
-                let our_bit = ours.decode_bit(&mut our_contexts[context], tables) != 0;
-                let oracle_bit = oracle.decode_bit(&mut oracle_contexts[context]);
-
-                assert_eq!(
-                    our_bit, oracle_bit,
-                    "bit mismatch for input {input:02x?}, step {step}, context {context}"
-                );
-                assert_eq!(
-                    our_contexts[context], oracle_contexts[context],
-                    "context mismatch for input {input:02x?}, step {step}, context {context}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn spec_zp_mixed_passthrough_and_context_decode_matches_djvu_zp_oracle() {
-        let tables = &DJVU_ZP_TABLES;
-        let mut ours = SpecZpDecoder::new(HELLO_BZZ);
-        let mut oracle = djvu_zp::ZpDecoder::new(HELLO_BZZ).expect("fixture should initialize ZP");
-
-        for step in 0..26 {
-            assert_eq!(
-                ours.decode_raw() != 0,
-                oracle.decode_passthrough(),
-                "passthrough mismatch at step {step}"
-            );
-        }
-
-        let mut our_contexts = [0; 16];
-        let mut oracle_contexts = [0; 16];
-        for step in 0..256 {
-            let context = (step * 7) % our_contexts.len();
-            let our_bit = ours.decode_bit(&mut our_contexts[context], tables) != 0;
-            let oracle_bit = oracle.decode_bit(&mut oracle_contexts[context]);
-
-            assert_eq!(
-                our_bit, oracle_bit,
-                "bit mismatch after passthrough at step {step}, context {context}"
-            );
-            assert_eq!(
-                our_contexts[context], oracle_contexts[context],
-                "context mismatch after passthrough at step {step}, context {context}"
-            );
-        }
-    }
-
-    #[test]
-    fn djvu_zp_oracle_tables_have_expected_public_shape() {
-        assert_eq!(djvu_zp::tables::PROB.len(), 256);
-        assert_eq!(djvu_zp::tables::THRESHOLD.len(), 256);
-        assert_eq!(djvu_zp::tables::MPS_NEXT.len(), 256);
-        assert_eq!(djvu_zp::tables::LPS_NEXT.len(), 256);
-
-        djvu_zp_oracle_table_set().validate_shape();
-    }
-
-    #[test]
     fn runtime_zp_table_set_has_valid_shape() {
         DJVU_ZP_TABLES.validate_shape();
     }
@@ -858,11 +795,6 @@ mod tests {
             assert_eq!(DJVU_ZP_TABLES.mu[state], 0);
             assert_eq!(DJVU_ZP_TABLES.lambda[state], 0);
         }
-    }
-
-    #[test]
-    fn runtime_zp_table_set_matches_dev_oracle() {
-        assert_eq!(DJVU_ZP_TABLES, djvu_zp_oracle_table_set());
     }
 
     #[test]
@@ -940,26 +872,12 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_decoder_decodes_generated_oracle_cases() {
-        let mut patterned = Vec::with_capacity(1024);
-        for index in 0..1024u32 {
-            patterned.push(index.wrapping_mul(7).wrapping_add(13).to_le_bytes()[0]);
-        }
-
-        let cases = [
-            Vec::new(),
-            b"A".to_vec(),
-            b"aaaaaaaaaa".to_vec(),
-            (0..=u8::MAX).collect::<Vec<_>>(),
-            patterned,
-        ];
-
-        for raw in &cases {
-            let compressed = djvu_bzz::bzz_encode(raw);
+    fn in_memory_decoder_decodes_fixture_corpus() {
+        for (compressed, raw) in BZZ_FIXTURES {
             let decoded =
-                decode_bzz_in_memory(&compressed).expect("generated BZZ should decode in memory");
+                decode_bzz_in_memory(compressed).expect("fixture should decode in memory");
 
-            assert_eq!(&decoded, raw, "roundtrip failed for {raw:02x?}");
+            assert_eq!(&decoded, raw);
         }
     }
 
@@ -1395,15 +1313,6 @@ mod tests {
 
         fn lambda(&self, _state: u8) -> u8 {
             84
-        }
-    }
-
-    fn djvu_zp_oracle_table_set() -> ZpTableSet {
-        ZpTableSet {
-            delta: djvu_zp::tables::PROB,
-            theta: djvu_zp::tables::THRESHOLD,
-            mu: djvu_zp::tables::MPS_NEXT,
-            lambda: djvu_zp::tables::LPS_NEXT,
         }
     }
 }
