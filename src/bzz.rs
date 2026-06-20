@@ -15,6 +15,8 @@ pub enum BzzError {
     IncompleteDecoder(&'static str),
     #[error("BZZ block declares unsupported size {size} bytes")]
     UnsupportedBlockSize { size: usize },
+    #[error("BZZ block declares invalid FSHIFT value {value}")]
+    InvalidFshift { value: u8 },
     #[error(
         "BZZ block has invalid Burrows-Wheeler marker position {marker_pos} for block size {block_len}"
     )]
@@ -58,7 +60,8 @@ pub fn decode_bzz(bytes: &[u8]) -> BzzResult<Vec<u8>> {
             | BzzError::DuplicateBwtMarker
             | BzzError::InvalidSymbolRank { .. }
             | BzzError::InvalidBwtMarker { .. }
-            | BzzError::InvalidBwtTransform,
+            | BzzError::InvalidBwtTransform
+            | BzzError::InvalidFshift { .. },
         ) => decode_bzz_with_local_tool(bytes),
         result => result,
     }
@@ -124,7 +127,8 @@ fn decode_bzz_in_memory(bytes: &[u8]) -> BzzResult<Vec<u8>> {
         return Err(BzzError::UnsupportedBlockSize { size: block_size });
     }
 
-    let ranks = decoder.decode_block_ranks(block_size)?;
+    let fshift = decoder.next_fshift()?;
+    let ranks = decoder.decode_block_ranks(block_size, fshift)?;
     decode_block_from_ranks(block_size, ranks)
 }
 
@@ -275,14 +279,21 @@ impl<'a> BzzDecoder<'a> {
         let block_len_marker = 1usize << 24;
 
         while value < block_len_marker {
-            let split = 0x8000 + (u32::from(self.bits.lower_bound()) >> 1);
-            value = (value << 1) | usize::from(self.bits.read_split_bit(split));
+            value = (value << 1) | usize::from(self.bits.read_raw_bit());
         }
 
         value - block_len_marker
     }
 
-    fn decode_block_ranks(&mut self, block_len: usize) -> BzzResult<Vec<usize>> {
+    fn next_fshift(&mut self) -> BzzResult<u8> {
+        let value = (self.bits.read_raw_bit() << 1) | self.bits.read_raw_bit();
+        if value > 2 {
+            return Err(BzzError::InvalidFshift { value });
+        }
+        Ok(value)
+    }
+
+    fn decode_block_ranks(&mut self, block_len: usize, _fshift: u8) -> BzzResult<Vec<usize>> {
         let mut ranks = EntropyRankDecoder::new(&mut self.bits);
         collect_block_ranks(block_len, &mut ranks)
     }
@@ -295,6 +306,7 @@ trait RankDecoder {
 struct EntropyRankDecoder<'bits, 'input> {
     bits: &'bits mut ZpBitReader<'input>,
     model: BitModel,
+    previous_mtfno: usize,
 }
 
 impl<'bits, 'input> EntropyRankDecoder<'bits, 'input> {
@@ -302,51 +314,97 @@ impl<'bits, 'input> EntropyRankDecoder<'bits, 'input> {
         Self {
             bits,
             model: BitModel::with_contexts(ENTROPY_CONTEXTS),
+            previous_mtfno: 0,
         }
     }
 }
 
 impl RankDecoder for EntropyRankDecoder<'_, '_> {
     fn next_rank(&mut self) -> BzzResult<usize> {
-        read_entropy_rank(&mut self.model, self.bits)
+        let rank = read_entropy_rank(&mut self.model, self.bits, self.previous_mtfno)?;
+        self.previous_mtfno = rank;
+        Ok(rank)
     }
 }
 
-const ENTROPY_CONTEXTS: usize = 300;
-const RANK_ZERO_CONTEXT: usize = 0;
-const RANK_ONE_CONTEXT: usize = 1;
-const RANK_TREE_CONTEXT_START: usize = 2;
-const RANK_GROUPS: usize = 7;
+const BZZ_MTF_CONTEXTS: usize = 262;
+const ENTROPY_CONTEXTS: usize = BZZ_MTF_CONTEXTS;
+const RANK_ZERO_CONTEXT_START: usize = 0;
+const RANK_ONE_CONTEXT_START: usize = 3;
+const BZZ_MTF_RANGES: [BzzMtfRange; 7] = [
+    BzzMtfRange::new(2, 6, 7, 1),
+    BzzMtfRange::new(4, 8, 9, 2),
+    BzzMtfRange::new(8, 12, 13, 3),
+    BzzMtfRange::new(16, 20, 21, 4),
+    BzzMtfRange::new(32, 36, 37, 5),
+    BzzMtfRange::new(64, 68, 69, 6),
+    BzzMtfRange::new(128, 132, 133, 7),
+];
 
-fn read_entropy_rank<R>(model: &mut BitModel, reader: &mut R) -> BzzResult<usize>
+#[derive(Debug, Clone, Copy)]
+struct BzzMtfRange {
+    start: usize,
+    selector_context: usize,
+    tree_context: usize,
+    bits: usize,
+}
+
+impl BzzMtfRange {
+    const fn new(start: usize, selector_context: usize, tree_context: usize, bits: usize) -> Self {
+        Self {
+            start,
+            selector_context,
+            tree_context,
+            bits,
+        }
+    }
+}
+
+fn read_entropy_rank<R>(
+    model: &mut BitModel,
+    reader: &mut R,
+    previous_mtfno: usize,
+) -> BzzResult<usize>
 where
     R: ModeledBitReader,
 {
-    if model.read_bit(reader, RANK_ZERO_CONTEXT)? == 1 {
+    let previous_class = previous_mtfno.min(2);
+    if model.read_bit(reader, RANK_ZERO_CONTEXT_START + previous_class)? == 1 {
         return Ok(0);
     }
-    if model.read_bit(reader, RANK_ONE_CONTEXT)? == 1 {
+    if model.read_bit(reader, RANK_ONE_CONTEXT_START + previous_class)? == 1 {
         return Ok(1);
     }
 
-    let mut group_start = 2usize;
-    let mut context = RANK_TREE_CONTEXT_START;
-
-    for group_bits in 1..=RANK_GROUPS {
-        if model.read_bit(reader, context)? == 1 {
-            let mut offset = 0usize;
-            for bit_index in 0..group_bits {
-                let bit = model.read_bit(reader, context + 1 + bit_index)?;
-                offset = (offset << 1) | usize::from(bit);
-            }
-            return Ok(group_start + offset);
+    for range in BZZ_MTF_RANGES {
+        if model.read_bit(reader, range.selector_context)? == 1 {
+            let offset = read_bzz_mtfno_bin(model, reader, range.bits, range.tree_context)?;
+            return Ok(range.start + offset);
         }
-
-        context += 1 + group_bits;
-        group_start <<= 1;
     }
 
     Ok(BWT_MARKER_RANK)
+}
+
+fn read_bzz_mtfno_bin<R>(
+    model: &mut BitModel,
+    reader: &mut R,
+    bits: usize,
+    context_start: usize,
+) -> BzzResult<usize>
+where
+    R: ModeledBitReader,
+{
+    let mut value = 0usize;
+    let mut node = 0usize;
+
+    for _ in 0..bits {
+        let bit = model.read_bit(reader, context_start + node)?;
+        value = (value << 1) | usize::from(bit);
+        node = (node << 1) + 1 + usize::from(bit);
+    }
+
+    Ok(value)
 }
 
 trait ModeledBitReader {
@@ -500,6 +558,11 @@ impl<'a> ZpBitReader<'a> {
         self.lower_bound
     }
 
+    fn read_raw_bit(&mut self) -> u8 {
+        let split = 0x8000 + (3 * u32::from(self.lower_bound()) / 8);
+        self.read_split_bit(split)
+    }
+
     fn read_split_bit(&mut self, mut split: u32) -> u8 {
         self.refill();
 
@@ -634,19 +697,38 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_decoder_reports_incomplete_after_block_size() {
+    fn bzz_decoder_reads_fixture_fshift_after_block_len() {
+        let mut decoder = BzzDecoder::new(HELLO_BZZ);
+
+        assert_eq!(decoder.next_block_len(), HELLO_RAW.len() + 1);
+        assert_eq!(
+            decoder.next_fshift().expect("fixture FSHIFT should decode"),
+            0
+        );
+    }
+
+    #[test]
+    fn in_memory_decoder_reports_incomplete_after_block_header() {
         let error =
             decode_bzz_in_memory(HELLO_BZZ).expect_err("full in-memory decode is not complete yet");
 
-        assert!(matches!(error, BzzError::MissingBwtMarker));
+        assert!(matches!(
+            error,
+            BzzError::MissingBwtMarker
+                | BzzError::DuplicateBwtMarker
+                | BzzError::InvalidSymbolRank { .. }
+                | BzzError::InvalidBwtMarker { .. }
+                | BzzError::InvalidBwtTransform
+        ));
     }
 
     #[test]
     fn bzz_decoder_rank_decode_returns_block_len_with_provisional_model() {
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let block_len = decoder.next_block_len();
+        let fshift = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let ranks = decoder
-            .decode_block_ranks(block_len)
+            .decode_block_ranks(block_len, fshift)
             .expect("provisional rank decoder should produce one block of ranks");
 
         assert_eq!(ranks.len(), block_len);
@@ -854,7 +936,7 @@ mod tests {
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let mut reader = ScriptedModeledBitReader::new([1]);
 
-        let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
+        let rank = read_entropy_rank(&mut model, &mut reader, 0).expect("rank should decode");
 
         assert_eq!(rank, 0);
         assert_eq!(reader.bits_read(), 1);
@@ -865,7 +947,7 @@ mod tests {
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let mut reader = ScriptedModeledBitReader::new([0, 1]);
 
-        let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
+        let rank = read_entropy_rank(&mut model, &mut reader, 0).expect("rank should decode");
 
         assert_eq!(rank, 1);
         assert_eq!(reader.bits_read(), 2);
@@ -876,7 +958,7 @@ mod tests {
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let mut reader = ScriptedModeledBitReader::new([0, 0, 0, 1, 1, 1]);
 
-        let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
+        let rank = read_entropy_rank(&mut model, &mut reader, 0).expect("rank should decode");
 
         assert_eq!(rank, 7);
         assert_eq!(reader.bits_read(), 6);
@@ -887,7 +969,7 @@ mod tests {
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let mut reader = ScriptedModeledBitReader::new([0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
-        let rank = read_entropy_rank(&mut model, &mut reader).expect("rank should decode");
+        let rank = read_entropy_rank(&mut model, &mut reader, 0).expect("rank should decode");
 
         assert_eq!(rank, BWT_MARKER_RANK);
         assert_eq!(reader.bits_read(), 9);
@@ -895,36 +977,56 @@ mod tests {
 
     #[test]
     fn entropy_decisions_for_rank_encode_rank_tree_paths() {
-        assert_eq!(entropy_decisions_for_rank(0), vec![(RANK_ZERO_CONTEXT, 1)]);
+        assert_eq!(entropy_decisions_for_rank(0, 0), vec![(0, 1)]);
+        assert_eq!(entropy_decisions_for_rank(1, 0), vec![(0, 0), (3, 1)]);
         assert_eq!(
-            entropy_decisions_for_rank(1),
-            vec![(RANK_ZERO_CONTEXT, 0), (RANK_ONE_CONTEXT, 1)]
+            entropy_decisions_for_rank(7, 0),
+            vec![(0, 0), (3, 0), (6, 0), (8, 1), (9, 1), (11, 1),]
         );
         assert_eq!(
-            entropy_decisions_for_rank(7),
+            entropy_decisions_for_rank(BWT_MARKER_RANK, 0),
             vec![
-                (RANK_ZERO_CONTEXT, 0),
-                (RANK_ONE_CONTEXT, 0),
-                (RANK_TREE_CONTEXT_START, 0),
-                (RANK_TREE_CONTEXT_START + 2, 1),
-                (RANK_TREE_CONTEXT_START + 3, 1),
-                (RANK_TREE_CONTEXT_START + 4, 1),
+                (0, 0),
+                (3, 0),
+                (6, 0),
+                (8, 0),
+                (12, 0),
+                (20, 0),
+                (36, 0),
+                (68, 0),
+                (132, 0),
             ]
         );
+    }
+
+    #[test]
+    fn bzz_mtfno_context_path_uses_spec_layout() {
+        let path = bzz_mtfno_context_path(10, 0);
+
         assert_eq!(
-            entropy_decisions_for_rank(BWT_MARKER_RANK),
+            path,
             vec![
-                (RANK_ZERO_CONTEXT, 0),
-                (RANK_ONE_CONTEXT, 0),
-                (RANK_TREE_CONTEXT_START, 0),
-                (RANK_TREE_CONTEXT_START + 2, 0),
-                (RANK_TREE_CONTEXT_START + 5, 0),
-                (RANK_TREE_CONTEXT_START + 9, 0),
-                (RANK_TREE_CONTEXT_START + 14, 0),
-                (RANK_TREE_CONTEXT_START + 20, 0),
-                (RANK_TREE_CONTEXT_START + 27, 0),
+                (0, 0),
+                (3, 0),
+                (6, 0),
+                (8, 0),
+                (12, 1),
+                (13, 0),
+                (14, 1),
+                (17, 0),
             ]
         );
+        assert!(
+            !path.iter().any(|(context_id, _)| *context_id == 9),
+            "context 9 belongs to the rank 4..7 decode_bin tree, not rank 10"
+        );
+    }
+
+    #[test]
+    fn bzz_decode_bin_uses_tree_contexts() {
+        let path = bzz_decode_bin_context_path(3, 13, 0b010);
+
+        assert_eq!(path, vec![(13, 0), (14, 1), (17, 0)]);
     }
 
     #[test]
@@ -933,8 +1035,9 @@ mod tests {
         let expected = expected_ranks_from_raw(HELLO_RAW);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let block_len = decoder.next_block_len();
+        let fshift = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let actual = decoder
-            .decode_block_ranks(block_len)
+            .decode_block_ranks(block_len, fshift)
             .expect("fixture ranks should decode");
 
         assert_eq!(actual, expected);
@@ -947,6 +1050,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
+        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
             .expect("modeled fixture bits should decode");
@@ -962,6 +1066,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
+        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let bit_trace =
             trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
@@ -987,15 +1092,7 @@ mod tests {
 
         assert_eq!(
             actual_first_rank_decisions,
-            vec![
-                (RANK_ZERO_CONTEXT, 0),
-                (RANK_ONE_CONTEXT, 0),
-                (RANK_TREE_CONTEXT_START, 0),
-                (RANK_TREE_CONTEXT_START + 2, 0),
-                (RANK_TREE_CONTEXT_START + 5, 1),
-                (RANK_TREE_CONTEXT_START + 6, 0),
-                (RANK_TREE_CONTEXT_START + 7, 0),
-            ]
+            vec![(0, 0), (3, 0), (6, 0), (8, 0), (12, 1), (13, 0), (14, 1),]
         );
         eprintln!("first mismatch expected decision: {expected:?}");
     }
@@ -1052,6 +1149,7 @@ mod tests {
                 let decisions = entropy_decisions_from_ranks_with_options(&expected_ranks, options);
                 let mut decoder = BzzDecoder::new(HELLO_BZZ);
                 let _ = decoder.next_block_len();
+                let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
                 let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
                 let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &decisions)
                     .expect("modeled fixture bits should decode");
@@ -1078,6 +1176,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
+        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
             .expect("modeled fixture bits should decode");
@@ -1128,10 +1227,11 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
+        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
             .expect("modeled fixture bits should decode");
-        let first_rank = &trace[..entropy_decisions_for_rank(expected_ranks[0]).len()];
+        let first_rank = &trace[..entropy_decisions_for_rank(expected_ranks[0], 0).len()];
         let mut merged = SplitConstraint {
             key: SplitConstraintKey {
                 context_id: usize::MAX,
@@ -1171,10 +1271,11 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
+        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
             .expect("modeled fixture bits should decode");
-        let first_rank = &trace[..entropy_decisions_for_rank(expected_ranks[0]).len()];
+        let first_rank = &trace[..entropy_decisions_for_rank(expected_ranks[0], 0).len()];
         let state_ranges = first_rank
             .iter()
             .map(|entry| {
@@ -1211,6 +1312,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
+        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         model.context_mut(9).state = 59;
         let bit_trace =
@@ -1233,6 +1335,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
+        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         model.context_mut(9).state = 59;
         model.context_mut(16).state = 59;
@@ -1308,6 +1411,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
+        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let search = split_constraints_for_expected_decisions(
             &mut model,
@@ -1414,13 +1518,103 @@ mod tests {
         entropy_decisions_from_ranks_with_options(ranks, RankDecisionOptions::default())
     }
 
+    fn bzz_mtfno_context_path(rank: usize, previous_mtfno: usize) -> Vec<(usize, u8)> {
+        bzz_mtfno_context_path_with_options(rank, previous_mtfno, RankDecisionOptions::default())
+    }
+
+    fn bzz_mtfno_context_path_with_options(
+        rank: usize,
+        previous_mtfno: usize,
+        options: RankDecisionOptions,
+    ) -> Vec<(usize, u8)> {
+        let mut path = Vec::new();
+        let previous_class = previous_mtfno.min(2);
+
+        path.push((previous_class, u8::from(rank == 0)));
+        if rank == 0 {
+            return path;
+        }
+
+        path.push((3 + previous_class, u8::from(rank == 1)));
+        if rank == 1 {
+            return path;
+        }
+
+        for range in BZZ_MTF_RANGES {
+            let range_end = range.start + (1usize << range.bits) - 1;
+            let selected = rank >= range.start && rank <= range_end;
+            let selected_bit = if selected {
+                options.group_selected_bit
+            } else {
+                1 - options.group_selected_bit
+            };
+            path.push((range.selector_context, selected_bit));
+            if selected {
+                path.extend(bzz_decode_bin_context_path_with_options(
+                    range.bits,
+                    range.tree_context,
+                    rank - range.start,
+                    options,
+                ));
+                return path;
+            }
+        }
+
+        path
+    }
+
+    fn bzz_decode_bin_context_path(
+        bits: usize,
+        context_start: usize,
+        value: usize,
+    ) -> Vec<(usize, u8)> {
+        bzz_decode_bin_context_path_with_options(
+            bits,
+            context_start,
+            value,
+            RankDecisionOptions::default(),
+        )
+    }
+
+    fn bzz_decode_bin_context_path_with_options(
+        bits: usize,
+        context_start: usize,
+        value: usize,
+        options: RankDecisionOptions,
+    ) -> Vec<(usize, u8)> {
+        let mut path = Vec::with_capacity(bits);
+        let mut node = 0usize;
+        let bit_indexes = if options.offset_msb_first {
+            (0..bits).rev().collect::<Vec<_>>()
+        } else {
+            (0..bits).collect::<Vec<_>>()
+        };
+
+        for bit_index in bit_indexes {
+            let mut bit = u8::from((value & (1usize << bit_index)) != 0);
+            if options.invert_offset_bits {
+                bit = 1 - bit;
+            }
+            path.push((context_start + node, bit));
+            node = (node << 1) + 1 + usize::from(bit);
+        }
+
+        path
+    }
+
     fn entropy_decisions_from_ranks_with_options(
         ranks: &[usize],
         options: RankDecisionOptions,
     ) -> Vec<(usize, u8)> {
         let mut decisions = Vec::new();
+        let mut previous_mtfno = 0usize;
         for rank in ranks {
-            decisions.extend(entropy_decisions_for_rank_with_options(*rank, options));
+            decisions.extend(entropy_decisions_for_rank_with_options(
+                *rank,
+                previous_mtfno,
+                options,
+            ));
+            previous_mtfno = *rank;
         }
         decisions
     }
@@ -1428,8 +1622,16 @@ mod tests {
     fn expected_decision_trace_from_ranks(ranks: &[usize]) -> Vec<ExpectedDecisionTrace> {
         let mut trace = Vec::new();
         for (rank_index, rank) in ranks.iter().copied().enumerate() {
-            for (rank_decision_index, (context_id, expected_bit)) in
-                entropy_decisions_for_rank(rank).into_iter().enumerate()
+            for (rank_decision_index, (context_id, expected_bit)) in entropy_decisions_for_rank(
+                rank,
+                if rank_index == 0 {
+                    0
+                } else {
+                    ranks[rank_index - 1]
+                },
+            )
+            .into_iter()
+            .enumerate()
             {
                 trace.push(ExpectedDecisionTrace {
                     decision_index: trace.len(),
@@ -1473,59 +1675,33 @@ mod tests {
         trace
     }
 
-    fn entropy_decisions_for_rank(rank: usize) -> Vec<(usize, u8)> {
-        entropy_decisions_for_rank_with_options(rank, RankDecisionOptions::default())
+    fn entropy_decisions_for_rank(rank: usize, previous_mtfno: usize) -> Vec<(usize, u8)> {
+        entropy_decisions_for_rank_with_options(
+            rank,
+            previous_mtfno,
+            RankDecisionOptions::default(),
+        )
     }
 
     fn entropy_decisions_for_rank_with_options(
         rank: usize,
+        previous_mtfno: usize,
         options: RankDecisionOptions,
     ) -> Vec<(usize, u8)> {
-        let mut decisions = vec![(RANK_ZERO_CONTEXT, u8::from(rank == 0))];
-        if rank == 0 {
-            return decisions;
-        }
-
-        decisions.push((RANK_ONE_CONTEXT, u8::from(rank == 1)));
-        if rank == 1 {
-            return decisions;
-        }
-
-        let mut group_start = 2usize;
-        let mut context = RANK_TREE_CONTEXT_START;
-        for group_bits in 1..=RANK_GROUPS {
-            let group_end = (group_start << 1) - 1;
-            let rank_is_in_group = rank >= group_start && rank <= group_end;
-            decisions.push((
-                context,
-                if rank_is_in_group {
-                    options.group_selected_bit
-                } else {
-                    1 - options.group_selected_bit
-                },
-            ));
-
-            if rank_is_in_group {
-                let offset = rank - group_start;
-                let bit_indexes = if options.offset_msb_first {
-                    (0..group_bits).rev().collect::<Vec<_>>()
-                } else {
-                    (0..group_bits).collect::<Vec<_>>()
-                };
-                for bit_index in bit_indexes {
-                    let mut bit = u8::from((offset & (1usize << bit_index)) != 0);
-                    if options.invert_offset_bits {
-                        bit = 1 - bit;
-                    }
-                    decisions.push((context + 1 + (group_bits - 1 - bit_index), bit));
+        let mut decisions = bzz_mtfno_context_path(rank, previous_mtfno);
+        if options.group_selected_bit == 0 {
+            for (context_id, bit) in &mut decisions {
+                if BZZ_MTF_RANGES
+                    .iter()
+                    .any(|range| range.selector_context == *context_id)
+                {
+                    *bit = 1 - *bit;
                 }
-                return decisions;
             }
-
-            context += 1 + group_bits;
-            group_start <<= 1;
         }
-
+        if !options.offset_msb_first || options.invert_offset_bits {
+            decisions = bzz_mtfno_context_path_with_options(rank, previous_mtfno, options);
+        }
         decisions
     }
 
@@ -1637,6 +1813,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
+        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         initialize(&mut model);
         let bit_trace =
@@ -1656,19 +1833,19 @@ mod tests {
                 model.context_mut(16).state = 59;
             }
             EntropyInitializerVariant::HighDiscoveredLowRankConservative => {
-                model.context_mut(RANK_ZERO_CONTEXT).state = 24;
-                model.context_mut(RANK_ONE_CONTEXT).state = 24;
+                model.context_mut(RANK_ZERO_CONTEXT_START).state = 24;
+                model.context_mut(RANK_ONE_CONTEXT_START).state = 24;
                 model.context_mut(9).state = 59;
                 model.context_mut(16).state = 59;
             }
             EntropyInitializerVariant::HighDiscoveredLowRankVeryConservative => {
-                model.context_mut(RANK_ZERO_CONTEXT).state = 18;
-                model.context_mut(RANK_ONE_CONTEXT).state = 18;
+                model.context_mut(RANK_ZERO_CONTEXT_START).state = 18;
+                model.context_mut(RANK_ONE_CONTEXT_START).state = 18;
                 model.context_mut(9).state = 59;
                 model.context_mut(16).state = 59;
             }
             EntropyInitializerVariant::HighDiscoveredEarlySelectorsVeryConservative => {
-                for context_id in [RANK_ZERO_CONTEXT, RANK_ONE_CONTEXT, 2, 4] {
+                for context_id in [RANK_ZERO_CONTEXT_START, RANK_ONE_CONTEXT_START, 6, 8] {
                     model.context_mut(context_id).state = 18;
                 }
                 model.context_mut(9).state = 59;
@@ -1680,8 +1857,8 @@ mod tests {
                 }
             }
             EntropyInitializerVariant::RankTreeSelectedHighLowRankVeryConservative => {
-                model.context_mut(RANK_ZERO_CONTEXT).state = 18;
-                model.context_mut(RANK_ONE_CONTEXT).state = 18;
+                model.context_mut(RANK_ZERO_CONTEXT_START).state = 18;
+                model.context_mut(RANK_ONE_CONTEXT_START).state = 18;
                 for context_id in [7, 9, 16, 23] {
                     model.context_mut(context_id).state = 59;
                 }

@@ -12,6 +12,8 @@
 - The current bit-model table generator is a provisional in-repo scaffold. It must be replaced or validated against an independently derived BZZ-compatible model before removing the external `bzz` fallback.
 - The provisional split table is generated from a linear `state / states` baseline plus a small concave boost. The boost was chosen from fixture constraints to move the first known entropy mismatch forward; it is not copied from DjVuLibre, ExifTool, or any static table.
 - The provisional state transition step is currently `3` states per observed bit. Fixture diagnostics showed that the earlier step of `4` adapted too quickly after repeated zero observations.
+- Block decoding now consumes the two pass-through `FSHIFT` bits after the block length and before the MTF-number stream.
+- MTF-number entropy decoding now uses the spec-shaped 262-context layout with previous-`MTFNO` selectors and tree-shaped `decode_bin` context paths. The Z′ state model and BZZ frequency-augmented MTF update are still provisional/incomplete.
 
 ## Implementation Stages
 
