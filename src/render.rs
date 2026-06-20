@@ -1,3 +1,4 @@
+use crate::bzz::{BzzResult, decode_bzz};
 use crate::dirm::DirmTailEntry;
 use crate::document::{Document, Page, ResolvedPageChunk};
 use crate::error::{ParseError, ParseResult};
@@ -194,6 +195,18 @@ pub struct PageRenderPlan<'a> {
     pub unknown_chunks: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RenderChunkPayload<'a> {
+    pub index: usize,
+    pub bytes: &'a [u8],
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OwnedRenderChunkPayload {
+    pub index: usize,
+    pub bytes: Vec<u8>,
+}
+
 impl<'a> PageRenderPlan<'a> {
     #[must_use]
     pub fn new(info: PageInfo, chunks: Vec<ResolvedPageChunk<'a>>) -> Self {
@@ -238,6 +251,66 @@ impl<'a> PageRenderPlan<'a> {
     #[must_use]
     pub fn chunk(&self, index: usize) -> Option<&ResolvedPageChunk<'a>> {
         self.chunks.get(index)
+    }
+
+    #[must_use]
+    pub fn chunk_payload<'bytes>(&self, bytes: &'bytes [u8], index: usize) -> Option<&'bytes [u8]> {
+        let chunk = &self.chunk(index)?.chunk.chunk;
+        bytes.get(chunk.data_start..chunk.data_end)
+    }
+
+    #[must_use]
+    pub fn bitonal_dictionary_payloads<'bytes>(
+        &self,
+        bytes: &'bytes [u8],
+    ) -> Vec<RenderChunkPayload<'bytes>> {
+        self.bitonal_dictionaries
+            .iter()
+            .filter_map(|index| {
+                self.chunk_payload(bytes, *index)
+                    .map(|payload| RenderChunkPayload {
+                        index: *index,
+                        bytes: payload,
+                    })
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn bitonal_image_payloads<'bytes>(
+        &self,
+        bytes: &'bytes [u8],
+    ) -> Vec<RenderChunkPayload<'bytes>> {
+        self.bitonal_images
+            .iter()
+            .filter_map(|index| {
+                self.chunk_payload(bytes, *index)
+                    .map(|payload| RenderChunkPayload {
+                        index: *index,
+                        bytes: payload,
+                    })
+            })
+            .collect()
+    }
+
+    /// Returns the JB2 payloads obtained by BZZ-decoding each `Sjbz` chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `Sjbz` payload fails BZZ decompression.
+    pub fn decoded_bitonal_image_payloads(
+        &self,
+        bytes: &[u8],
+    ) -> BzzResult<Vec<OwnedRenderChunkPayload>> {
+        self.bitonal_image_payloads(bytes)
+            .into_iter()
+            .map(|payload| {
+                decode_bzz(payload.bytes).map(|decoded| OwnedRenderChunkPayload {
+                    index: payload.index,
+                    bytes: decoded,
+                })
+            })
+            .collect()
     }
 
     #[must_use]
@@ -289,6 +362,9 @@ mod tests {
             rotation: 1,
         }
     }
+
+    const HELLO_BZZ: &[u8] = include_bytes!("../tests/fixtures/bzz/hello.bzz");
+    const HELLO_RAW: &[u8] = include_bytes!("../tests/fixtures/bzz/hello.raw");
 
     #[test]
     fn page_bitmap_allocates_rgb_pixels_and_writes_in_bounds() {
@@ -429,6 +505,63 @@ mod tests {
         assert_eq!(
             plan.chunk(2).map(|chunk| chunk.chunk.chunk.id),
             Some("Sjbz")
+        );
+    }
+
+    #[test]
+    fn render_plan_extracts_bitonal_payloads_by_chunk_index() {
+        let mut plan = PageRenderPlan::new(
+            page_info(),
+            vec![
+                resolved_chunk(PageChunkKind::Djbz, "Djbz"),
+                resolved_chunk(PageChunkKind::Sjbz, "Sjbz"),
+                resolved_chunk(PageChunkKind::Txtz, "TXTz"),
+            ],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 1;
+        plan.chunks[0].chunk.chunk.data_end = 4;
+        plan.chunks[1].chunk.chunk.data_start = 4;
+        plan.chunks[1].chunk.chunk.data_end = 7;
+        let bytes = b"Xdictimg";
+
+        let dictionaries = plan.bitonal_dictionary_payloads(bytes);
+        let images = plan.bitonal_image_payloads(bytes);
+
+        assert_eq!(
+            dictionaries,
+            [RenderChunkPayload {
+                index: 0,
+                bytes: b"dic"
+            }]
+        );
+        assert_eq!(
+            images,
+            [RenderChunkPayload {
+                index: 1,
+                bytes: b"tim"
+            }]
+        );
+    }
+
+    #[test]
+    fn render_plan_decodes_bzz_wrapped_bitonal_payloads() {
+        let mut plan = PageRenderPlan::new(
+            page_info(),
+            vec![resolved_chunk(PageChunkKind::Sjbz, "Sjbz")],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 0;
+        plan.chunks[0].chunk.chunk.data_end = HELLO_BZZ.len();
+
+        let decoded = plan
+            .decoded_bitonal_image_payloads(HELLO_BZZ)
+            .expect("BZZ payload should decode");
+
+        assert_eq!(
+            decoded,
+            [OwnedRenderChunkPayload {
+                index: 0,
+                bytes: HELLO_RAW.to_vec()
+            }]
         );
     }
 }

@@ -1,6 +1,6 @@
 use crate::commands::{
-    run_dirm, run_form, run_forms, run_page, run_pages, run_render_page, run_render_plan,
-    run_summary, run_text,
+    run_dirm, run_dump_bitonal, run_form, run_forms, run_page, run_pages, run_render_page,
+    run_render_plan, run_summary, run_text,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -64,6 +64,15 @@ enum Command {
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
+    /// Dump raw Djbz/Sjbz bitonal payloads for one page.
+    DumpBitonal {
+        number: usize,
+        #[arg(long)]
+        decoded: bool,
+        output_dir: PathBuf,
+        #[arg(default_value = DEFAULT_FILE)]
+        file: PathBuf,
+    },
     /// Extract hidden text from one page by 1-based page number.
     Text {
         number: usize,
@@ -90,6 +99,12 @@ pub fn run() -> anyhow::Result<()> {
             output,
             file,
         } => run_render_page(&file, number, &output)?,
+        Command::DumpBitonal {
+            number,
+            decoded,
+            output_dir,
+            file,
+        } => run_dump_bitonal(&file, number, &output_dir, decoded)?,
         Command::Text {
             number,
             zones,
