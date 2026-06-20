@@ -105,11 +105,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "djvu-zp"
+version = "0.20.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34c5b1e90a02f68d80d3ecb646e42d80df4e680d300ec4018629b854170903fe"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "djvulpes"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "djvu-zp",
  "thiserror",
 ]
 

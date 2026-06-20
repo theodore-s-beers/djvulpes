@@ -559,7 +559,7 @@ impl<'a> ZpBitReader<'a> {
     }
 
     fn read_raw_bit(&mut self) -> u8 {
-        let split = 0x8000 + (3 * u32::from(self.lower_bound()) / 8);
+        let split = 0x8000 + (u32::from(self.lower_bound()) >> 1);
         self.read_split_bit(split)
     }
 
@@ -629,6 +629,229 @@ impl<'a> ZpBitReader<'a> {
     fn take_buffered_bits(&self, count: u8) -> u32 {
         u32::try_from((self.shift_buffer >> self.buffered_bits) & ((1u64 << count) - 1))
             .expect("requested bit buffer slice should fit in u32")
+    }
+}
+
+#[cfg(test)]
+struct SpecZpDecoder<'a> {
+    input: &'a [u8],
+    cursor: usize,
+    a: u32,
+    c: u32,
+    fence: u32,
+    bit_buffer: u32,
+    buffered_bits: i32,
+}
+
+#[cfg(test)]
+impl<'a> SpecZpDecoder<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        let mut decoder = Self {
+            input,
+            cursor: 0,
+            a: 0,
+            c: 0,
+            fence: 0,
+            bit_buffer: 0,
+            buffered_bits: 0,
+        };
+        let high = u32::from(decoder.read_byte());
+        let low = u32::from(decoder.read_byte());
+        decoder.c = (high << 8) | low;
+        decoder.refill();
+        decoder.fence = decoder.c.min(0x7fff);
+        decoder
+    }
+
+    fn decode_raw(&mut self) -> u8 {
+        let z = 0x8000 + (self.a >> 1);
+        self.decode_passthrough_with_threshold(z)
+    }
+
+    fn decode_passthrough_with_threshold(&mut self, z: u32) -> u8 {
+        let bit;
+
+        if z > self.c {
+            bit = 1;
+            self.a += 0x10000 - z;
+            self.c += 0x10000 - z;
+            self.renormalize();
+        } else {
+            bit = 0;
+            self.buffered_bits -= 1;
+            self.a = (z << 1) & 0xffff;
+            self.c = ((self.c << 1) | ((self.bit_buffer >> self.buffered_bits) & 1)) & 0xffff;
+            if self.buffered_bits < 16 {
+                self.refill();
+            }
+            self.fence = self.c.min(0x7fff);
+        }
+
+        bit
+    }
+
+    fn decode_bit<T>(&mut self, context: &mut u8, tables: &T) -> u8
+    where
+        T: SpecZpTables,
+    {
+        let state = *context;
+        let mut z = self.a + u32::from(tables.delta(state));
+        if z <= self.fence {
+            self.a = z;
+            return state & 1;
+        }
+
+        let d = 0x6000 + ((z + self.a) >> 2);
+        z = z.min(d);
+
+        let bit;
+        if z > self.c {
+            bit = 1 - (state & 1);
+            self.a += 0x10000 - z;
+            self.c += 0x10000 - z;
+            *context = tables.lambda(state);
+            self.renormalize();
+        } else {
+            bit = state & 1;
+            if self.a >= u32::from(tables.theta(state)) {
+                *context = tables.mu(state);
+            }
+            self.buffered_bits -= 1;
+            self.a = (z << 1) & 0xffff;
+            self.c = ((self.c << 1) | ((self.bit_buffer >> self.buffered_bits) & 1)) & 0xffff;
+            if self.buffered_bits < 16 {
+                self.refill();
+            }
+            self.fence = self.c.min(0x7fff);
+        }
+
+        bit
+    }
+
+    fn renormalize(&mut self) {
+        let shift = u16::try_from(self.a)
+            .expect("ZP interval register should fit in 16 bits")
+            .leading_ones();
+        self.buffered_bits -= i32::try_from(shift).expect("renormalization shift should fit i32");
+        self.a = (self.a << shift) & 0xffff;
+        let mask = (1u32 << shift) - 1;
+        self.c = ((self.c << shift) | ((self.bit_buffer >> self.buffered_bits) & mask)) & 0xffff;
+        if self.buffered_bits < 16 {
+            self.refill();
+        }
+        self.fence = self.c.min(0x7fff);
+    }
+
+    fn refill(&mut self) {
+        while self.buffered_bits <= 24 {
+            self.bit_buffer = (self.bit_buffer << 8) | u32::from(self.read_byte());
+            self.buffered_bits += 8;
+        }
+    }
+
+    fn read_byte(&mut self) -> u8 {
+        let byte = self.input.get(self.cursor).copied().unwrap_or(0xff);
+        self.cursor = self.cursor.wrapping_add(1);
+        byte
+    }
+}
+
+#[cfg(test)]
+trait SpecZpTables {
+    fn delta(&self, state: u8) -> u16;
+    fn theta(&self, state: u8) -> u16;
+    fn mu(&self, state: u8) -> u8;
+    fn lambda(&self, state: u8) -> u8;
+}
+
+#[cfg(test)]
+trait ZpTableGenerator {
+    fn delta(&self, state: usize) -> u16;
+    fn theta(&self, state: usize) -> u16;
+    fn mu(&self, state: usize) -> u8;
+    fn lambda(&self, state: usize) -> u8;
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ZpTableSet {
+    delta: [u16; 256],
+    theta: [u16; 256],
+    mu: [u8; 256],
+    lambda: [u8; 256],
+}
+
+#[cfg(test)]
+impl ZpTableSet {
+    fn generate(generator: &impl ZpTableGenerator) -> Self {
+        let mut delta = [0; 256];
+        let mut theta = [0; 256];
+        let mut mu = [0; 256];
+        let mut lambda = [0; 256];
+
+        for state in 0..256 {
+            delta[state] = generator.delta(state);
+            theta[state] = generator.theta(state);
+            mu[state] = generator.mu(state);
+            lambda[state] = generator.lambda(state);
+        }
+
+        Self {
+            delta,
+            theta,
+            mu,
+            lambda,
+        }
+    }
+
+    fn validate_shape(&self) {
+        for state in 0..=250 {
+            assert!(
+                self.delta[state] <= 0x8000,
+                "probability delta for state {state} should fit the ZP interval"
+            );
+            assert!(
+                self.theta[state] <= 0x7fff,
+                "threshold for state {state} should fit the ZP fence"
+            );
+            assert!(
+                usize::from(self.mu[state]) <= 250,
+                "MPS transition for state {state} should stay in valid states"
+            );
+            assert!(
+                usize::from(self.lambda[state]) <= 250,
+                "LPS transition for state {state} should stay in valid states"
+            );
+        }
+
+        for state in 251..=255 {
+            assert!(
+                self.delta[state] <= 0x8000,
+                "padding probability delta for state {state} should fit the ZP interval"
+            );
+            assert_eq!(self.theta[state], 0);
+            assert_eq!(self.mu[state], 0);
+            assert_eq!(self.lambda[state], 0);
+        }
+    }
+}
+
+#[cfg(test)]
+impl SpecZpTables for ZpTableSet {
+    fn delta(&self, state: u8) -> u16 {
+        self.delta[usize::from(state)]
+    }
+
+    fn theta(&self, state: u8) -> u16 {
+        self.theta[usize::from(state)]
+    }
+
+    fn mu(&self, state: u8) -> u8 {
+        self.mu[usize::from(state)]
+    }
+
+    fn lambda(&self, state: u8) -> u8 {
+        self.lambda[usize::from(state)]
     }
 }
 
@@ -705,6 +928,184 @@ mod tests {
             decoder.next_fshift().expect("fixture FSHIFT should decode"),
             0
         );
+    }
+
+    #[test]
+    fn spec_zp_raw_decoder_reads_fixture_block_header() {
+        let mut decoder = SpecZpDecoder::new(HELLO_BZZ);
+
+        assert_eq!(spec_zp_next_block_len(&mut decoder), HELLO_RAW.len() + 1);
+        assert_eq!(spec_zp_next_fshift(&mut decoder), 0);
+    }
+
+    #[test]
+    fn spec_zp_context_decode_updates_mps_and_lps_states() {
+        let tables = ScriptedSpecZpTables;
+        let mut mps_decoder = SpecZpDecoder::new(&[0xff, 0xff]);
+        let mut mps_context = 0;
+        let mut lps_decoder = SpecZpDecoder::new(&[0x00, 0x00]);
+        let mut lps_context = 0;
+
+        let mps_bit = mps_decoder.decode_bit(&mut mps_context, &tables);
+        let lps_bit = lps_decoder.decode_bit(&mut lps_context, &tables);
+
+        assert_eq!(mps_bit, 0);
+        assert_eq!(mps_context, 83);
+        assert_eq!(lps_bit, 1);
+        assert_eq!(lps_context, 84);
+    }
+
+    #[test]
+    fn spec_zp_context_decode_matches_djvu_zp_oracle() {
+        let tables = candidate_zp_table_set();
+        let cases: &[&[u8]] = &[
+            HELLO_BZZ,
+            &[0xff, 0xff, 0xff, 0xff],
+            &[0x00, 0x00, 0x00, 0x00],
+            &[0x55, 0xaa, 0x33, 0xcc],
+            &[0x80, 0x00, 0x7f, 0xff, 0x01],
+        ];
+
+        for input in cases {
+            let mut ours = SpecZpDecoder::new(input);
+            let mut oracle =
+                djvu_zp::ZpDecoder::new(input).expect("test case should initialize ZP");
+            let mut our_contexts = [0; 16];
+            let mut oracle_contexts = [0; 16];
+
+            for step in 0..256 {
+                let context = (step * 7) % our_contexts.len();
+                let our_bit = ours.decode_bit(&mut our_contexts[context], &tables) != 0;
+                let oracle_bit = oracle.decode_bit(&mut oracle_contexts[context]);
+
+                assert_eq!(
+                    our_bit, oracle_bit,
+                    "bit mismatch for input {input:02x?}, step {step}, context {context}"
+                );
+                assert_eq!(
+                    our_contexts[context], oracle_contexts[context],
+                    "context mismatch for input {input:02x?}, step {step}, context {context}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn djvu_zp_oracle_tables_have_expected_public_shape() {
+        assert_eq!(djvu_zp::tables::PROB.len(), 256);
+        assert_eq!(djvu_zp::tables::THRESHOLD.len(), 256);
+        assert_eq!(djvu_zp::tables::MPS_NEXT.len(), 256);
+        assert_eq!(djvu_zp::tables::LPS_NEXT.len(), 256);
+
+        djvu_zp_oracle_table_set().validate_shape();
+    }
+
+    #[test]
+    fn zp_table_set_can_be_generated_from_dev_oracle() {
+        let tables = ZpTableSet::generate(&DevOracleZpTableGenerator);
+
+        assert_eq!(tables.delta, djvu_zp::tables::PROB);
+        assert_eq!(tables.theta, djvu_zp::tables::THRESHOLD);
+        assert_eq!(tables.mu, djvu_zp::tables::MPS_NEXT);
+        assert_eq!(tables.lambda, djvu_zp::tables::LPS_NEXT);
+    }
+
+    #[test]
+    fn candidate_zp_table_set_matches_dev_oracle() {
+        assert_eq!(candidate_zp_table_set(), djvu_zp_oracle_table_set());
+    }
+
+    #[test]
+    fn zp_table_phases_match_spec_structure() {
+        let tables = candidate_zp_table_set();
+
+        assert_eq!(tables.theta[0], 0);
+        assert_eq!(tables.theta[1], 0);
+        assert_eq!(tables.theta[2], 0);
+
+        for state in 3..=82 {
+            assert!(
+                tables.theta[state] > 0,
+                "early-estimation state {state} should have a nonzero MPS update threshold"
+            );
+        }
+
+        for state in 83..=250 {
+            assert_eq!(
+                tables.theta[state], 0,
+                "steady-state state {state} should update on every decoded MPS"
+            );
+        }
+    }
+
+    #[test]
+    fn zp_initial_context_transitions_enter_late_estimation() {
+        let tables = candidate_zp_table_set();
+
+        assert!(
+            (83..=250).contains(&usize::from(tables.mu[0])),
+            "first MPS from a fresh context should leave the early-estimation range"
+        );
+        assert!(
+            (83..=250).contains(&usize::from(tables.lambda[0])),
+            "first LPS from a fresh context should leave the early-estimation range"
+        );
+        assert_eq!(
+            tables.mu[0] & 1,
+            0,
+            "first MPS from a fresh context should keep zero as the MPS"
+        );
+        assert_eq!(
+            tables.lambda[0] & 1,
+            1,
+            "first LPS from a fresh context should make one the MPS"
+        );
+    }
+
+    #[test]
+    fn zp_early_estimation_pairs_share_probability_and_threshold() {
+        let tables = candidate_zp_table_set();
+
+        for state in (3..=81).step_by(2) {
+            assert_eq!(
+                tables.delta[state],
+                tables.delta[state + 1],
+                "early-estimation states {state} and {} should share probability delta",
+                state + 1
+            );
+            assert_eq!(
+                tables.theta[state],
+                tables.theta[state + 1],
+                "early-estimation states {state} and {} should share MPS threshold",
+                state + 1
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "prints residuals for candidate theta formulas against the dev oracle"]
+    fn fixture_theta_candidate_formula_residuals() {
+        let tables = candidate_zp_table_set();
+        let mut max_error = 0;
+        let mut max_error_state = 0;
+
+        for state in (3..=81).step_by(2) {
+            let expected = dev_oracle_theta(state);
+            let estimated = estimate_theta_from_delta(tables.delta[state]);
+            let error = expected.abs_diff(estimated);
+
+            if error > max_error {
+                max_error = error;
+                max_error_state = state;
+            }
+
+            eprintln!(
+                "state={state:>2} delta=0x{:04x} expected=0x{expected:04x} estimated=0x{estimated:04x} error={error}",
+                tables.delta[state],
+            );
+        }
+
+        eprintln!("max_error={max_error} at state={max_error_state}");
     }
 
     #[test]
@@ -1514,6 +1915,21 @@ mod tests {
         ranks_from_block_symbols(&block).expect("derived BWT block should convert to ranks")
     }
 
+    fn spec_zp_next_block_len(decoder: &mut SpecZpDecoder<'_>) -> usize {
+        let mut value = 1usize;
+        let block_len_marker = 1usize << 24;
+
+        while value < block_len_marker {
+            value = (value << 1) | usize::from(decoder.decode_raw());
+        }
+
+        value - block_len_marker
+    }
+
+    fn spec_zp_next_fshift(decoder: &mut SpecZpDecoder<'_>) -> u8 {
+        (decoder.decode_raw() << 1) | decoder.decode_raw()
+    }
+
     fn entropy_decisions_from_ranks(ranks: &[usize]) -> Vec<(usize, u8)> {
         entropy_decisions_from_ranks_with_options(ranks, RankDecisionOptions::default())
     }
@@ -2124,6 +2540,76 @@ mod tests {
             self.splits.push(split);
             self.bits_read += 1;
             Ok(self.bits.next().unwrap_or(0))
+        }
+    }
+
+    struct ScriptedSpecZpTables;
+
+    impl SpecZpTables for ScriptedSpecZpTables {
+        fn delta(&self, _state: u8) -> u16 {
+            0x8000
+        }
+
+        fn theta(&self, _state: u8) -> u16 {
+            0
+        }
+
+        fn mu(&self, _state: u8) -> u8 {
+            83
+        }
+
+        fn lambda(&self, _state: u8) -> u8 {
+            84
+        }
+    }
+
+    struct DevOracleZpTableGenerator;
+
+    impl ZpTableGenerator for DevOracleZpTableGenerator {
+        fn delta(&self, state: usize) -> u16 {
+            djvu_zp::tables::PROB[state]
+        }
+
+        fn theta(&self, state: usize) -> u16 {
+            candidate_theta(state)
+        }
+
+        fn mu(&self, state: usize) -> u8 {
+            djvu_zp::tables::MPS_NEXT[state]
+        }
+
+        fn lambda(&self, state: usize) -> u8 {
+            djvu_zp::tables::LPS_NEXT[state]
+        }
+    }
+
+    fn candidate_zp_table_set() -> ZpTableSet {
+        ZpTableSet::generate(&DevOracleZpTableGenerator)
+    }
+
+    fn candidate_theta(state: usize) -> u16 {
+        dev_oracle_theta(state)
+    }
+
+    fn dev_oracle_theta(state: usize) -> u16 {
+        djvu_zp::tables::THRESHOLD[state]
+    }
+
+    fn estimate_theta_from_delta(delta: u16) -> u16 {
+        if delta == 0x8000 {
+            return 0;
+        }
+
+        let complement = (u32::from(delta) * 0x5a82 + 0x4000) >> 15;
+        u16::try_from(0x8000 - complement).expect("theta estimate should fit in u16")
+    }
+
+    fn djvu_zp_oracle_table_set() -> ZpTableSet {
+        ZpTableSet {
+            delta: djvu_zp::tables::PROB,
+            theta: djvu_zp::tables::THRESHOLD,
+            mu: djvu_zp::tables::MPS_NEXT,
+            lambda: djvu_zp::tables::LPS_NEXT,
         }
     }
 }
