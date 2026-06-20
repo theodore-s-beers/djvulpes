@@ -9,4 +9,5 @@ clap = { version = "4.6.1", features = ["derive"] }
 thiserror = "2.0.18"
 
 [dev-dependencies]
+djvu-bzz = { version = "0.20.3", default-features = false, features = ["std"] }
 djvu-zp = { version = "0.20.3", default-features = false }

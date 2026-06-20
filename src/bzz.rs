@@ -43,15 +43,17 @@ pub enum BzzError {
 
 /// Decodes `DjVu` BZZ-compressed bytes.
 ///
-/// This is currently backed by the local `bzz` command. Keeping the command
-/// dependency behind this API lets callers use decoded `DjVu` payloads without
-/// knowing how decompression is implemented, and gives the future pure-Rust
-/// decoder one narrow replacement point.
+/// This currently tries the in-memory decoder first and falls back to the local
+/// `bzz` command for inputs the in-memory path does not yet handle. Keeping the
+/// command dependency behind this API lets callers use decoded `DjVu` payloads
+/// without knowing how decompression is implemented, and gives the future
+/// pure-Rust decoder one narrow replacement point.
 ///
 /// # Errors
 ///
-/// Returns an error if the external decoder cannot be run, fails, or if its
-/// temporary input/output files cannot be written or read.
+/// Returns an error if in-memory decoding fails and the external decoder cannot
+/// be run, fails, or if its temporary input/output files cannot be written or
+/// read.
 pub fn decode_bzz(bytes: &[u8]) -> BzzResult<Vec<u8>> {
     match decode_bzz_in_memory(bytes) {
         Err(
@@ -117,23 +119,29 @@ fn decode_bzz_with_local_tool(bytes: &[u8]) -> BzzResult<Vec<u8>> {
 }
 
 fn decode_bzz_in_memory(bytes: &[u8]) -> BzzResult<Vec<u8>> {
-    let mut decoder = BzzDecoder::new(bytes);
-    let block_size = decoder.next_block_len();
+    let mut decoder = VerifiedBzzDecoder::new(bytes)?;
+    let mut output = Vec::new();
 
-    if block_size == 0 {
-        return Ok(Vec::new());
-    }
-    if block_size > MAX_BLOCK_BYTES {
-        return Err(BzzError::UnsupportedBlockSize { size: block_size });
-    }
+    loop {
+        let block_size = decoder.next_block_len();
 
-    let fshift = decoder.next_fshift()?;
-    let ranks = decoder.decode_block_ranks(block_size, fshift)?;
-    decode_block_from_ranks(block_size, fshift, ranks)
+        if block_size == 0 {
+            return Ok(output);
+        }
+        if block_size > MAX_BLOCK_BYTES {
+            return Err(BzzError::UnsupportedBlockSize { size: block_size });
+        }
+
+        let fshift = decoder.next_fshift();
+        let ranks = decoder.decode_block_ranks(block_size, fshift);
+        output.extend(decode_block_from_ranks(block_size, fshift, ranks)?);
+    }
 }
 
 const MAX_BLOCK_BYTES: usize = 4096 * 1024;
 const BWT_MARKER_RANK: usize = 256;
+const BZZ_FREQ_SLOTS: usize = 4;
+const INITIAL_PREVIOUS_MTFNO: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockSymbols {
@@ -194,6 +202,7 @@ where
     inverse_bwt_block(&block.symbols, block.marker_pos)
 }
 
+#[cfg(test)]
 fn collect_block_ranks<R>(block_len: usize, decoder: &mut R) -> BzzResult<Vec<usize>>
 where
     R: RankDecoder,
@@ -252,7 +261,7 @@ impl BzzMoveToFrontTable {
     fn new(fshift: u8) -> Self {
         Self {
             symbols: (0..=u8::MAX).collect(),
-            freq: [0; 4],
+            freq: [0; BZZ_FREQ_SLOTS],
             fadd: 4,
             fshift,
         }
@@ -263,17 +272,31 @@ impl BzzMoveToFrontTable {
             return Err(BzzError::InvalidSymbolRank { rank });
         }
 
+        let symbol = self.symbols[rank];
         self.update_fadd();
-        let symbol = self.symbols.remove(rank);
         let symbol_freq = self
             .freq
             .get(rank)
             .copied()
             .unwrap_or(0)
             .saturating_add(self.fadd);
-        let insert_at = self.insertion_index(rank, symbol_freq);
-        self.symbols.insert(insert_at, symbol);
-        self.rotate_freq(rank, insert_at, symbol_freq);
+
+        let mut insert_at = rank;
+        if insert_at >= BZZ_FREQ_SLOTS {
+            for index in (BZZ_FREQ_SLOTS..=rank).rev() {
+                self.symbols[index] = self.symbols[index - 1];
+            }
+            insert_at = BZZ_FREQ_SLOTS - 1;
+        }
+
+        while insert_at > 0 && symbol_freq >= self.freq[insert_at - 1] {
+            self.symbols[insert_at] = self.symbols[insert_at - 1];
+            self.freq[insert_at] = self.freq[insert_at - 1];
+            insert_at -= 1;
+        }
+
+        self.symbols[insert_at] = symbol;
+        self.freq[insert_at] = symbol_freq;
         Ok(symbol)
     }
 
@@ -290,43 +313,128 @@ impl BzzMoveToFrontTable {
             .saturating_add(self.fadd >> u32::from(self.fshift));
 
         if self.fadd > 0x1000_0000 {
-            self.fadd /= 0x1000_0000;
+            self.fadd >>= 24;
             for freq in &mut self.freq {
-                *freq /= 0x1000_0000;
+                *freq >>= 24;
             }
         }
-    }
-
-    fn insertion_index(&self, rank: usize, symbol_freq: u32) -> usize {
-        let max_insert = rank.min(3);
-        let mut insert_at = 0;
-
-        while insert_at < max_insert && self.freq[insert_at] >= symbol_freq {
-            insert_at += 1;
-        }
-
-        insert_at
-    }
-
-    fn rotate_freq(&mut self, rank: usize, insert_at: usize, symbol_freq: u32) {
-        if rank < 4 {
-            for index in (insert_at + 1..=rank).rev() {
-                self.freq[index] = self.freq[index - 1];
-            }
-        } else {
-            for index in (insert_at + 1..4).rev() {
-                self.freq[index] = self.freq[index - 1];
-            }
-        }
-
-        self.freq[insert_at] = symbol_freq;
     }
 }
 
+struct VerifiedBzzDecoder<'a> {
+    zp: SpecZpDecoder<'a>,
+    contexts: [u8; BZZ_MTF_CONTEXTS],
+    tables: &'static ZpTableSet,
+}
+
+impl<'a> VerifiedBzzDecoder<'a> {
+    fn new(bytes: &'a [u8]) -> BzzResult<Self> {
+        if bytes.len() < 2 {
+            return Err(BzzError::IncompleteDecoder("ZP input is too short"));
+        }
+
+        Ok(Self {
+            zp: SpecZpDecoder::new(bytes),
+            contexts: [0; BZZ_MTF_CONTEXTS],
+            tables: &DJVU_ZP_TABLES,
+        })
+    }
+
+    fn next_block_len(&mut self) -> usize {
+        let mut value = 1usize;
+        let block_len_marker = 1usize << 24;
+
+        while value < block_len_marker {
+            value = (value << 1) | usize::from(self.zp.decode_raw());
+        }
+
+        value - block_len_marker
+    }
+
+    fn next_fshift(&mut self) -> u8 {
+        if self.zp.decode_raw() == 0 {
+            return 0;
+        }
+        1 + self.zp.decode_raw()
+    }
+
+    fn decode_block_ranks(&mut self, block_len: usize, _fshift: u8) -> Vec<usize> {
+        let mut ranks = Vec::with_capacity(block_len);
+        let mut previous_mtfno = INITIAL_PREVIOUS_MTFNO;
+
+        for _ in 0..block_len {
+            let rank = read_verified_entropy_rank(
+                &mut self.zp,
+                &mut self.contexts,
+                self.tables,
+                previous_mtfno,
+            );
+            previous_mtfno = rank;
+            ranks.push(rank);
+        }
+
+        ranks
+    }
+}
+
+fn read_verified_entropy_rank(
+    zp: &mut SpecZpDecoder<'_>,
+    contexts: &mut [u8; BZZ_MTF_CONTEXTS],
+    tables: &ZpTableSet,
+    previous_mtfno: usize,
+) -> usize {
+    let previous_class = previous_mtfno.min(2);
+    if zp.decode_bit(
+        &mut contexts[RANK_ZERO_CONTEXT_START + previous_class],
+        tables,
+    ) == 1
+    {
+        return 0;
+    }
+    if zp.decode_bit(
+        &mut contexts[RANK_ONE_CONTEXT_START + previous_class],
+        tables,
+    ) == 1
+    {
+        return 1;
+    }
+
+    for range in BZZ_MTF_RANGES {
+        if zp.decode_bit(&mut contexts[range.selector_context], tables) == 1 {
+            let offset =
+                read_verified_mtfno_bin(zp, contexts, tables, range.bits, range.tree_context);
+            return range.start + offset;
+        }
+    }
+
+    BWT_MARKER_RANK
+}
+
+fn read_verified_mtfno_bin(
+    zp: &mut SpecZpDecoder<'_>,
+    contexts: &mut [u8; BZZ_MTF_CONTEXTS],
+    tables: &ZpTableSet,
+    bits: usize,
+    context_start: usize,
+) -> usize {
+    let mut value = 0;
+    let mut node = 0;
+
+    for _ in 0..bits {
+        let bit = usize::from(zp.decode_bit(&mut contexts[context_start + node], tables));
+        value = (value << 1) | bit;
+        node = (node << 1) + 1 + bit;
+    }
+
+    value
+}
+
+#[cfg(test)]
 struct BzzDecoder<'a> {
     bits: ZpBitReader<'a>,
 }
 
+#[cfg(test)]
 impl<'a> BzzDecoder<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self {
@@ -345,12 +453,11 @@ impl<'a> BzzDecoder<'a> {
         value - block_len_marker
     }
 
-    fn next_fshift(&mut self) -> BzzResult<u8> {
-        let value = (self.bits.read_raw_bit() << 1) | self.bits.read_raw_bit();
-        if value > 2 {
-            return Err(BzzError::InvalidFshift { value });
+    fn next_fshift(&mut self) -> u8 {
+        if self.bits.read_raw_bit() == 0 {
+            return 0;
         }
-        Ok(value)
+        1 + self.bits.read_raw_bit()
     }
 
     fn decode_block_ranks(&mut self, block_len: usize, _fshift: u8) -> BzzResult<Vec<usize>> {
@@ -359,26 +466,30 @@ impl<'a> BzzDecoder<'a> {
     }
 }
 
+#[cfg(test)]
 trait RankDecoder {
     fn next_rank(&mut self) -> BzzResult<usize>;
 }
 
+#[cfg(test)]
 struct EntropyRankDecoder<'bits, 'input> {
     bits: &'bits mut ZpBitReader<'input>,
     model: BitModel,
     previous_mtfno: usize,
 }
 
+#[cfg(test)]
 impl<'bits, 'input> EntropyRankDecoder<'bits, 'input> {
     fn new(bits: &'bits mut ZpBitReader<'input>) -> Self {
         Self {
             bits,
             model: BitModel::with_contexts(ENTROPY_CONTEXTS),
-            previous_mtfno: 0,
+            previous_mtfno: INITIAL_PREVIOUS_MTFNO,
         }
     }
 }
 
+#[cfg(test)]
 impl RankDecoder for EntropyRankDecoder<'_, '_> {
     fn next_rank(&mut self) -> BzzResult<usize> {
         let rank = read_entropy_rank(&mut self.model, self.bits, self.previous_mtfno)?;
@@ -388,6 +499,7 @@ impl RankDecoder for EntropyRankDecoder<'_, '_> {
 }
 
 const BZZ_MTF_CONTEXTS: usize = 262;
+#[cfg(test)]
 const ENTROPY_CONTEXTS: usize = BZZ_MTF_CONTEXTS;
 const RANK_ZERO_CONTEXT_START: usize = 0;
 const RANK_ONE_CONTEXT_START: usize = 3;
@@ -420,6 +532,7 @@ impl BzzMtfRange {
     }
 }
 
+#[cfg(test)]
 fn read_entropy_rank<R>(
     model: &mut BitModel,
     reader: &mut R,
@@ -446,6 +559,7 @@ where
     Ok(BWT_MARKER_RANK)
 }
 
+#[cfg(test)]
 fn read_bzz_mtfno_bin<R>(
     model: &mut BitModel,
     reader: &mut R,
@@ -467,16 +581,19 @@ where
     Ok(value)
 }
 
+#[cfg(test)]
 trait ModeledBitReader {
     fn read_modeled_bit(&mut self, split: u16) -> BzzResult<u8>;
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct BitModel {
     contexts: Vec<BitContext>,
     tables: BitModelTables,
 }
 
+#[cfg(test)]
 impl BitModel {
     fn with_contexts(count: usize) -> Self {
         Self {
@@ -506,6 +623,7 @@ impl BitModel {
     }
 }
 
+#[cfg(test)]
 impl ModeledBitReader for ZpBitReader<'_> {
     fn read_modeled_bit(&mut self, split: u16) -> BzzResult<u8> {
         Ok(self.read_split_bit(u32::from(split)))
@@ -513,10 +631,12 @@ impl ModeledBitReader for ZpBitReader<'_> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 struct BitContext {
     state: u8,
 }
 
+#[cfg(test)]
 impl Default for BitContext {
     fn default() -> Self {
         Self {
@@ -525,22 +645,27 @@ impl Default for BitContext {
     }
 }
 
+#[cfg(test)]
 impl BitContext {
     const fn observe(&mut self, bit: u8, tables: &BitModelTables) {
         self.state = tables.next_state(self.state, bit);
     }
 }
 
+#[cfg(test)]
 const BIT_MODEL_STATES: usize = 65;
+#[cfg(test)]
 const BIT_MODEL_INITIAL_STATE: u8 = 32;
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct BitModelTables {
     split: [u16; BIT_MODEL_STATES],
     next_zero: [u8; BIT_MODEL_STATES],
     next_one: [u8; BIT_MODEL_STATES],
 }
 
+#[cfg(test)]
 impl BitModelTables {
     fn generated() -> Self {
         let mut split = [0; BIT_MODEL_STATES];
@@ -585,6 +710,7 @@ impl BitModelTables {
     }
 }
 
+#[cfg(test)]
 struct ZpBitReader<'a> {
     input: &'a [u8],
     cursor: usize,
@@ -595,6 +721,7 @@ struct ZpBitReader<'a> {
     end_padding: u8,
 }
 
+#[cfg(test)]
 impl<'a> ZpBitReader<'a> {
     fn new(input: &'a [u8]) -> Self {
         let (code_window, cursor) = match input {
@@ -692,7 +819,6 @@ impl<'a> ZpBitReader<'a> {
     }
 }
 
-#[cfg(test)]
 struct SpecZpDecoder<'a> {
     input: &'a [u8],
     cursor: usize,
@@ -703,7 +829,6 @@ struct SpecZpDecoder<'a> {
     buffered_bits: i32,
 }
 
-#[cfg(test)]
 impl<'a> SpecZpDecoder<'a> {
     fn new(input: &'a [u8]) -> Self {
         let mut decoder = Self {
@@ -816,7 +941,6 @@ impl<'a> SpecZpDecoder<'a> {
     }
 }
 
-#[cfg(test)]
 trait SpecZpTables {
     fn delta(&self, state: u8) -> u16;
     fn theta(&self, state: u8) -> u16;
@@ -832,7 +956,6 @@ trait ZpTableGenerator {
     fn lambda(&self, state: usize) -> u8;
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ZpTableSet {
     delta: [u16; 256],
@@ -841,8 +964,8 @@ struct ZpTableSet {
     lambda: [u8; 256],
 }
 
-#[cfg(test)]
 impl ZpTableSet {
+    #[cfg(test)]
     fn generate(generator: &impl ZpTableGenerator) -> Self {
         let mut delta = [0; 256];
         let mut theta = [0; 256];
@@ -864,6 +987,7 @@ impl ZpTableSet {
         }
     }
 
+    #[cfg(test)]
     fn validate_shape(&self) {
         for state in 0..=250 {
             assert!(
@@ -896,7 +1020,6 @@ impl ZpTableSet {
     }
 }
 
-#[cfg(test)]
 impl SpecZpTables for ZpTableSet {
     fn delta(&self, state: u8) -> u16 {
         self.delta[usize::from(state)]
@@ -915,6 +1038,85 @@ impl SpecZpTables for ZpTableSet {
     }
 }
 
+const fn zp_theta_table() -> [u16; 256] {
+    let initial = [
+        0x0000, 0x0000, 0x0000, 0x10a5, 0x10a5, 0x1f28, 0x1f28, 0x2bd3, 0x2bd3, 0x36e3, 0x36e3,
+        0x408c, 0x408c, 0x48fd, 0x48fd, 0x505d, 0x505d, 0x56d0, 0x56d0, 0x5c71, 0x5c71, 0x615b,
+        0x615b, 0x65a5, 0x65a5, 0x6962, 0x6962, 0x6ca2, 0x6ca2, 0x6f74, 0x6f74, 0x71e6, 0x71e6,
+        0x7404, 0x7404, 0x75d6, 0x75d6, 0x7768, 0x7768, 0x78c2, 0x78c2, 0x79ea, 0x79ea, 0x7ae7,
+        0x7ae7, 0x7bbe, 0x7bbe, 0x7c75, 0x7c75, 0x7d0f, 0x7d0f, 0x7d91, 0x7d91, 0x7dfe, 0x7dfe,
+        0x7e5a, 0x7e5a, 0x7ea6, 0x7ea6, 0x7ee6, 0x7ee6, 0x7f1a, 0x7f1a, 0x7f45, 0x7f45, 0x7f6b,
+        0x7f6b, 0x7f8d, 0x7f8d, 0x7faa, 0x7faa, 0x7fc3, 0x7fc3, 0x7fd7, 0x7fd7, 0x7fe7, 0x7fe7,
+        0x7ff2, 0x7ff2, 0x7ffa, 0x7ffa, 0x7fff, 0x7fff,
+    ];
+    let mut theta = [0; 256];
+    let mut index = 0;
+    while index < initial.len() {
+        theta[index] = initial[index];
+        index += 1;
+    }
+    theta
+}
+
+const DJVU_ZP_TABLES: ZpTableSet = ZpTableSet {
+    delta: [
+        0x8000, 0x8000, 0x8000, 0x6bbd, 0x6bbd, 0x5d45, 0x5d45, 0x51b9, 0x51b9, 0x4813, 0x4813,
+        0x3fd5, 0x3fd5, 0x38b1, 0x38b1, 0x3275, 0x3275, 0x2cfd, 0x2cfd, 0x2825, 0x2825, 0x23ab,
+        0x23ab, 0x1f87, 0x1f87, 0x1bbb, 0x1bbb, 0x1845, 0x1845, 0x1523, 0x1523, 0x1253, 0x1253,
+        0x0fcf, 0x0fcf, 0x0d95, 0x0d95, 0x0b9d, 0x0b9d, 0x09e3, 0x09e3, 0x0861, 0x0861, 0x0711,
+        0x0711, 0x05f1, 0x05f1, 0x04f9, 0x04f9, 0x0425, 0x0425, 0x0371, 0x0371, 0x02d9, 0x02d9,
+        0x0259, 0x0259, 0x01ed, 0x01ed, 0x0193, 0x0193, 0x0149, 0x0149, 0x010b, 0x010b, 0x00d5,
+        0x00d5, 0x00a5, 0x00a5, 0x007b, 0x007b, 0x0057, 0x0057, 0x003b, 0x003b, 0x0023, 0x0023,
+        0x0013, 0x0013, 0x0007, 0x0007, 0x0001, 0x0001, 0x5695, 0x24ee, 0x8000, 0x0d30, 0x481a,
+        0x0481, 0x3579, 0x017a, 0x24ef, 0x007b, 0x1978, 0x0028, 0x10ca, 0x000d, 0x0b5d, 0x0034,
+        0x078a, 0x00a0, 0x050f, 0x0117, 0x0358, 0x01ea, 0x0234, 0x0144, 0x0173, 0x0234, 0x00f5,
+        0x0353, 0x00a1, 0x05c5, 0x011a, 0x03cf, 0x01aa, 0x0285, 0x0286, 0x01ab, 0x03d3, 0x011a,
+        0x05c5, 0x00ba, 0x08ad, 0x007a, 0x0ccc, 0x01eb, 0x1302, 0x02e6, 0x1b81, 0x045e, 0x24ef,
+        0x0690, 0x2865, 0x09de, 0x3987, 0x0dc8, 0x2c99, 0x10ca, 0x3b5f, 0x0b5d, 0x5695, 0x078a,
+        0x8000, 0x050f, 0x24ee, 0x0358, 0x0d30, 0x0234, 0x0481, 0x0173, 0x017a, 0x00f5, 0x007b,
+        0x00a1, 0x0028, 0x011a, 0x000d, 0x01aa, 0x0034, 0x0286, 0x00a0, 0x03d3, 0x0117, 0x05c5,
+        0x01ea, 0x08ad, 0x0144, 0x0ccc, 0x0234, 0x1302, 0x0353, 0x1b81, 0x05c5, 0x24ef, 0x03cf,
+        0x2b74, 0x0285, 0x201d, 0x01ab, 0x1715, 0x011a, 0x0fb7, 0x00ba, 0x0a67, 0x01eb, 0x06e7,
+        0x02e6, 0x0496, 0x045e, 0x030d, 0x0690, 0x0206, 0x09de, 0x0155, 0x0dc8, 0x00e1, 0x2b74,
+        0x0094, 0x201d, 0x0188, 0x1715, 0x0252, 0x0fb7, 0x0383, 0x0a67, 0x0547, 0x06e7, 0x07e2,
+        0x0496, 0x0bc0, 0x030d, 0x1178, 0x0206, 0x19da, 0x0155, 0x24ef, 0x00e1, 0x320e, 0x0094,
+        0x432a, 0x0188, 0x447d, 0x0252, 0x5ece, 0x0383, 0x8000, 0x0547, 0x481a, 0x07e2, 0x3579,
+        0x0bc0, 0x24ef, 0x1178, 0x1978, 0x19da, 0x2865, 0x24ef, 0x3987, 0x320e, 0x2c99, 0x432a,
+        0x3b5f, 0x447d, 0x5695, 0x5ece, 0x8000, 0x8000, 0x5695, 0x481a, 0x481a, 0x8000, 0x8000,
+        0x8000, 0x8000, 0x8000,
+    ],
+    theta: zp_theta_table(),
+    mu: [
+        84, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+        49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71,
+        72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 81, 82, 9, 86, 5, 88, 89, 90, 91, 92, 93, 94,
+        95, 96, 97, 82, 99, 76, 101, 70, 103, 66, 105, 106, 107, 66, 109, 60, 111, 56, 69, 114, 65,
+        116, 61, 118, 57, 120, 53, 122, 49, 124, 43, 72, 39, 60, 33, 56, 29, 52, 23, 48, 23, 42,
+        137, 38, 21, 140, 15, 142, 9, 144, 141, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+        70, 157, 66, 81, 62, 75, 58, 69, 54, 65, 50, 167, 44, 65, 40, 59, 34, 55, 30, 175, 24, 177,
+        178, 179, 180, 181, 182, 183, 184, 69, 186, 59, 188, 55, 190, 51, 192, 47, 194, 41, 196,
+        37, 198, 199, 72, 201, 62, 203, 58, 205, 54, 207, 50, 209, 46, 211, 40, 213, 36, 215, 30,
+        217, 26, 219, 20, 71, 14, 61, 14, 57, 8, 53, 228, 49, 230, 45, 232, 39, 234, 35, 138, 29,
+        24, 25, 240, 19, 22, 13, 16, 13, 10, 7, 244, 249, 10, 89, 230, 0, 0, 0, 0, 0,
+    ],
+    lambda: [
+        145, 4, 3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+        23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
+        46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
+        69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 85, 226, 6, 176, 143, 138, 141, 112, 135,
+        104, 133, 100, 129, 98, 127, 72, 125, 102, 123, 60, 121, 110, 119, 108, 117, 54, 115, 48,
+        113, 134, 59, 132, 55, 130, 51, 128, 47, 126, 41, 62, 37, 66, 31, 54, 25, 50, 131, 46, 17,
+        40, 15, 136, 7, 32, 139, 172, 9, 170, 85, 168, 248, 166, 247, 164, 197, 162, 95, 160, 173,
+        158, 165, 156, 161, 60, 159, 56, 71, 52, 163, 48, 59, 42, 171, 38, 169, 32, 53, 26, 47,
+        174, 193, 18, 191, 222, 189, 218, 187, 216, 185, 214, 61, 212, 53, 210, 49, 208, 45, 206,
+        39, 204, 195, 202, 31, 200, 243, 64, 239, 56, 237, 52, 235, 48, 233, 44, 231, 38, 229, 34,
+        227, 28, 225, 22, 223, 16, 221, 220, 63, 8, 55, 224, 51, 2, 47, 87, 43, 246, 37, 244, 33,
+        238, 27, 236, 21, 16, 15, 8, 241, 242, 7, 10, 245, 2, 1, 83, 250, 2, 143, 246, 0, 0, 0, 0,
+        0,
+    ],
+};
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct DecisionProbe {
@@ -924,6 +1126,7 @@ struct DecisionProbe {
     buffered_bits: u8,
 }
 
+#[cfg(test)]
 const fn leading_one_bits(byte: u8) -> u8 {
     let mut count = 0;
     let mut value = byte;
@@ -973,6 +1176,13 @@ mod tests {
     }
 
     #[test]
+    fn djvu_bzz_oracle_decodes_fixture_bytes() {
+        let decoded = djvu_bzz::bzz_decode(HELLO_BZZ).expect("djvu-bzz should decode fixture");
+
+        assert_eq!(decoded, HELLO_RAW);
+    }
+
+    #[test]
     fn bzz_decoder_reads_fixture_block_len() {
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
 
@@ -984,10 +1194,7 @@ mod tests {
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
 
         assert_eq!(decoder.next_block_len(), HELLO_RAW.len() + 1);
-        assert_eq!(
-            decoder.next_fshift().expect("fixture FSHIFT should decode"),
-            0
-        );
+        assert_eq!(decoder.next_fshift(), 0);
     }
 
     #[test]
@@ -1108,6 +1315,11 @@ mod tests {
     }
 
     #[test]
+    fn runtime_zp_table_set_matches_dev_oracle() {
+        assert_eq!(DJVU_ZP_TABLES, djvu_zp_oracle_table_set());
+    }
+
+    #[test]
     fn zp_table_phases_match_spec_structure() {
         let tables = candidate_zp_table_set();
 
@@ -1201,25 +1413,41 @@ mod tests {
     }
 
     #[test]
-    fn in_memory_decoder_reports_incomplete_after_block_header() {
-        let error =
-            decode_bzz_in_memory(HELLO_BZZ).expect_err("full in-memory decode is not complete yet");
+    fn in_memory_decoder_decodes_fixture_bytes() {
+        let decoded = decode_bzz_in_memory(HELLO_BZZ).expect("in-memory BZZ should decode fixture");
 
-        assert!(matches!(
-            error,
-            BzzError::MissingBwtMarker
-                | BzzError::DuplicateBwtMarker
-                | BzzError::InvalidSymbolRank { .. }
-                | BzzError::InvalidBwtMarker { .. }
-                | BzzError::InvalidBwtTransform
-        ));
+        assert_eq!(decoded, HELLO_RAW);
+    }
+
+    #[test]
+    fn in_memory_decoder_decodes_generated_oracle_cases() {
+        let mut patterned = Vec::with_capacity(1024);
+        for index in 0..1024u32 {
+            patterned.push(index.wrapping_mul(7).wrapping_add(13).to_le_bytes()[0]);
+        }
+
+        let cases = [
+            Vec::new(),
+            b"A".to_vec(),
+            b"aaaaaaaaaa".to_vec(),
+            (0..=u8::MAX).collect::<Vec<_>>(),
+            patterned,
+        ];
+
+        for raw in &cases {
+            let compressed = djvu_bzz::bzz_encode(raw);
+            let decoded =
+                decode_bzz_in_memory(&compressed).expect("generated BZZ should decode in memory");
+
+            assert_eq!(&decoded, raw, "roundtrip failed for {raw:02x?}");
+        }
     }
 
     #[test]
     fn bzz_decoder_rank_decode_returns_block_len_with_provisional_model() {
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let block_len = decoder.next_block_len();
-        let fshift = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let fshift = decoder.next_fshift();
         let ranks = decoder
             .decode_block_ranks(block_len, fshift)
             .expect("provisional rank decoder should produce one block of ranks");
@@ -1228,14 +1456,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "tracks true ZP rank decoding against BWT-derived fixture ranks"]
     fn spec_zp_rank_stream_matches_expected_fixture_ranks() {
         let tables = candidate_zp_table_set();
         let mut decoder = SpecZpDecoder::new(HELLO_BZZ);
         let block_len = spec_zp_next_block_len(&mut decoder);
         let fshift = spec_zp_next_fshift(&mut decoder);
         let mut contexts = [0; BZZ_MTF_CONTEXTS];
-        let mut previous_mtfno = 0;
+        let mut previous_mtfno = INITIAL_PREVIOUS_MTFNO;
         let mut ranks = Vec::with_capacity(block_len);
 
         for _ in 0..block_len {
@@ -1298,7 +1525,7 @@ mod tests {
         let mut contexts = [0; BZZ_MTF_CONTEXTS];
         let mut actual_path = Vec::new();
 
-        let previous_class = 0;
+        let previous_class = INITIAL_PREVIOUS_MTFNO.min(2);
         let bit = decoder.decode_bit(
             &mut contexts[RANK_ZERO_CONTEXT_START + previous_class],
             &tables,
@@ -1329,7 +1556,7 @@ mod tests {
         }
 
         let expected_rank = expected_ranks_from_raw_with_fshift(HELLO_RAW, 0)[0];
-        let expected_path = bzz_mtfno_context_path(expected_rank, 0);
+        let expected_path = bzz_mtfno_context_path(expected_rank, INITIAL_PREVIOUS_MTFNO);
 
         eprintln!("actual first-rank path: {actual_path:?}");
         eprintln!("expected rank: {expected_rank}");
@@ -1351,7 +1578,7 @@ mod tests {
             }
 
             let mut contexts = [0; BZZ_MTF_CONTEXTS];
-            let mut previous_mtfno = 0;
+            let mut previous_mtfno = INITIAL_PREVIOUS_MTFNO;
             let mut ranks = Vec::new();
             for _ in 0..expected.len() {
                 let rank =
@@ -1381,7 +1608,7 @@ mod tests {
         let block_len = spec_zp_next_block_len(&mut decoder);
         let skipped = decoder.decode_raw();
         let mut contexts = [0; BZZ_MTF_CONTEXTS];
-        let mut previous_mtfno = 0;
+        let mut previous_mtfno = INITIAL_PREVIOUS_MTFNO;
         let mut ranks = Vec::with_capacity(block_len);
 
         for _ in 0..block_len {
@@ -1440,7 +1667,7 @@ mod tests {
             let _ = spec_zp_next_fshift(&mut decoder);
             let mut contexts = [0; BZZ_MTF_CONTEXTS];
             let mut ranks = Vec::with_capacity(expected.len());
-            let mut previous_mtfno = 0;
+            let mut previous_mtfno = INITIAL_PREVIOUS_MTFNO;
             for _ in 0..expected.len() {
                 let rank = read_spec_zp_entropy_rank_with_ranges(
                     &mut decoder,
@@ -1780,7 +2007,7 @@ mod tests {
         let expected = expected_ranks_from_raw(HELLO_RAW);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let block_len = decoder.next_block_len();
-        let fshift = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let fshift = decoder.next_fshift();
         let actual = decoder
             .decode_block_ranks(block_len, fshift)
             .expect("fixture ranks should decode");
@@ -1795,7 +2022,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
-        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let _ = decoder.next_fshift();
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
             .expect("modeled fixture bits should decode");
@@ -1811,7 +2038,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
-        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let _ = decoder.next_fshift();
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let bit_trace =
             trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
@@ -1894,7 +2121,7 @@ mod tests {
                 let decisions = entropy_decisions_from_ranks_with_options(&expected_ranks, options);
                 let mut decoder = BzzDecoder::new(HELLO_BZZ);
                 let _ = decoder.next_block_len();
-                let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
+                let _ = decoder.next_fshift();
                 let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
                 let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &decisions)
                     .expect("modeled fixture bits should decode");
@@ -1921,7 +2148,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
-        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let _ = decoder.next_fshift();
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
             .expect("modeled fixture bits should decode");
@@ -1972,7 +2199,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
-        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let _ = decoder.next_fshift();
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
             .expect("modeled fixture bits should decode");
@@ -2016,7 +2243,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
-        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let _ = decoder.next_fshift();
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let trace = trace_fixture_modeled_bits(&mut model, &mut decoder.bits, &expected_decisions)
             .expect("modeled fixture bits should decode");
@@ -2057,7 +2284,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
-        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let _ = decoder.next_fshift();
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         model.context_mut(9).state = 59;
         let bit_trace =
@@ -2080,7 +2307,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
-        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let _ = decoder.next_fshift();
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         model.context_mut(9).state = 59;
         model.context_mut(16).state = 59;
@@ -2156,7 +2383,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
-        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let _ = decoder.next_fshift();
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         let search = split_constraints_for_expected_decisions(
             &mut model,
@@ -2275,7 +2502,11 @@ mod tests {
     }
 
     fn spec_zp_next_fshift(decoder: &mut SpecZpDecoder<'_>) -> u8 {
-        (decoder.decode_raw() << 1) | decoder.decode_raw()
+        if decoder.decode_raw() == 0 {
+            0
+        } else {
+            1 + decoder.decode_raw()
+        }
     }
 
     fn read_spec_zp_entropy_rank(
@@ -2444,7 +2675,7 @@ mod tests {
         options: RankDecisionOptions,
     ) -> Vec<(usize, u8)> {
         let mut decisions = Vec::new();
-        let mut previous_mtfno = 0usize;
+        let mut previous_mtfno = INITIAL_PREVIOUS_MTFNO;
         for rank in ranks {
             decisions.extend(entropy_decisions_for_rank_with_options(
                 *rank,
@@ -2650,7 +2881,7 @@ mod tests {
         let expected_decisions = entropy_decisions_from_ranks(&expected_ranks);
         let mut decoder = BzzDecoder::new(HELLO_BZZ);
         let _ = decoder.next_block_len();
-        let _ = decoder.next_fshift().expect("fixture FSHIFT should decode");
+        let _ = decoder.next_fshift();
         let mut model = BitModel::with_contexts(ENTROPY_CONTEXTS);
         initialize(&mut model);
         let bit_trace =
