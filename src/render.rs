@@ -2,6 +2,7 @@ use crate::dirm::DirmTailEntry;
 use crate::document::{Document, Page, ResolvedPageChunk};
 use crate::error::{ParseError, ParseResult};
 use crate::info::PageInfo;
+use crate::iw44::{Iw44Error, Iw44LayerSummary, Iw44PageMapping, summarize_iw44_layer};
 use crate::jb2::{
     Jb2Error, Jb2ImageHeader, Jb2PartialImage, Jb2RecordPrefix, read_jb2_image_header,
     read_jb2_record_prefix, render_jb2_image, render_jb2_supported_prefix,
@@ -219,6 +220,12 @@ pub struct BitonalImageHeader {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Iw44LayerGeometry {
+    pub summary: Iw44LayerSummary,
+    pub mapping: Iw44PageMapping,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PartialPageRender {
     pub bitmap: PageBitmap,
     pub bitonal_masks: Vec<(usize, Jb2PartialImage)>,
@@ -281,16 +288,7 @@ impl<'a> PageRenderPlan<'a> {
         &self,
         bytes: &'bytes [u8],
     ) -> Vec<RenderChunkPayload<'bytes>> {
-        self.bitonal_dictionaries
-            .iter()
-            .filter_map(|index| {
-                self.chunk_payload(bytes, *index)
-                    .map(|payload| RenderChunkPayload {
-                        index: *index,
-                        bytes: payload,
-                    })
-            })
-            .collect()
+        self.payloads_for_indices(bytes, &self.bitonal_dictionaries)
     }
 
     #[must_use]
@@ -298,7 +296,99 @@ impl<'a> PageRenderPlan<'a> {
         &self,
         bytes: &'bytes [u8],
     ) -> Vec<RenderChunkPayload<'bytes>> {
-        self.bitonal_images
+        self.payloads_for_indices(bytes, &self.bitonal_images)
+    }
+
+    #[must_use]
+    pub fn foreground_layer_payloads<'bytes>(
+        &self,
+        bytes: &'bytes [u8],
+    ) -> Vec<RenderChunkPayload<'bytes>> {
+        self.payloads_for_indices(bytes, &self.foreground_layers)
+    }
+
+    #[must_use]
+    pub fn background_layer_payloads<'bytes>(
+        &self,
+        bytes: &'bytes [u8],
+    ) -> Vec<RenderChunkPayload<'bytes>> {
+        self.payloads_for_indices(bytes, &self.background_layers)
+    }
+
+    /// Reads and validates the progressive foreground IW44 layer, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `FG44` chunk header is malformed or the serial
+    /// sequence is not contiguous.
+    pub fn foreground_layer_summary(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Option<Iw44LayerSummary>, Iw44Error> {
+        let payloads = self.foreground_layer_payloads(bytes);
+        if payloads.is_empty() {
+            return Ok(None);
+        }
+
+        summarize_iw44_layer(payloads.iter().map(|payload| payload.bytes)).map(Some)
+    }
+
+    /// Reads and validates the progressive background IW44 layer, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `BG44` chunk header is malformed or the serial
+    /// sequence is not contiguous.
+    pub fn background_layer_summary(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Option<Iw44LayerSummary>, Iw44Error> {
+        let payloads = self.background_layer_payloads(bytes);
+        if payloads.is_empty() {
+            return Ok(None);
+        }
+
+        summarize_iw44_layer(payloads.iter().map(|payload| payload.bytes)).map(Some)
+    }
+
+    /// Reads the foreground IW44 layer and maps it into page space.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `FG44` layer summary cannot be decoded.
+    pub fn foreground_layer_geometry(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Option<Iw44LayerGeometry>, Iw44Error> {
+        Ok(self.foreground_layer_summary(bytes)?.map(|summary| {
+            let mapping =
+                summary.page_mapping(u32::from(self.info.width), u32::from(self.info.height));
+            Iw44LayerGeometry { summary, mapping }
+        }))
+    }
+
+    /// Reads the background IW44 layer and maps it into page space.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `BG44` layer summary cannot be decoded.
+    pub fn background_layer_geometry(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Option<Iw44LayerGeometry>, Iw44Error> {
+        Ok(self.background_layer_summary(bytes)?.map(|summary| {
+            let mapping =
+                summary.page_mapping(u32::from(self.info.width), u32::from(self.info.height));
+            Iw44LayerGeometry { summary, mapping }
+        }))
+    }
+
+    fn payloads_for_indices<'bytes>(
+        &self,
+        bytes: &'bytes [u8],
+        indices: &[usize],
+    ) -> Vec<RenderChunkPayload<'bytes>> {
+        indices
             .iter()
             .filter_map(|index| {
                 self.chunk_payload(bytes, *index)
@@ -635,6 +725,134 @@ mod tests {
                 bytes: b"tim"
             }]
         );
+    }
+
+    #[test]
+    fn render_plan_extracts_iw44_layer_payloads_by_chunk_index() {
+        let mut plan = PageRenderPlan::new(
+            page_info(),
+            vec![
+                resolved_chunk(PageChunkKind::Fg44, "FG44"),
+                resolved_chunk(PageChunkKind::Bg44, "BG44"),
+                resolved_chunk(PageChunkKind::Bg44, "BG44"),
+                resolved_chunk(PageChunkKind::Sjbz, "Sjbz"),
+            ],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 1;
+        plan.chunks[0].chunk.chunk.data_end = 4;
+        plan.chunks[1].chunk.chunk.data_start = 4;
+        plan.chunks[1].chunk.chunk.data_end = 7;
+        plan.chunks[2].chunk.chunk.data_start = 7;
+        plan.chunks[2].chunk.chunk.data_end = 9;
+        let bytes = b"Xfgbg0bg1";
+
+        let foreground = plan.foreground_layer_payloads(bytes);
+        let background = plan.background_layer_payloads(bytes);
+
+        assert_eq!(
+            foreground,
+            [RenderChunkPayload {
+                index: 0,
+                bytes: b"fgb"
+            }]
+        );
+        assert_eq!(
+            background,
+            [
+                RenderChunkPayload {
+                    index: 1,
+                    bytes: b"g0b"
+                },
+                RenderChunkPayload {
+                    index: 2,
+                    bytes: b"g1"
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn render_plan_reads_iw44_layer_summaries() {
+        let mut plan = PageRenderPlan::new(
+            page_info(),
+            vec![
+                resolved_chunk(PageChunkKind::Fg44, "FG44"),
+                resolved_chunk(PageChunkKind::Bg44, "BG44"),
+                resolved_chunk(PageChunkKind::Bg44, "BG44"),
+            ],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 0;
+        plan.chunks[0].chunk.chunk.data_end = 10;
+        plan.chunks[1].chunk.chunk.data_start = 10;
+        plan.chunks[1].chunk.chunk.data_end = 20;
+        plan.chunks[2].chunk.chunk.data_start = 20;
+        plan.chunks[2].chunk.chunk.data_end = 23;
+        let bytes = [
+            0x00, 0x05, 0x01, 0x02, 0x00, 0x20, 0x00, 0x10, 0x80, 0xaa, 0x00, 0x07, 0x01, 0x02,
+            0x00, 0x40, 0x00, 0x20, 0x00, 0xbb, 0x01, 0x03, 0xcc,
+        ];
+
+        let foreground = plan
+            .foreground_layer_summary(&bytes)
+            .expect("foreground summary should parse")
+            .expect("foreground layer should exist");
+        let background = plan
+            .background_layer_summary(&bytes)
+            .expect("background summary should parse")
+            .expect("background layer should exist");
+
+        assert_eq!(foreground.image.width, 32);
+        assert_eq!(foreground.image.height, 16);
+        assert_eq!(foreground.total_slices, 5);
+        assert_eq!(foreground.total_payload_bytes, 1);
+        assert_eq!(background.image.width, 64);
+        assert_eq!(background.image.height, 32);
+        assert_eq!(background.total_slices, 10);
+        assert_eq!(background.total_payload_bytes, 2);
+    }
+
+    #[test]
+    fn render_plan_maps_iw44_layers_to_page_space() {
+        let mut plan = PageRenderPlan::new(
+            PageInfo {
+                width: 1560,
+                height: 1633,
+                version: 25,
+                dpi: 200,
+                gamma: 2.2,
+                rotation: 1,
+            },
+            vec![
+                resolved_chunk(PageChunkKind::Fg44, "FG44"),
+                resolved_chunk(PageChunkKind::Bg44, "BG44"),
+            ],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 0;
+        plan.chunks[0].chunk.chunk.data_end = 10;
+        plan.chunks[1].chunk.chunk.data_start = 10;
+        plan.chunks[1].chunk.chunk.data_end = 20;
+        let bytes = [
+            0x00, 0x64, 0x01, 0x02, 0x00, 0xc3, 0x00, 0xcd, 0x80, 0xaa, 0x00, 0x4a, 0x01, 0x02,
+            0x03, 0x0c, 0x03, 0x31, 0x8a, 0xbb,
+        ];
+
+        let foreground = plan
+            .foreground_layer_geometry(&bytes)
+            .expect("foreground geometry should parse")
+            .expect("foreground layer should exist");
+        let background = plan
+            .background_layer_geometry(&bytes)
+            .expect("background geometry should parse")
+            .expect("background layer should exist");
+
+        assert_eq!(foreground.mapping.subsample, 8);
+        assert_eq!(foreground.mapping.scaled_width, 1560);
+        assert_eq!(foreground.mapping.scaled_height, 1640);
+        assert_eq!(foreground.mapping.vertical_overscan, 7);
+        assert_eq!(background.mapping.subsample, 2);
+        assert_eq!(background.mapping.scaled_width, 1560);
+        assert_eq!(background.mapping.scaled_height, 1634);
+        assert_eq!(background.mapping.vertical_overscan, 1);
     }
 
     #[test]

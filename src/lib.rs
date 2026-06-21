@@ -7,6 +7,7 @@ pub(crate) mod dirm;
 pub(crate) mod document;
 pub(crate) mod error;
 pub(crate) mod info;
+pub(crate) mod iw44;
 pub(crate) mod jb2;
 pub(crate) mod page;
 pub(crate) mod pdf;
@@ -22,6 +23,10 @@ pub use document::{
 };
 pub use error::{ParseError, ParseResult};
 pub use info::{PageInfo, read_page_info};
+pub use iw44::{
+    Iw44ChunkHeader, Iw44Error, Iw44ImageHeader, Iw44LayerSummary, Iw44PageMapping, Iw44Result,
+    read_iw44_chunk_header, summarize_iw44_layer,
+};
 pub use jb2::{
     Jb2Error, Jb2ImageHeader, Jb2PartialImage, Jb2RecordKind, Jb2RecordPrefix, Jb2RecordSummary,
     Jb2Result, read_jb2_image_header, read_jb2_record_prefix, render_jb2_image,
@@ -30,7 +35,7 @@ pub use jb2::{
 pub use page::{PageChunk, PageChunkKind, PageChunkPayload, PageDetails, read_page_details};
 pub use pdf::{PdfError, PdfResult, write_bitmap_pdf};
 pub use render::{
-    BitonalBitmap, BitonalImageHeader, PageBitmap, PageRenderPlan, PartialPageRender, PixelFormat,
-    RenderChunkPayload,
+    BitonalBitmap, BitonalImageHeader, Iw44LayerGeometry, PageBitmap, PageRenderPlan,
+    PartialPageRender, PixelFormat, RenderChunkPayload,
 };
 pub use text::{TextPayload, TextZone, TextZoneKind, parse_text_payload, parse_text_zones};

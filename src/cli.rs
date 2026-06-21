@@ -1,6 +1,6 @@
 use crate::commands::{
-    run_dirm, run_dump_bitonal, run_form, run_forms, run_page, run_pages, run_render_page,
-    run_render_page_pdf, run_render_plan, run_summary, run_text,
+    run_dirm, run_dump_bitonal, run_dump_image_layers, run_form, run_forms, run_page, run_pages,
+    run_render_page, run_render_page_pdf, run_render_plan, run_summary, run_text,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -78,6 +78,13 @@ enum Command {
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
+    /// Dump FG44/BG44 IW44 payloads for one page.
+    DumpImageLayers {
+        number: usize,
+        output_dir: PathBuf,
+        #[arg(default_value = DEFAULT_FILE)]
+        file: PathBuf,
+    },
     /// Extract hidden text from one page by 1-based page number.
     Text {
         number: usize,
@@ -114,6 +121,11 @@ pub fn run() -> anyhow::Result<()> {
             output_dir,
             file,
         } => run_dump_bitonal(&file, number, &output_dir)?,
+        Command::DumpImageLayers {
+            number,
+            output_dir,
+            file,
+        } => run_dump_image_layers(&file, number, &output_dir)?,
         Command::Text {
             number,
             zones,

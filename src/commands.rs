@@ -408,6 +408,71 @@ pub fn run_dump_bitonal(path: &Path, number: usize, output_dir: &Path) -> anyhow
     Ok(())
 }
 
+pub fn run_dump_image_layers(path: &Path, number: usize, output_dir: &Path) -> anyhow::Result<()> {
+    if number == 0 {
+        bail!("page number must be 1 or greater");
+    }
+
+    let bytes = read_file(path)?;
+    let document = Document::parse(&bytes)?;
+    let page = document
+        .pages(&bytes)
+        .nth(number - 1)
+        .transpose()?
+        .with_context(|| {
+            format!(
+                "page {number} not found; document has {} pages",
+                document.form_kind_counts().pages
+            )
+        })?;
+    let decoded_tail;
+    let tail_entries = if let Some(dirm) = &document.directory {
+        decoded_tail = decode_dirm_tail(&bytes, dirm)?;
+        parse_dirm_tail(dirm, &decoded_tail)?
+    } else {
+        Vec::new()
+    };
+    let plan = document.page_render_plan(&bytes, &page, &tail_entries)?;
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+
+    println!("file: {}", path.display());
+    println!("page: {number}");
+    println!("output dir: {}", output_dir.display());
+    println!("IW44 payloads: raw FG44/BG44");
+
+    let mut written = 0usize;
+    for payload in plan.foreground_layer_payloads(&bytes) {
+        let output = output_dir.join(format!("page-{number}-chunk-{}.fg44", payload.index));
+        fs::write(&output, payload.bytes)
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        println!(
+            "wrote {} bytes to {}",
+            payload.bytes.len(),
+            output.display()
+        );
+        written += 1;
+    }
+    for payload in plan.background_layer_payloads(&bytes) {
+        let output = output_dir.join(format!("page-{number}-chunk-{}.bg44", payload.index));
+        fs::write(&output, payload.bytes)
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        println!(
+            "wrote {} bytes to {}",
+            payload.bytes.len(),
+            output.display()
+        );
+        written += 1;
+    }
+
+    if written == 0 {
+        println!("IW44 chunks: none");
+    }
+
+    Ok(())
+}
+
 pub fn run_text(path: &Path, number: usize, show_zones: bool) -> anyhow::Result<()> {
     if number == 0 {
         bail!("page number must be 1 or greater");
@@ -718,6 +783,7 @@ fn print_render_plan(plan: &PageRenderPlan<'_>, bytes: &[u8]) {
             Err(error) => println!("bitonal mask: unavailable ({error})"),
         }
     }
+    print_iw44_layer_plan(plan, bytes);
     println!();
     println!("effective chunks:");
     println!("index  source      chunk  role      size      offset");
@@ -732,6 +798,95 @@ fn print_render_plan(plan: &PageRenderPlan<'_>, bytes: &[u8]) {
             chunk.chunk.chunk.size,
             chunk.chunk.chunk.data_start - 8
         );
+    }
+}
+
+fn print_iw44_layer_plan(plan: &PageRenderPlan<'_>, bytes: &[u8]) {
+    let foreground = plan.foreground_layer_payloads(bytes);
+    let background = plan.background_layer_payloads(bytes);
+    if foreground.is_empty() && background.is_empty() {
+        return;
+    }
+
+    println!("IW44 layers:");
+    print_iw44_layer_summary(
+        "foreground",
+        "FG44",
+        plan.foreground_layer_geometry(bytes),
+        &foreground,
+    );
+    print_iw44_layer_summary(
+        "background",
+        "BG44",
+        plan.background_layer_geometry(bytes),
+        &background,
+    );
+}
+
+fn print_iw44_layer_summary(
+    role: &str,
+    chunk_id: &str,
+    geometry: Result<Option<djvulpes::Iw44LayerGeometry>, djvulpes::Iw44Error>,
+    payloads: &[djvulpes::RenderChunkPayload<'_>],
+) {
+    if payloads.is_empty() {
+        return;
+    }
+
+    match geometry {
+        Ok(Some(geometry)) => {
+            let summary = geometry.summary;
+            let mapping = geometry.mapping;
+            println!(
+                "  {role}: chunks={} total_slices={} payload_bytes={} image={}x{} subsample={} scaled={}x{} overscan={}x{} grayscale={} chroma_half={} delay={}",
+                summary.chunks.len(),
+                summary.total_slices,
+                summary.total_payload_bytes,
+                summary.image.width,
+                summary.image.height,
+                mapping.subsample,
+                mapping.scaled_width,
+                mapping.scaled_height,
+                mapping.horizontal_overscan,
+                mapping.vertical_overscan,
+                summary.image.grayscale,
+                summary.image.chroma_half,
+                summary.image.delay
+            );
+        }
+        Ok(None) => {}
+        Err(error) => println!("  {role}: {chunk_id} layer_error={error}"),
+    }
+
+    for payload in payloads {
+        print_iw44_payload_summary(role, chunk_id, payload.index, payload.bytes);
+    }
+}
+
+fn print_iw44_payload_summary(role: &str, chunk_id: &str, index: usize, bytes: &[u8]) {
+    match djvulpes::read_iw44_chunk_header(bytes) {
+        Ok(header) => {
+            print!(
+                "  {role} chunk #{index}: {chunk_id} bytes={} serial={} slices={} payload_bytes={}",
+                bytes.len(),
+                header.serial,
+                header.slices,
+                header.payload_len
+            );
+            if let Some(image) = header.image {
+                print!(
+                    " image={}x{} grayscale={} chroma_half={} delay={}",
+                    image.width, image.height, image.grayscale, image.chroma_half, image.delay
+                );
+            }
+            println!();
+        }
+        Err(error) => {
+            println!(
+                "  {role} chunk #{index}: {chunk_id} bytes={} header_error={error}",
+                bytes.len()
+            );
+        }
     }
 }
 
