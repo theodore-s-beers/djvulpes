@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-const PARTIAL_JB2_RECORD_LIMIT: usize = 1024;
+const JB2_PLAN_PREFIX_RECORD_LIMIT: usize = 8;
 
 pub fn run_summary(path: &Path) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
@@ -281,7 +281,7 @@ pub fn run_render_page(path: &Path, number: usize, output: &Path) -> anyhow::Res
         Vec::new()
     };
     let plan = document.page_render_plan(&bytes, &page, &tail_entries)?;
-    let render = plan.render_partial_bitmap(&bytes, PARTIAL_JB2_RECORD_LIMIT)?;
+    let render = plan.render_partial_bitmap(&bytes)?;
     let ppm = render.bitmap.to_ppm_bytes();
 
     fs::write(output, ppm).with_context(|| format!("failed to write {}", output.display()))?;
@@ -293,7 +293,7 @@ pub fn run_render_page(path: &Path, number: usize, output: &Path) -> anyhow::Res
         render.bitmap.width, render.bitmap.height, render.bitmap.dpi
     );
     println!("output: {}", output.display());
-    print_partial_render_summary(&render.bitonal_masks, PARTIAL_JB2_RECORD_LIMIT);
+    print_partial_render_summary(&render.bitonal_masks);
     print_pending_image_layer_summary(&plan);
 
     Ok(())
@@ -324,7 +324,7 @@ pub fn run_render_page_pdf(path: &Path, number: usize, output: &Path) -> anyhow:
         Vec::new()
     };
     let plan = document.page_render_plan(&bytes, &page, &tail_entries)?;
-    let render = plan.render_partial_bitmap(&bytes, PARTIAL_JB2_RECORD_LIMIT)?;
+    let render = plan.render_partial_bitmap(&bytes)?;
     let pdf = write_bitmap_pdf(std::slice::from_ref(&render.bitmap))?;
 
     fs::write(output, pdf).with_context(|| format!("failed to write {}", output.display()))?;
@@ -336,7 +336,7 @@ pub fn run_render_page_pdf(path: &Path, number: usize, output: &Path) -> anyhow:
         render.bitmap.width, render.bitmap.height, render.bitmap.dpi
     );
     println!("output: {}", output.display());
-    print_partial_render_summary(&render.bitonal_masks, PARTIAL_JB2_RECORD_LIMIT);
+    print_partial_render_summary(&render.bitonal_masks);
     print_pending_image_layer_summary(&plan);
 
     Ok(())
@@ -678,7 +678,7 @@ fn print_render_plan(plan: &PageRenderPlan<'_>, bytes: &[u8]) {
             }
             Err(error) => println!("bitonal image headers: unavailable ({error})"),
         }
-        match plan.bitonal_record_prefixes(bytes, 8) {
+        match plan.bitonal_record_prefixes(bytes, JB2_PLAN_PREFIX_RECORD_LIMIT) {
             Ok(prefixes) => {
                 for (chunk_index, prefix) in prefixes {
                     print!(
@@ -689,7 +689,7 @@ fn print_render_plan(plan: &PageRenderPlan<'_>, bytes: &[u8]) {
                         print!("; stopped before {}", kind.as_str());
                     }
                     println!();
-                    for record in prefix.records.iter().take(8) {
+                    for record in prefix.records.iter().take(JB2_PLAN_PREFIX_RECORD_LIMIT) {
                         println!(
                             "  rec #{:<3} {:<27}{}",
                             record.index,
@@ -701,12 +701,11 @@ fn print_render_plan(plan: &PageRenderPlan<'_>, bytes: &[u8]) {
             }
             Err(error) => println!("bitonal record prefix: unavailable ({error})"),
         }
-        match plan.partial_bitonal_masks(bytes, PARTIAL_JB2_RECORD_LIMIT) {
+        match plan.bitonal_masks(bytes) {
             Ok(partials) => {
                 for (chunk_index, partial) in partials {
                     println!(
-                        "bitonal image #{chunk_index}: supported-prefix mask record_limit={} black_pixels={} dictionary_symbols={} end_of_data={} stopped_before={}",
-                        PARTIAL_JB2_RECORD_LIMIT,
+                        "bitonal image #{chunk_index}: mask black_pixels={} dictionary_symbols={} end_of_data={} stopped_before={}",
                         partial.mask.black_pixel_count(),
                         partial.dictionary_symbol_count,
                         partial.reached_end_of_data,
@@ -716,7 +715,7 @@ fn print_render_plan(plan: &PageRenderPlan<'_>, bytes: &[u8]) {
                     );
                 }
             }
-            Err(error) => println!("bitonal supported-prefix mask: unavailable ({error})"),
+            Err(error) => println!("bitonal mask: unavailable ({error})"),
         }
     }
     println!();
@@ -736,14 +735,10 @@ fn print_render_plan(plan: &PageRenderPlan<'_>, bytes: &[u8]) {
     }
 }
 
-fn print_partial_render_summary(
-    bitonal_masks: &[(usize, djvulpes::Jb2PartialImage)],
-    record_limit: usize,
-) {
+fn print_partial_render_summary(bitonal_masks: &[(usize, djvulpes::Jb2PartialImage)]) {
     for (chunk_index, partial) in bitonal_masks {
         println!(
-            "painted bitonal image #{chunk_index}: record_limit={} black_pixels={} dictionary_symbols={} end_of_data={} stopped_before={}",
-            record_limit,
+            "painted bitonal image #{chunk_index}: black_pixels={} dictionary_symbols={} end_of_data={} stopped_before={}",
             partial.mask.black_pixel_count(),
             partial.dictionary_symbol_count,
             partial.reached_end_of_data,

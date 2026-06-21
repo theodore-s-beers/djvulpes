@@ -24,7 +24,8 @@ pub use error::{ParseError, ParseResult};
 pub use info::{PageInfo, read_page_info};
 pub use jb2::{
     Jb2Error, Jb2ImageHeader, Jb2PartialImage, Jb2RecordKind, Jb2RecordPrefix, Jb2RecordSummary,
-    Jb2Result, read_jb2_image_header, read_jb2_record_prefix, render_jb2_supported_prefix,
+    Jb2Result, read_jb2_image_header, read_jb2_record_prefix, render_jb2_image,
+    render_jb2_supported_prefix,
 };
 pub use page::{PageChunk, PageChunkKind, PageChunkPayload, PageDetails, read_page_details};
 pub use pdf::{PdfError, PdfResult, write_bitmap_pdf};

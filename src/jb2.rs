@@ -265,6 +265,37 @@ pub fn read_jb2_record_prefix(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2
 /// Returns an error if the JB2 header or a supported prefix record is malformed.
 #[allow(clippy::too_many_lines)]
 pub fn render_jb2_supported_prefix(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2PartialImage> {
+    render_jb2_records(bytes, max_records)
+}
+
+/// Decodes and paints a complete JB2 image.
+///
+/// # Errors
+///
+/// Returns an error if the JB2 image is malformed, requires an external
+/// dictionary/reset operation, or does not reach `EndOfData` before the
+/// decoder's safety record limit.
+pub fn render_jb2_image(bytes: &[u8]) -> Jb2Result<Jb2PartialImage> {
+    const MAX_IMAGE_RECORDS: usize = 1_000_000;
+
+    let image = render_jb2_records(bytes, MAX_IMAGE_RECORDS)?;
+    if let Some(kind) = image.stopped_before {
+        return Err(Jb2Error::new(format!(
+            "JB2 image stopped before unsupported {} record",
+            kind.as_str()
+        )));
+    }
+    if !image.reached_end_of_data {
+        return Err(Jb2Error::new(format!(
+            "JB2 image did not reach end-of-data within {MAX_IMAGE_RECORDS} records"
+        )));
+    }
+
+    Ok(image)
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_jb2_records(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2PartialImage> {
     let mut decoder = Jb2Decoder::new(bytes)?;
     let header = decoder.read_header()?;
     let mut mask = BitonalBitmap::new(header.width, header.height);
@@ -1126,9 +1157,8 @@ mod tests {
     }
 
     #[test]
-    fn renders_rypka_page_1_supported_prefix_mask() {
-        let partial = render_jb2_supported_prefix(RYPKA_PAGE_1_SJBZ, 1024)
-            .expect("supported prefix should render");
+    fn renders_rypka_page_1_image_mask() {
+        let partial = render_jb2_image(RYPKA_PAGE_1_SJBZ).expect("JB2 image should render");
 
         assert_eq!(partial.header.width, 1560);
         assert_eq!(partial.mask.width, 1560);

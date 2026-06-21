@@ -4,7 +4,7 @@ use crate::error::{ParseError, ParseResult};
 use crate::info::PageInfo;
 use crate::jb2::{
     Jb2Error, Jb2ImageHeader, Jb2PartialImage, Jb2RecordPrefix, read_jb2_image_header,
-    read_jb2_record_prefix, render_jb2_supported_prefix,
+    read_jb2_record_prefix, render_jb2_image, render_jb2_supported_prefix,
 };
 use crate::page::PageChunkKind;
 
@@ -368,6 +368,20 @@ impl<'a> PageRenderPlan<'a> {
             .collect()
     }
 
+    /// Decodes and paints complete JB2 masks for each `Sjbz` bitonal image
+    /// payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `Sjbz` payload has an invalid or unsupported JB2
+    /// image stream.
+    pub fn bitonal_masks(&self, bytes: &[u8]) -> Result<Vec<(usize, Jb2PartialImage)>, Jb2Error> {
+        self.bitonal_image_payloads(bytes)
+            .into_iter()
+            .map(|payload| render_jb2_image(payload.bytes).map(|image| (payload.index, image)))
+            .collect()
+    }
+
     #[must_use]
     pub fn render_base_bitmap(&self) -> PageBitmap {
         PageBitmap::white_rgb8(&self.info)
@@ -375,19 +389,15 @@ impl<'a> PageRenderPlan<'a> {
 
     /// Renders the currently supported page layers into an RGB bitmap.
     ///
-    /// This paints supported `Sjbz` JB2 prefixes over a white page. IW44
+    /// This paints complete `Sjbz` JB2 masks over a white page. IW44
     /// foreground/background layers are not decoded yet.
     ///
     /// # Errors
     ///
     /// Returns an error if any supported bitonal layer is malformed or has
     /// dimensions that do not match the page.
-    pub fn render_partial_bitmap(
-        &self,
-        bytes: &[u8],
-        max_jb2_records: usize,
-    ) -> Result<PartialPageRender, Jb2Error> {
-        let bitonal_masks = self.partial_bitonal_masks(bytes, max_jb2_records)?;
+    pub fn render_partial_bitmap(&self, bytes: &[u8]) -> Result<PartialPageRender, Jb2Error> {
+        let bitonal_masks = self.bitonal_masks(bytes)?;
         let mut bitmap = self.render_base_bitmap();
 
         for (chunk_index, partial) in &bitonal_masks {
@@ -710,11 +720,31 @@ mod tests {
 
         assert_eq!(masks.len(), 1);
         assert_eq!(masks[0].1.mask.width, 1560);
+        assert!(!masks[0].1.reached_end_of_data);
         assert!(masks[0].1.mask.black_pixel_count() > 0);
     }
 
     #[test]
-    fn render_plan_paints_partial_bitonal_masks_into_rgb_bitmap() {
+    fn render_plan_reads_complete_bitonal_masks() {
+        const RYPKA_PAGE_1_SJBZ: &[u8] = include_bytes!("../tests/fixtures/jb2/rypka-page-1.jb2");
+        let mut plan = PageRenderPlan::new(
+            page_info(),
+            vec![resolved_chunk(PageChunkKind::Sjbz, "Sjbz")],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 0;
+        plan.chunks[0].chunk.chunk.data_end = RYPKA_PAGE_1_SJBZ.len();
+
+        let masks = plan
+            .bitonal_masks(RYPKA_PAGE_1_SJBZ)
+            .expect("complete JB2 mask should render");
+
+        assert_eq!(masks.len(), 1);
+        assert!(masks[0].1.reached_end_of_data);
+        assert_eq!(masks[0].1.mask.black_pixel_count(), 167_028);
+    }
+
+    #[test]
+    fn render_plan_paints_bitonal_masks_into_rgb_bitmap() {
         const RYPKA_PAGE_1_SJBZ: &[u8] = include_bytes!("../tests/fixtures/jb2/rypka-page-1.jb2");
         let mut plan = PageRenderPlan::new(
             PageInfo {
@@ -731,7 +761,7 @@ mod tests {
         plan.chunks[0].chunk.chunk.data_end = RYPKA_PAGE_1_SJBZ.len();
 
         let render = plan
-            .render_partial_bitmap(RYPKA_PAGE_1_SJBZ, 8)
+            .render_partial_bitmap(RYPKA_PAGE_1_SJBZ)
             .expect("partial bitmap should render");
         let black_pixels = render
             .bitmap
@@ -741,9 +771,9 @@ mod tests {
             .count();
 
         assert_eq!(render.bitonal_masks.len(), 1);
-        assert!(!render.bitonal_masks[0].1.reached_end_of_data);
-        assert_eq!(render.bitonal_masks[0].1.mask.black_pixel_count(), 11_647);
-        assert_eq!(black_pixels, 11_647);
+        assert!(render.bitonal_masks[0].1.reached_end_of_data);
+        assert_eq!(render.bitonal_masks[0].1.mask.black_pixel_count(), 167_028);
+        assert_eq!(black_pixels, 167_028);
     }
 
     #[test]
@@ -757,7 +787,7 @@ mod tests {
         plan.chunks[0].chunk.chunk.data_end = RYPKA_PAGE_1_SJBZ.len();
 
         let error = plan
-            .render_partial_bitmap(RYPKA_PAGE_1_SJBZ, 8)
+            .render_partial_bitmap(RYPKA_PAGE_1_SJBZ)
             .expect_err("mismatched dimensions should fail");
 
         assert_eq!(
