@@ -375,7 +375,7 @@ impl BzzMtfRange {
     }
 }
 
-struct SpecZpDecoder<'a> {
+pub struct SpecZpDecoder<'a> {
     input: &'a [u8],
     cursor: usize,
     a: u32,
@@ -386,7 +386,7 @@ struct SpecZpDecoder<'a> {
 }
 
 impl<'a> SpecZpDecoder<'a> {
-    fn new(input: &'a [u8]) -> Self {
+    pub fn new(input: &'a [u8]) -> Self {
         let mut decoder = Self {
             input,
             cursor: 0,
@@ -467,6 +467,10 @@ impl<'a> SpecZpDecoder<'a> {
         }
 
         bit
+    }
+
+    pub fn decode_context_bit(&mut self, context: &mut u8) -> bool {
+        self.decode_bit(context, &DJVU_ZP_TABLES) != 0
     }
 
     fn renormalize(&mut self) {

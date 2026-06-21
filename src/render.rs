@@ -2,6 +2,10 @@ use crate::dirm::DirmTailEntry;
 use crate::document::{Document, Page, ResolvedPageChunk};
 use crate::error::{ParseError, ParseResult};
 use crate::info::PageInfo;
+use crate::jb2::{
+    Jb2Error, Jb2ImageHeader, Jb2PartialImage, Jb2RecordPrefix, read_jb2_image_header,
+    read_jb2_record_prefix, render_jb2_supported_prefix,
+};
 use crate::page::PageChunkKind;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -94,6 +98,14 @@ impl BitonalBitmap {
         }
 
         bytes
+    }
+
+    #[must_use]
+    pub fn black_pixel_count(&self) -> usize {
+        self.bits
+            .iter()
+            .map(|byte| byte.count_ones() as usize)
+            .sum()
     }
 
     fn bit_index(&self, x: u32, y: u32) -> Option<usize> {
@@ -200,6 +212,18 @@ pub struct RenderChunkPayload<'a> {
     pub bytes: &'a [u8],
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BitonalImageHeader {
+    pub index: usize,
+    pub header: Jb2ImageHeader,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PartialPageRender {
+    pub bitmap: PageBitmap,
+    pub bitonal_masks: Vec<(usize, Jb2PartialImage)>,
+}
+
 impl<'a> PageRenderPlan<'a> {
     #[must_use]
     pub fn new(info: PageInfo, chunks: Vec<ResolvedPageChunk<'a>>) -> Self {
@@ -286,9 +310,99 @@ impl<'a> PageRenderPlan<'a> {
             .collect()
     }
 
+    /// Reads JB2 headers for each `Sjbz` bitonal image payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `Sjbz` payload has an invalid JB2 image header.
+    pub fn bitonal_image_headers(&self, bytes: &[u8]) -> Result<Vec<BitonalImageHeader>, Jb2Error> {
+        self.bitonal_image_payloads(bytes)
+            .into_iter()
+            .map(|payload| {
+                read_jb2_image_header(payload.bytes).map(|header| BitonalImageHeader {
+                    index: payload.index,
+                    header,
+                })
+            })
+            .collect()
+    }
+
+    /// Reads a bounded JB2 record prefix for each `Sjbz` bitonal image payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `Sjbz` payload has an invalid JB2 header or
+    /// malformed supported prefix record.
+    pub fn bitonal_record_prefixes(
+        &self,
+        bytes: &[u8],
+        max_records: usize,
+    ) -> Result<Vec<(usize, Jb2RecordPrefix)>, Jb2Error> {
+        self.bitonal_image_payloads(bytes)
+            .into_iter()
+            .map(|payload| {
+                read_jb2_record_prefix(payload.bytes, max_records)
+                    .map(|prefix| (payload.index, prefix))
+            })
+            .collect()
+    }
+
+    /// Decodes and paints the supported JB2 record prefix for each `Sjbz`
+    /// payload, stopping before the first unsupported reset/dictionary record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `Sjbz` payload has an invalid JB2 header or
+    /// malformed supported prefix record.
+    pub fn partial_bitonal_masks(
+        &self,
+        bytes: &[u8],
+        max_records: usize,
+    ) -> Result<Vec<(usize, Jb2PartialImage)>, Jb2Error> {
+        self.bitonal_image_payloads(bytes)
+            .into_iter()
+            .map(|payload| {
+                render_jb2_supported_prefix(payload.bytes, max_records)
+                    .map(|partial| (payload.index, partial))
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn render_base_bitmap(&self) -> PageBitmap {
         PageBitmap::white_rgb8(&self.info)
+    }
+
+    /// Renders the currently supported page layers into an RGB bitmap.
+    ///
+    /// This paints supported `Sjbz` JB2 prefixes over a white page. IW44
+    /// foreground/background layers are not decoded yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any supported bitonal layer is malformed or has
+    /// dimensions that do not match the page.
+    pub fn render_partial_bitmap(
+        &self,
+        bytes: &[u8],
+        max_jb2_records: usize,
+    ) -> Result<PartialPageRender, Jb2Error> {
+        let bitonal_masks = self.partial_bitonal_masks(bytes, max_jb2_records)?;
+        let mut bitmap = self.render_base_bitmap();
+
+        for (chunk_index, partial) in &bitonal_masks {
+            if !bitmap.paint_bitonal_mask(&partial.mask, [0, 0, 0]) {
+                return Err(Jb2Error::new(format!(
+                    "bitonal image #{chunk_index} dimensions {}x{} do not match page {}x{}",
+                    partial.mask.width, partial.mask.height, bitmap.width, bitmap.height
+                )));
+            }
+        }
+
+        Ok(PartialPageRender {
+            bitmap,
+            bitonal_masks,
+        })
     }
 }
 
@@ -530,6 +644,125 @@ mod tests {
                 index: 0,
                 bytes: b"jb2"
             }]
+        );
+    }
+
+    #[test]
+    fn render_plan_reads_bitonal_image_headers() {
+        const RYPKA_PAGE_1_SJBZ: &[u8] = include_bytes!("../tests/fixtures/jb2/rypka-page-1.jb2");
+        let mut plan = PageRenderPlan::new(
+            page_info(),
+            vec![resolved_chunk(PageChunkKind::Sjbz, "Sjbz")],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 0;
+        plan.chunks[0].chunk.chunk.data_end = RYPKA_PAGE_1_SJBZ.len();
+
+        let headers = plan
+            .bitonal_image_headers(RYPKA_PAGE_1_SJBZ)
+            .expect("JB2 header should parse");
+
+        assert_eq!(
+            headers,
+            [BitonalImageHeader {
+                index: 0,
+                header: Jb2ImageHeader {
+                    width: 1560,
+                    height: 1633,
+                    inherited_dictionary_symbols: 0,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn render_plan_reads_bitonal_record_prefixes() {
+        const RYPKA_PAGE_1_SJBZ: &[u8] = include_bytes!("../tests/fixtures/jb2/rypka-page-1.jb2");
+        let mut plan = PageRenderPlan::new(
+            page_info(),
+            vec![resolved_chunk(PageChunkKind::Sjbz, "Sjbz")],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 0;
+        plan.chunks[0].chunk.chunk.data_end = RYPKA_PAGE_1_SJBZ.len();
+
+        let prefixes = plan
+            .bitonal_record_prefixes(RYPKA_PAGE_1_SJBZ, 8)
+            .expect("JB2 record prefix should parse");
+
+        assert_eq!(prefixes.len(), 1);
+        assert_eq!(prefixes[0].0, 0);
+        assert_eq!(prefixes[0].1.header.width, 1560);
+        assert!(!prefixes[0].1.records.is_empty());
+    }
+
+    #[test]
+    fn render_plan_reads_partial_bitonal_masks() {
+        const RYPKA_PAGE_1_SJBZ: &[u8] = include_bytes!("../tests/fixtures/jb2/rypka-page-1.jb2");
+        let mut plan = PageRenderPlan::new(
+            page_info(),
+            vec![resolved_chunk(PageChunkKind::Sjbz, "Sjbz")],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 0;
+        plan.chunks[0].chunk.chunk.data_end = RYPKA_PAGE_1_SJBZ.len();
+
+        let masks = plan
+            .partial_bitonal_masks(RYPKA_PAGE_1_SJBZ, 8)
+            .expect("partial JB2 mask should render");
+
+        assert_eq!(masks.len(), 1);
+        assert_eq!(masks[0].1.mask.width, 1560);
+        assert!(masks[0].1.mask.black_pixel_count() > 0);
+    }
+
+    #[test]
+    fn render_plan_paints_partial_bitonal_masks_into_rgb_bitmap() {
+        const RYPKA_PAGE_1_SJBZ: &[u8] = include_bytes!("../tests/fixtures/jb2/rypka-page-1.jb2");
+        let mut plan = PageRenderPlan::new(
+            PageInfo {
+                width: 1560,
+                height: 1633,
+                version: 25,
+                dpi: 200,
+                gamma: 2.2,
+                rotation: 1,
+            },
+            vec![resolved_chunk(PageChunkKind::Sjbz, "Sjbz")],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 0;
+        plan.chunks[0].chunk.chunk.data_end = RYPKA_PAGE_1_SJBZ.len();
+
+        let render = plan
+            .render_partial_bitmap(RYPKA_PAGE_1_SJBZ, 8)
+            .expect("partial bitmap should render");
+        let black_pixels = render
+            .bitmap
+            .pixels
+            .chunks_exact(3)
+            .filter(|pixel| **pixel == [0, 0, 0])
+            .count();
+
+        assert_eq!(render.bitonal_masks.len(), 1);
+        assert!(!render.bitonal_masks[0].1.reached_end_of_data);
+        assert_eq!(render.bitonal_masks[0].1.mask.black_pixel_count(), 11_647);
+        assert_eq!(black_pixels, 11_647);
+    }
+
+    #[test]
+    fn render_plan_rejects_bitonal_masks_with_mismatched_page_dimensions() {
+        const RYPKA_PAGE_1_SJBZ: &[u8] = include_bytes!("../tests/fixtures/jb2/rypka-page-1.jb2");
+        let mut plan = PageRenderPlan::new(
+            page_info(),
+            vec![resolved_chunk(PageChunkKind::Sjbz, "Sjbz")],
+        );
+        plan.chunks[0].chunk.chunk.data_start = 0;
+        plan.chunks[0].chunk.chunk.data_end = RYPKA_PAGE_1_SJBZ.len();
+
+        let error = plan
+            .render_partial_bitmap(RYPKA_PAGE_1_SJBZ, 8)
+            .expect_err("mismatched dimensions should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "bitonal image #0 dimensions 1560x1633 do not match page 100x200"
         );
     }
 }

@@ -6,8 +6,11 @@ use djvulpes::{
     write_bitmap_pdf,
 };
 use djvulpes::{decode_bzz, decode_dirm_tail};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
+
+const PARTIAL_JB2_RECORD_LIMIT: usize = 1024;
 
 pub fn run_summary(path: &Path) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
@@ -248,7 +251,7 @@ pub fn run_render_plan(path: &Path, number: usize) -> anyhow::Result<()> {
 
     println!("file: {}", path.display());
     println!("page: {number}");
-    print_render_plan(&plan);
+    print_render_plan(&plan, &bytes);
 
     Ok(())
 }
@@ -278,8 +281,8 @@ pub fn run_render_page(path: &Path, number: usize, output: &Path) -> anyhow::Res
         Vec::new()
     };
     let plan = document.page_render_plan(&bytes, &page, &tail_entries)?;
-    let bitmap = plan.render_base_bitmap();
-    let ppm = bitmap.to_ppm_bytes();
+    let render = plan.render_partial_bitmap(&bytes, PARTIAL_JB2_RECORD_LIMIT)?;
+    let ppm = render.bitmap.to_ppm_bytes();
 
     fs::write(output, ppm).with_context(|| format!("failed to write {}", output.display()))?;
 
@@ -287,12 +290,11 @@ pub fn run_render_page(path: &Path, number: usize, output: &Path) -> anyhow::Res
     println!("page: {number}");
     println!(
         "rendered: {}x{} dpi={} format=PPM/P6",
-        bitmap.width, bitmap.height, bitmap.dpi
+        render.bitmap.width, render.bitmap.height, render.bitmap.dpi
     );
     println!("output: {}", output.display());
-    if plan.has_image_data() {
-        println!("image layers: pending decoder support");
-    }
+    print_partial_render_summary(&render.bitonal_masks, PARTIAL_JB2_RECORD_LIMIT);
+    print_pending_image_layer_summary(&plan);
 
     Ok(())
 }
@@ -322,8 +324,8 @@ pub fn run_render_page_pdf(path: &Path, number: usize, output: &Path) -> anyhow:
         Vec::new()
     };
     let plan = document.page_render_plan(&bytes, &page, &tail_entries)?;
-    let bitmap = plan.render_base_bitmap();
-    let pdf = write_bitmap_pdf(std::slice::from_ref(&bitmap))?;
+    let render = plan.render_partial_bitmap(&bytes, PARTIAL_JB2_RECORD_LIMIT)?;
+    let pdf = write_bitmap_pdf(std::slice::from_ref(&render.bitmap))?;
 
     fs::write(output, pdf).with_context(|| format!("failed to write {}", output.display()))?;
 
@@ -331,12 +333,11 @@ pub fn run_render_page_pdf(path: &Path, number: usize, output: &Path) -> anyhow:
     println!("page: {number}");
     println!(
         "rendered: {}x{} dpi={} format=PDF",
-        bitmap.width, bitmap.height, bitmap.dpi
+        render.bitmap.width, render.bitmap.height, render.bitmap.dpi
     );
     println!("output: {}", output.display());
-    if plan.has_image_data() {
-        println!("image layers: pending decoder support");
-    }
+    print_partial_render_summary(&render.bitonal_masks, PARTIAL_JB2_RECORD_LIMIT);
+    print_pending_image_layer_summary(&plan);
 
     Ok(())
 }
@@ -641,7 +642,7 @@ fn print_page_detail(
     Ok(())
 }
 
-fn print_render_plan(plan: &PageRenderPlan<'_>) {
+fn print_render_plan(plan: &PageRenderPlan<'_>, bytes: &[u8]) {
     println!(
         "INFO: {}x{} dpi={} gamma={:.1} version={} rotation={}",
         plan.info.width,
@@ -662,6 +663,62 @@ fn print_render_plan(plan: &PageRenderPlan<'_>) {
     );
     println!("has image data: {}", plan.has_image_data());
     println!("has text: {}", plan.has_text());
+    if !plan.bitonal_images.is_empty() {
+        match plan.bitonal_image_headers(bytes) {
+            Ok(headers) => {
+                for image in headers {
+                    println!(
+                        "bitonal image #{}: JB2 {}x{} inherited_dict_symbols={}",
+                        image.index,
+                        image.header.width,
+                        image.header.height,
+                        image.header.inherited_dictionary_symbols
+                    );
+                }
+            }
+            Err(error) => println!("bitonal image headers: unavailable ({error})"),
+        }
+        match plan.bitonal_record_prefixes(bytes, 8) {
+            Ok(prefixes) => {
+                for (chunk_index, prefix) in prefixes {
+                    print!(
+                        "bitonal image #{chunk_index}: first {} JB2 records",
+                        prefix.records.len()
+                    );
+                    if let Some(kind) = prefix.stopped_before {
+                        print!("; stopped before {}", kind.as_str());
+                    }
+                    println!();
+                    for record in prefix.records.iter().take(8) {
+                        println!(
+                            "  rec #{:<3} {:<27}{}",
+                            record.index,
+                            record.kind.as_str(),
+                            format_jb2_record_geometry(record)
+                        );
+                    }
+                }
+            }
+            Err(error) => println!("bitonal record prefix: unavailable ({error})"),
+        }
+        match plan.partial_bitonal_masks(bytes, PARTIAL_JB2_RECORD_LIMIT) {
+            Ok(partials) => {
+                for (chunk_index, partial) in partials {
+                    println!(
+                        "bitonal image #{chunk_index}: supported-prefix mask record_limit={} black_pixels={} dictionary_symbols={} end_of_data={} stopped_before={}",
+                        PARTIAL_JB2_RECORD_LIMIT,
+                        partial.mask.black_pixel_count(),
+                        partial.dictionary_symbol_count,
+                        partial.reached_end_of_data,
+                        partial
+                            .stopped_before
+                            .map_or("none", djvulpes::Jb2RecordKind::as_str)
+                    );
+                }
+            }
+            Err(error) => println!("bitonal supported-prefix mask: unavailable ({error})"),
+        }
+    }
     println!();
     println!("effective chunks:");
     println!("index  source      chunk  role      size      offset");
@@ -677,6 +734,47 @@ fn print_render_plan(plan: &PageRenderPlan<'_>) {
             chunk.chunk.chunk.data_start - 8
         );
     }
+}
+
+fn print_partial_render_summary(
+    bitonal_masks: &[(usize, djvulpes::Jb2PartialImage)],
+    record_limit: usize,
+) {
+    for (chunk_index, partial) in bitonal_masks {
+        println!(
+            "painted bitonal image #{chunk_index}: record_limit={} black_pixels={} dictionary_symbols={} end_of_data={} stopped_before={}",
+            record_limit,
+            partial.mask.black_pixel_count(),
+            partial.dictionary_symbol_count,
+            partial.reached_end_of_data,
+            partial
+                .stopped_before
+                .map_or("none", djvulpes::Jb2RecordKind::as_str)
+        );
+    }
+}
+
+fn print_pending_image_layer_summary(plan: &PageRenderPlan<'_>) {
+    if plan.foreground_layers.is_empty() && plan.background_layers.is_empty() {
+        return;
+    }
+
+    println!(
+        "image layers: IW44 foreground/background pending decoder support (foreground={} background={})",
+        plan.foreground_layers.len(),
+        plan.background_layers.len()
+    );
+}
+
+fn format_jb2_record_geometry(record: &djvulpes::Jb2RecordSummary) -> String {
+    let mut detail = String::new();
+    if let (Some(width), Some(height)) = (record.symbol_width, record.symbol_height) {
+        let _ = write!(detail, " {width}x{height}");
+    }
+    if let (Some(x), Some(y)) = (record.x, record.y) {
+        let _ = write!(detail, " at ({x}, {y})");
+    }
+    detail
 }
 
 fn format_page_chunk_source(source: PageChunkSource<'_>) -> String {
