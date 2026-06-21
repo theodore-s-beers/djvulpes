@@ -409,6 +409,11 @@ impl<'a> SpecZpDecoder<'a> {
         self.decode_passthrough_with_threshold(z)
     }
 
+    pub(crate) fn decode_iw44_passthrough_bit(&mut self) -> bool {
+        let z = 0x8000 + ((3 * self.a) >> 3);
+        self.decode_passthrough_with_threshold(z) != 0
+    }
+
     fn decode_passthrough_with_threshold(&mut self, z: u32) -> u8 {
         let bit;
 
@@ -779,6 +784,15 @@ mod tests {
     }
 
     #[test]
+    fn spec_zp_iw44_passthrough_uses_iw44_threshold() {
+        let mut raw_decoder = zp_decoder_with_interval(0x4000, 0x9c00);
+        let mut iw44_decoder = zp_decoder_with_interval(0x4000, 0x9c00);
+
+        assert_eq!(raw_decoder.decode_raw(), 1);
+        assert!(!iw44_decoder.decode_iw44_passthrough_bit());
+    }
+
+    #[test]
     fn runtime_zp_table_set_has_valid_shape() {
         DJVU_ZP_TABLES.validate_shape();
     }
@@ -1131,6 +1145,18 @@ mod tests {
             0
         } else {
             1 + decoder.decode_raw()
+        }
+    }
+
+    fn zp_decoder_with_interval(a: u32, c: u32) -> SpecZpDecoder<'static> {
+        SpecZpDecoder {
+            input: &[],
+            cursor: 0,
+            a,
+            c,
+            fence: c.min(0x7fff),
+            bit_buffer: u32::MAX,
+            buffered_bits: 32,
         }
     }
 

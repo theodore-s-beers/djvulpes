@@ -92,10 +92,98 @@ pub struct Jb2PartialImage {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Jb2Dictionary {
+    symbols: Vec<Jb2SymbolBitmap>,
+}
+
+impl Jb2Dictionary {
+    #[must_use]
+    pub const fn symbol_count(&self) -> usize {
+        self.symbols.len()
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct Jb2SymbolBitmap {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
+}
+
+impl Jb2SymbolBitmap {
+    fn dictionary_symbol(&self) -> Self {
+        let cropped = self.crop_to_content();
+        if cropped.width == 0 || cropped.height == 0 {
+            self.clone()
+        } else {
+            cropped
+        }
+    }
+
+    fn crop_to_content(&self) -> Self {
+        let mut min_x = self.width;
+        let mut min_y = self.height;
+        let mut max_x = None;
+        let mut max_y = None;
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.pixel(x, y) == 0 {
+                    continue;
+                }
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = Some(max_x.map_or(x, |max_x: u32| max_x.max(x)));
+                max_y = Some(max_y.map_or(y, |max_y: u32| max_y.max(y)));
+            }
+        }
+
+        let Some(max_x) = max_x else {
+            return Self {
+                width: 0,
+                height: 0,
+                pixels: Vec::new(),
+            };
+        };
+        let max_y = max_y.expect("max_y should be set when max_x is set");
+        let width = max_x - min_x + 1;
+        let height = max_y - min_y + 1;
+        let mut pixels = vec![0; (width as usize).saturating_mul(height as usize)];
+
+        for y in 0..height {
+            for x in 0..width {
+                let value = self.pixel(min_x + x, min_y + y);
+                let target_index = (y as usize)
+                    .checked_mul(width as usize)
+                    .and_then(|offset| offset.checked_add(x as usize))
+                    .expect("cropped JB2 symbol offset should not overflow");
+                pixels[target_index] = value;
+            }
+        }
+
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    fn pixel(&self, x: u32, y: u32) -> u8 {
+        if x >= self.width || y >= self.height {
+            return 0;
+        }
+        let width = usize::try_from(self.width).expect("symbol width should fit usize");
+        let x = usize::try_from(x).expect("symbol x should fit usize");
+        let y = usize::try_from(y).expect("symbol y should fit usize");
+        let Some(index) = y
+            .checked_mul(width)
+            .and_then(|offset| offset.checked_add(x))
+        else {
+            return 0;
+        };
+
+        self.pixels.get(index).copied().unwrap_or(0)
+    }
 }
 
 /// Reads the JB2 image preamble and dimensions from an `Sjbz` payload.
@@ -265,7 +353,7 @@ pub fn read_jb2_record_prefix(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2
 /// Returns an error if the JB2 header or a supported prefix record is malformed.
 #[allow(clippy::too_many_lines)]
 pub fn render_jb2_supported_prefix(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2PartialImage> {
-    render_jb2_records(bytes, max_records)
+    render_jb2_records(bytes, max_records, None)
 }
 
 /// Decodes and paints a complete JB2 image.
@@ -278,7 +366,7 @@ pub fn render_jb2_supported_prefix(bytes: &[u8], max_records: usize) -> Jb2Resul
 pub fn render_jb2_image(bytes: &[u8]) -> Jb2Result<Jb2PartialImage> {
     const MAX_IMAGE_RECORDS: usize = 1_000_000;
 
-    let image = render_jb2_records(bytes, MAX_IMAGE_RECORDS)?;
+    let image = render_jb2_records(bytes, MAX_IMAGE_RECORDS, None)?;
     if let Some(kind) = image.stopped_before {
         return Err(Jb2Error::new(format!(
             "JB2 image stopped before unsupported {} record",
@@ -294,12 +382,96 @@ pub fn render_jb2_image(bytes: &[u8]) -> Jb2Result<Jb2PartialImage> {
     Ok(image)
 }
 
+/// Decodes and paints a complete JB2 image using a shared symbol dictionary.
+///
+/// # Errors
+///
+/// Returns an error if the JB2 image is malformed, requires more inherited
+/// symbols than the dictionary provides, or does not reach `EndOfData`.
+pub fn render_jb2_image_with_dictionary(
+    bytes: &[u8],
+    dictionary: &Jb2Dictionary,
+) -> Jb2Result<Jb2PartialImage> {
+    const MAX_IMAGE_RECORDS: usize = 1_000_000;
+
+    let image = render_jb2_records(bytes, MAX_IMAGE_RECORDS, Some(dictionary))?;
+    if let Some(kind) = image.stopped_before {
+        return Err(Jb2Error::new(format!(
+            "JB2 image stopped before unsupported {} record",
+            kind.as_str()
+        )));
+    }
+    if !image.reached_end_of_data {
+        return Err(Jb2Error::new(format!(
+            "JB2 image did not reach end-of-data within {MAX_IMAGE_RECORDS} records"
+        )));
+    }
+
+    Ok(image)
+}
+
+/// Decodes a shared JB2 dictionary from a `Djbz` payload.
+///
+/// # Errors
+///
+/// Returns an error if the dictionary stream is malformed or contains a record
+/// kind that is invalid for dictionary chunks.
+pub fn decode_jb2_dictionary(bytes: &[u8]) -> Jb2Result<Jb2Dictionary> {
+    decode_jb2_dictionary_with_inherited(bytes, None)
+}
+
+fn decode_jb2_dictionary_with_inherited(
+    bytes: &[u8],
+    inherited: Option<&Jb2Dictionary>,
+) -> Jb2Result<Jb2Dictionary> {
+    const MAX_DICTIONARY_RECORDS: usize = 1_000_000;
+
+    let mut decoder = Jb2Decoder::new(bytes)?;
+    let header = decoder.read_header()?;
+    let mut dictionary = initial_dictionary(inherited, header.inherited_dictionary_symbols)?;
+
+    for _ in 0..MAX_DICTIONARY_RECORDS {
+        match decoder.next_record_kind()? {
+            Jb2RecordKind::NewSymbolAddOnly => {
+                let symbol = decoder.decode_direct_symbol()?;
+                dictionary.push(symbol.dictionary_symbol());
+            }
+            Jb2RecordKind::MatchedRefineAddOnly => {
+                let symbol = decoder.decode_refined_symbol(&dictionary)?;
+                dictionary.push(symbol.dictionary_symbol());
+            }
+            Jb2RecordKind::RequiredDictOrReset => {}
+            Jb2RecordKind::Comment => decoder.skip_comment(),
+            Jb2RecordKind::EndOfData => {
+                return Ok(Jb2Dictionary {
+                    symbols: dictionary,
+                });
+            }
+            kind => {
+                return Err(Jb2Error::new(format!(
+                    "JB2 dictionary contains unexpected {} record",
+                    kind.as_str()
+                )));
+            }
+        }
+    }
+
+    Err(Jb2Error::new(
+        "JB2 dictionary did not reach end-of-data before record limit",
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
-fn render_jb2_records(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2PartialImage> {
+fn render_jb2_records(
+    bytes: &[u8],
+    max_records: usize,
+    shared_dictionary: Option<&Jb2Dictionary>,
+) -> Jb2Result<Jb2PartialImage> {
     let mut decoder = Jb2Decoder::new(bytes)?;
     let header = decoder.read_header()?;
     let mut mask = BitonalBitmap::new(header.width, header.height);
-    let mut dictionary = Vec::new();
+    let mut dictionary =
+        initial_dictionary(shared_dictionary, header.inherited_dictionary_symbols)?;
     let mut records = Vec::new();
 
     for index in 0..max_records {
@@ -310,13 +482,13 @@ fn render_jb2_records(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2PartialI
                 let (x, y) = decoder.decode_symbol_coords(symbol.width, symbol.height);
                 blit_symbol(&mut mask, &symbol, x, y);
                 let record = symbol_record(index, kind, &symbol, Some((x, y)));
-                dictionary.push(symbol);
+                dictionary.push(symbol.dictionary_symbol());
                 Some(record)
             }
             Jb2RecordKind::NewSymbolAddOnly => {
                 let symbol = decoder.decode_direct_symbol()?;
                 let record = symbol_record(index, kind, &symbol, None);
-                dictionary.push(symbol);
+                dictionary.push(symbol.dictionary_symbol());
                 Some(record)
             }
             Jb2RecordKind::NewSymbolBlitOnly => {
@@ -354,13 +526,13 @@ fn render_jb2_records(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2PartialI
                 let (x, y) = decoder.decode_symbol_coords(symbol.width, symbol.height);
                 blit_symbol(&mut mask, &symbol, x, y);
                 let record = symbol_record(index, kind, &symbol, Some((x, y)));
-                dictionary.push(symbol);
+                dictionary.push(symbol.dictionary_symbol());
                 Some(record)
             }
             Jb2RecordKind::MatchedRefineAddOnly => {
                 let symbol = decoder.decode_refined_symbol(&dictionary)?;
                 let record = symbol_record(index, kind, &symbol, None);
-                dictionary.push(symbol);
+                dictionary.push(symbol.dictionary_symbol());
                 Some(record)
             }
             Jb2RecordKind::MatchedRefineBlitOnly => {
@@ -428,16 +600,7 @@ fn render_jb2_records(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2PartialI
                     reached_end_of_data: true,
                 });
             }
-            Jb2RecordKind::RequiredDictOrReset => {
-                return Ok(Jb2PartialImage {
-                    header,
-                    mask,
-                    records,
-                    dictionary_symbol_count: dictionary.len(),
-                    stopped_before: Some(kind),
-                    reached_end_of_data: false,
-                });
-            }
+            Jb2RecordKind::RequiredDictOrReset => None,
         };
 
         if let Some(record) = record {
@@ -453,6 +616,27 @@ fn render_jb2_records(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2PartialI
         stopped_before: None,
         reached_end_of_data: false,
     })
+}
+
+fn initial_dictionary(
+    shared_dictionary: Option<&Jb2Dictionary>,
+    requested_symbols: u32,
+) -> Jb2Result<Vec<Jb2SymbolBitmap>> {
+    if requested_symbols == 0 {
+        return Ok(Vec::new());
+    }
+    let shared_dictionary =
+        shared_dictionary.ok_or_else(|| Jb2Error::new("JB2 image requires a shared dictionary"))?;
+    let requested_symbols = usize::try_from(requested_symbols)
+        .map_err(|_| Jb2Error::new("JB2 inherited dictionary size exceeds decoder range"))?;
+    if requested_symbols > shared_dictionary.symbols.len() {
+        return Err(Jb2Error::new(format!(
+            "JB2 image requires {requested_symbols} shared symbols, dictionary has {}",
+            shared_dictionary.symbols.len()
+        )));
+    }
+
+    Ok(shared_dictionary.symbols[..requested_symbols].to_vec())
 }
 
 struct Jb2Decoder<'a> {
@@ -686,10 +870,15 @@ impl<'a> Jb2Decoder<'a> {
         let height = i32::try_from(reference.height)
             .map_err(|_| Jb2Error::new("JB2 reference height exceeds decoder range"))?
             + height_difference;
-        if width <= 0 || height <= 0 {
-            return Err(Jb2Error::new(
-                "JB2 refined bitmap has non-positive dimensions",
-            ));
+        if width < 0 || height < 0 {
+            return Err(Jb2Error::new("JB2 refined bitmap has negative dimensions"));
+        }
+        if width == 0 || height == 0 {
+            return Ok(Jb2SymbolBitmap {
+                width: 0,
+                height: 0,
+                pixels: Vec::new(),
+            });
         }
 
         Ok(self.decode_refined_bitmap(
@@ -821,36 +1010,37 @@ impl LayoutState {
 #[derive(Debug, Clone)]
 struct Baseline {
     values: [i32; 3],
-    index: usize,
-    filled: bool,
+    index: i32,
 }
 
 impl Baseline {
     const fn new() -> Self {
         Self {
             values: [0; 3],
-            index: 0,
-            filled: false,
+            index: -1,
         }
     }
 
     const fn fill(&mut self, value: i32) {
         self.values = [value; 3];
-        self.index = 0;
-        self.filled = true;
     }
 
-    const fn add(&mut self, value: i32) {
-        self.values[self.index] = value;
-        self.index = (self.index + 1) % 3;
-        self.filled = true;
+    fn add(&mut self, value: i32) {
+        self.index += 1;
+        if self.index == 3 {
+            self.index = 0;
+        }
+        self.values[usize::try_from(self.index).expect("baseline index should fit usize")] = value;
     }
 
-    fn value(&self) -> i32 {
-        if self.filled {
-            self.values.iter().sum::<i32>() / i32::try_from(self.values.len()).unwrap_or(1)
+    const fn value(&self) -> i32 {
+        let [a, b, c] = self.values;
+        if (a >= b && a <= c) || (a <= b && a >= c) {
+            a
+        } else if (b >= a && b <= c) || (b <= a && b >= c) {
+            b
         } else {
-            0
+            c
         }
     }
 }
@@ -1175,7 +1365,52 @@ mod tests {
             partial.records[5].kind,
             Jb2RecordKind::MatchedRefineAddAndBlit
         );
-        assert_eq!(partial.mask.black_pixel_count(), 167_028);
+        assert_eq!(partial.mask.black_pixel_count(), 167_493);
+    }
+
+    #[test]
+    fn dictionary_symbols_crop_to_black_pixel_bounds() {
+        let symbol = Jb2SymbolBitmap {
+            width: 4,
+            height: 3,
+            pixels: vec![
+                0, 0, 0, 0, // bottom row
+                0, 1, 0, 1, //
+                0, 0, 0, 0, // top row
+            ],
+        };
+
+        let cropped = symbol.crop_to_content();
+
+        assert_eq!(cropped.width, 3);
+        assert_eq!(cropped.height, 1);
+        assert_eq!(cropped.pixels, [1, 0, 1]);
+    }
+
+    #[test]
+    fn dictionary_symbols_keep_empty_reference_dimensions() {
+        let symbol = Jb2SymbolBitmap {
+            width: 4,
+            height: 3,
+            pixels: vec![0; 12],
+        };
+
+        let dictionary_symbol = symbol.dictionary_symbol();
+
+        assert_eq!(dictionary_symbol.width, 4);
+        assert_eq!(dictionary_symbol.height, 3);
+        assert_eq!(dictionary_symbol.pixels, vec![0; 12]);
+    }
+
+    #[test]
+    fn baseline_uses_median_of_last_three_values() {
+        let mut baseline = Baseline::new();
+        baseline.fill(100);
+        baseline.add(100);
+        baseline.add(140);
+        baseline.add(101);
+
+        assert_eq!(baseline.value(), 101);
     }
 
     #[test]

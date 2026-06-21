@@ -1,3 +1,14 @@
+//! `DjVu` parsing, rendering, and PDF conversion primitives.
+//!
+//! The high-level rendering entry points are [`render_document_page`],
+//! [`render_document_pages`], and [`render_document_pages_with_events`]. Use
+//! [`PageRenderMode`] to select full-page, background, foreground, or mask
+//! compositor output.
+//!
+//! The high-level PDF entry points are [`render_document_pdf`] and
+//! [`render_document_pdf_with_events`]. They use the same in-house BZZ/ZP, JB2,
+//! IW44, and compositing paths as the bitmap render APIs.
+
 #![forbid(unsafe_code)]
 #![warn(clippy::pedantic, clippy::nursery)]
 
@@ -24,18 +35,32 @@ pub use document::{
 pub use error::{ParseError, ParseResult};
 pub use info::{PageInfo, read_page_info};
 pub use iw44::{
-    Iw44ChunkHeader, Iw44Error, Iw44ImageHeader, Iw44LayerSummary, Iw44PageMapping, Iw44Result,
-    read_iw44_chunk_header, summarize_iw44_layer,
+    Iw44Bitstream, Iw44ChunkHeader, Iw44CoefficientEvent, Iw44CoefficientEventKind,
+    Iw44CoefficientPlane, Iw44CoefficientTraceTarget, Iw44DecodedChunk, Iw44Decoder, Iw44Error,
+    Iw44ImageHeader, Iw44LayerSummary, Iw44PageMapping, Iw44Plane, Iw44PlaneCoefficientSummary,
+    Iw44ReconstructionExtent, Iw44ReconstructionOrder, Iw44ReconstructionPlane, Iw44Result,
+    Iw44RgbImage, read_iw44_chunk_header, summarize_iw44_layer,
 };
 pub use jb2::{
-    Jb2Error, Jb2ImageHeader, Jb2PartialImage, Jb2RecordKind, Jb2RecordPrefix, Jb2RecordSummary,
-    Jb2Result, read_jb2_image_header, read_jb2_record_prefix, render_jb2_image,
+    Jb2Dictionary, Jb2Error, Jb2ImageHeader, Jb2PartialImage, Jb2RecordKind, Jb2RecordPrefix,
+    Jb2RecordSummary, Jb2Result, decode_jb2_dictionary, read_jb2_image_header,
+    read_jb2_record_prefix, render_jb2_image, render_jb2_image_with_dictionary,
     render_jb2_supported_prefix,
 };
 pub use page::{PageChunk, PageChunkKind, PageChunkPayload, PageDetails, read_page_details};
-pub use pdf::{PdfError, PdfResult, write_bitmap_pdf};
+pub use pdf::{
+    DjvuPdfError, DjvuPdfRenderEvent, DjvuPdfResult, PdfError, PdfPageImage, PdfResult,
+    render_document_pdf, render_document_pdf_with_events, write_bitmap_pdf, write_page_image_pdf,
+    write_page_image_pdf_iter, write_rendered_pages_pdf_iter,
+};
 pub use render::{
-    BitonalBitmap, BitonalImageHeader, Iw44LayerGeometry, PageBitmap, PageRenderPlan,
-    PartialPageRender, PixelFormat, RenderChunkPayload,
+    BitonalBitmap, BitonalImageHeader, DjvuPageRenderEvent, DjvuRenderError, DjvuRenderResult,
+    Iw44LayerGeometry, Iw44LayerRole, PageBitmap, PageBitmapChannelDiff, PageBitmapDiff,
+    PageBitmapDiffBounds, PageBitmapDiffPixel, PageBitmapDiffRegionSummary,
+    PageBitmapDiffTileSummary, PageBitmapStats, PageRenderMode, PageRenderPlan, PartialPageRender,
+    PixelFormat, RenderChunkPayload, RenderCompareLimits, RenderError, RenderResult,
+    RenderedDocumentPage, RenderedIw44Layer, bitmap_diff_failures, bitmap_diff_region_summary,
+    bitmap_diff_tile_summaries, render_document_page, render_document_pages,
+    render_document_pages_with_events,
 };
 pub use text::{TextPayload, TextZone, TextZoneKind, parse_text_payload, parse_text_zones};
