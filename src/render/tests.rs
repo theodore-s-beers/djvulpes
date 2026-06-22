@@ -574,13 +574,17 @@ fn render_plan_classifies_effective_page_chunks() {
 fn render_plan_recognizes_all_rypka_effective_chunks() {
     const RYPKA: &[u8] = include_bytes!("../../Rypka-HIL.djvu");
     let document = Document::parse(RYPKA).expect("fixture DjVu should parse");
-    let decoded_tail;
-    let tail_entries = if let Some(dirm) = &document.directory {
-        decoded_tail = decode_dirm_tail(RYPKA, dirm).expect("DIRM tail should decode");
-        parse_dirm_tail(dirm, &decoded_tail).expect("DIRM tail should parse")
-    } else {
-        Vec::new()
-    };
+    let decoded_tail = document
+        .directory
+        .as_ref()
+        .map(|dirm| decode_dirm_tail(RYPKA, dirm).expect("DIRM tail should decode"));
+    let tail_entries = document
+        .directory
+        .as_ref()
+        .zip(decoded_tail.as_deref())
+        .map_or_else(Vec::new, |(dirm, decoded_tail)| {
+            parse_dirm_tail(dirm, decoded_tail).expect("DIRM tail should parse")
+        });
 
     let mut page_count = 0usize;
     for (index, page) in document.pages(RYPKA).enumerate() {

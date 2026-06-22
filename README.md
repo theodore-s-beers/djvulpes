@@ -18,10 +18,10 @@ cargo run -- render-page-layer 1 background background.ppm path/to/file.djvu
 cargo run -- render-pdf document.pdf path/to/file.djvu
 cargo run -- render-pdf pages-1-5.pdf --from-page 1 --to-page 5 path/to/file.djvu
 cargo run -- compare-ppm actual.ppm expected.ppm
-cargo run -- compare-render-pages oracles --from-page 1 --to-page 5 path/to/file.djvu
-cargo run -- compare-render-pages background-oracles --mode background --from-page 1 --to-page 5 path/to/file.djvu
-cargo run -- text 1 path/to/file.djvu
-cargo run -- text 1 --zones path/to/file.djvu
+cargo run -- compare-render --oracle oracle.ppm --page 1 path/to/file.djvu
+cargo run -- compare-render --oracle-dir oracles --from-page 1 --to-page 5 path/to/file.djvu
+cargo run -- compare-render --oracle-dir background-oracles --mode background --from-page 1 --to-page 5 path/to/file.djvu
+cargo run -- extract-text --from-page 1 --to-page 1 path/to/file.djvu
 cargo run -- extract-text --from-page 1 --to-page 5 path/to/file.djvu
 cargo run -- extract-text --structured --from-page 1 --to-page 5 path/to/file.djvu
 cargo run -- outline path/to/file.djvu
@@ -38,12 +38,10 @@ Available subcommands:
 - `render-page-layer <number> <full|background|foreground|mask> <output.ppm>` renders one compositor mode to binary RGB PPM/P6.
 - `render-pdf <output.pdf>` renders every supported page into one PDF, printing sparse status every 50 pages by default. Use `--from-page` and `--to-page` to render a page range, `--progress` for per-page status, `--quiet` for only the final summary, `--verbose` for detailed per-page summaries, and `--timings` for aggregate stage timings. Bitonal-only pages are embedded as 1-bit grayscale images; color/IW44 pages are embedded as RGB images. In-range `NAVM` outline entries are preserved as PDF bookmarks, and hidden text lines are embedded as invisible PDF text spans with Unicode `/ActualText`.
 - `compare-ppm <actual.ppm> <expected.ppm>` compares two binary RGB PPM/P6 images using the same diff summary and tolerance flags as the render comparison commands.
-- `compare-render-page <number> <oracle.ppm>` renders a page and compares it with a binary RGB PPM/P6 oracle.
-- `compare-render-pages <oracle-dir>` compares a page range against `page-<number>.ppm` files in an oracle directory. Use `--mode full|background|foreground|mask` to validate one compositor mode across the range.
+- `compare-render` compares rendered output with binary RGB PPM/P6 oracle files. Use `--oracle <file.ppm> --page <number>` for one explicit oracle file, or `--oracle-dir <dir> --from-page <n> --to-page <n>` for `page-<number>.ppm` files in a directory. Use `--mode full|background|foreground|mask` to validate one compositor mode.
 - `compare-render-page-layer <number> <full|background|foreground|mask> <oracle.ppm>` compares one compositor mode with a binary RGB PPM/P6 oracle.
 - `dump-image-layers <number> <output-dir>` writes raw `FG44`/`BG44` payloads, decoded native IW44 RGB PPMs, and decoded IW44 coefficient/reconstruction summaries.
 - `inspect-iw44-pixel <number> <background|foreground> <x> <y>` maps a page-space pixel to a decoded IW44 layer sample and prints RGB plus reconstructed Y/Cb/Cr values. Use `--radius <n>` to print a small Y-neighborhood grid around the target, `--coefficients <n>` to print the strongest luma coefficients in the containing 32x32 block, `--coefficient-index <n>` to include a specific local coefficient index, `--trace-coefficients` to show how those coefficients change after each progressive IW44 chunk or slice, `--trace-events` to show the bucket, activation, sign, and refinement decisions for those coefficients, and `--trace-reconstruction` to show how zeroing listed coefficients, bands, buckets, or the containing block changes the reconstructed sample and how the sample changes under diagnostic inverse-transform order/extent variants.
-- `text <number>` extracts hidden text from one page.
 - `extract-text` extracts hidden text from a page range as raw `djvutxt`-compatible output. Use `--structured` for `djvused print-txt`-style zone expressions, and `--from-page`/`--to-page` to select a range.
 - `outline` prints the document outline/bookmarks as `djvused`-style bookmark syntax.
 
@@ -72,16 +70,16 @@ Use `PageRenderMode::Full`, `Background`, `Foreground`, or `Mask` to select the 
 
 ```sh
 ddjvu -format=ppm -page=1 path/to/file.djvu oracle.ppm
-cargo run -- compare-render-page 1 oracle.ppm path/to/file.djvu
+cargo run -- compare-render --oracle oracle.ppm --page 1 path/to/file.djvu
 
 mkdir -p oracles
 ddjvu -format=ppm -page=1 path/to/file.djvu oracles/page-1.ppm
 ddjvu -format=ppm -page=2 path/to/file.djvu oracles/page-2.ppm
-cargo run -- compare-render-pages oracles --from-page 1 --to-page 2 path/to/file.djvu
+cargo run -- compare-render --oracle-dir oracles --from-page 1 --to-page 2 path/to/file.djvu
 
 mkdir -p background-oracles
 ddjvu -format=ppm -mode=background -page=1 path/to/file.djvu background-oracles/page-1.ppm
-cargo run -- compare-render-pages background-oracles --mode background --from-page 1 --to-page 1 path/to/file.djvu
+cargo run -- compare-render --oracle-dir background-oracles --mode background --from-page 1 --to-page 1 path/to/file.djvu
 
 ddjvu -format=ppm -mode=background -page=1 path/to/file.djvu background-oracle.ppm
 cargo run -- compare-render-page-layer 1 background background-oracle.ppm path/to/file.djvu

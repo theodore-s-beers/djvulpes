@@ -1,6 +1,6 @@
 use super::{
     print_bitmap_stats, print_iw44_render_summary, print_partial_render_summary, read_file,
-    render_page, render_page_layer,
+    render_page_layer,
 };
 use anyhow::{Context as _, bail};
 use djvulpes::{
@@ -18,6 +18,16 @@ struct BatchCompareWorst {
     mean_abs_delta: f64,
     mean_abs_delta_page: usize,
     observed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CompareRenderOptions<'a> {
+    pub oracle: Option<&'a Path>,
+    pub oracle_dir: Option<&'a Path>,
+    pub page: Option<usize>,
+    pub mode: PageRenderMode,
+    pub from_page: usize,
+    pub to_page: Option<usize>,
 }
 
 impl BatchCompareWorst {
@@ -56,19 +66,21 @@ impl BatchCompareWorst {
     }
 }
 
-pub fn run_compare_render_page(
+fn run_compare_render_oracle_file(
     path: &Path,
     number: usize,
     oracle: &Path,
+    mode: PageRenderMode,
     limits: RenderCompareLimits,
 ) -> anyhow::Result<()> {
-    let render = render_page(path, number)?;
+    let render = render_page_layer(path, number, mode)?;
     let oracle_bytes = read_file(oracle)?;
     let expected = djvulpes::PageBitmap::from_ppm_bytes(&oracle_bytes, render.bitmap.dpi)?;
     let diff = render.bitmap.diff(&expected)?;
 
     println!("file: {}", path.display());
     println!("page: {number}");
+    println!("mode: {}", mode.as_str());
     println!("oracle: {}", oracle.display());
     println!(
         "rendered: {}x{} dpi={} format=PPM/P6",
@@ -265,7 +277,40 @@ fn enforce_bitmap_diff(
     Ok(())
 }
 
-pub fn run_compare_render_pages(
+pub fn run_compare_render(
+    path: &Path,
+    options: CompareRenderOptions<'_>,
+    limits: RenderCompareLimits,
+) -> anyhow::Result<()> {
+    match (options.oracle, options.oracle_dir) {
+        (Some(_), Some(_)) => bail!("use either --oracle or --oracle-dir, not both"),
+        (Some(oracle), None) => {
+            if options.from_page != 1 || options.to_page.is_some() {
+                bail!("--oracle compares one page; use --page instead of --from-page/--to-page");
+            }
+            let page = options.page.context("--oracle requires --page <number>")?;
+            run_compare_render_oracle_file(path, page, oracle, options.mode, limits)
+        }
+        (None, Some(oracle_dir)) => {
+            let (from_page, to_page) = options
+                .page
+                .map_or((options.from_page, options.to_page), |page| {
+                    (page, Some(page))
+                });
+            run_compare_render_oracle_dir(
+                path,
+                oracle_dir,
+                options.mode,
+                from_page,
+                to_page,
+                limits,
+            )
+        }
+        (None, None) => bail!("compare-render requires --oracle or --oracle-dir"),
+    }
+}
+
+fn run_compare_render_oracle_dir(
     path: &Path,
     oracle_dir: &Path,
     mode: PageRenderMode,

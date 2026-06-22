@@ -1,16 +1,15 @@
 use anyhow::{Context, bail};
+use djvulpes::decode_dirm_tail;
 use djvulpes::{
     Bookmark, extract_document_bookmarks, extract_document_text, format_document_text_zones,
 };
 use djvulpes::{
-    Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkKind,
-    PageChunkPayload, PageChunkSource, PageRenderMode, PageRenderPlan, ParseResult,
-    PartialPageRender, PdfPageImage, TextZone, parse_chunks, parse_dirm_tail, parse_form_at,
-    parse_text_payload, parse_text_zones, read_page_details,
+    Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkPayload,
+    PageChunkSource, PageRenderMode, PageRenderPlan, ParseResult, PartialPageRender, PdfPageImage,
+    parse_chunks, parse_dirm_tail, parse_form_at, read_page_details,
     render_document_pdf_to_writer_with_events_and_timings,
 };
 use djvulpes::{DjvuPdfPageKind, DjvuPdfTimingEvent, DjvuPdfTimingStage};
-use djvulpes::{decode_bzz, decode_dirm_tail};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -20,8 +19,7 @@ mod compare;
 mod dump;
 mod iw44_inspect;
 pub use compare::{
-    run_compare_ppm, run_compare_render_page, run_compare_render_page_layer,
-    run_compare_render_pages,
+    CompareRenderOptions, run_compare_ppm, run_compare_render, run_compare_render_page_layer,
 };
 pub use dump::{run_dump_bitonal, run_dump_image_layers};
 pub use iw44_inspect::run_inspect_iw44_pixel;
@@ -797,51 +795,6 @@ fn with_page_render_plan<T>(
     render(&bytes, plan)
 }
 
-pub fn run_text(path: &Path, number: usize, show_zones: bool) -> anyhow::Result<()> {
-    if number == 0 {
-        bail!("page number must be 1 or greater");
-    }
-
-    let bytes = read_file(path)?;
-    let document = Document::parse(&bytes)?;
-    let Some(document_form) = document
-        .forms
-        .iter()
-        .filter(|form| form.kind == DocumentFormKind::Page)
-        .nth(number - 1)
-    else {
-        bail!(
-            "page {number} not found; document has {} pages",
-            document.form_kind_counts().pages
-        );
-    };
-    let details = read_page_details(&bytes, &document_form.form)?;
-
-    println!("file: {}", path.display());
-    println!("page: {number}");
-    println!(
-        "form: @{} FORM:{} size={}",
-        document_form.offset, details.form.kind, details.form.chunk.size
-    );
-
-    let mut found_text = false;
-    for chunk in details
-        .chunks
-        .iter()
-        .filter(|chunk| matches!(chunk.kind, PageChunkKind::Txta | PageChunkKind::Txtz))
-    {
-        found_text = true;
-        print_text_chunk(&bytes, chunk, show_zones)?;
-    }
-
-    if !found_text {
-        println!();
-        println!("text: none");
-    }
-
-    Ok(())
-}
-
 pub fn run_extract_text(
     path: &Path,
     from_page: usize,
@@ -1519,94 +1472,6 @@ fn print_page_chunk_line(
     Ok(())
 }
 
-fn print_text_chunk(
-    bytes: &[u8],
-    page_chunk: &PageChunk<'_>,
-    show_zones: bool,
-) -> anyhow::Result<()> {
-    let chunk = &page_chunk.chunk;
-    let encoded = &bytes[chunk.data_start..chunk.data_end];
-    let decoded;
-    let payload = match page_chunk.kind {
-        PageChunkKind::Txta => encoded,
-        PageChunkKind::Txtz => {
-            decoded = decode_bzz(encoded)?;
-            &decoded
-        }
-        _ => return Ok(()),
-    };
-    let parsed = parse_text_payload(payload)?;
-
-    println!();
-    println!(
-        "{}: @{} size={} decoded_bytes={} text_bytes={} zone_bytes={}",
-        chunk.id,
-        chunk.data_start - 8,
-        chunk.size,
-        payload.len(),
-        parsed.text_len,
-        parsed.zone_data.len()
-    );
-    println!();
-    print!("{}", parsed.text);
-    if !parsed.text.ends_with('\n') {
-        println!();
-    }
-
-    if show_zones {
-        println!();
-        match parse_text_zones(parsed.zone_data)? {
-            Some(root) => {
-                println!("zones:");
-                print_text_zone(&root, parsed.text, 0);
-            }
-            None => println!("zones: none"),
-        }
-    }
-
-    Ok(())
-}
-
-fn print_text_zone(zone: &TextZone, text: &str, depth: usize) {
-    let indent = "  ".repeat(depth);
-    println!(
-        "{indent}{} bbox=({}, {}, {}, {}) text=[{}..{}){}",
-        zone.kind.as_str(),
-        zone.x_min(),
-        zone.y_min(),
-        zone.x_max(),
-        zone.y_max(),
-        zone.text_start,
-        zone.text_end(),
-        format_zone_text(zone, text)
-    );
-
-    for child in &zone.children {
-        print_text_zone(child, text, depth + 1);
-    }
-}
-
-fn format_zone_text(zone: &TextZone, text: &str) -> String {
-    let Some(slice) = text.get(zone.text_start..zone.text_end()) else {
-        return String::new();
-    };
-    if slice.is_empty() {
-        return String::new();
-    }
-
-    let mut excerpt = String::new();
-    for (index, character) in slice.chars().enumerate() {
-        if index == 80 {
-            excerpt.push_str("...");
-            break;
-        }
-        excerpt.push(character);
-    }
-
-    let escaped = excerpt.escape_debug().to_string();
-    format!(" \"{escaped}\"")
-}
-
 fn format_page_chunk_payload(
     page_chunk: &PageChunk<'_>,
     directory_context: Option<(&Document<'_>, &[DirectoryEntry<'_>])>,
@@ -1806,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_render_pages_accepts_exact_generated_oracle_directory() {
+    fn compare_render_accepts_exact_generated_oracle_directory() {
         let oracle_dir =
             std::env::temp_dir().join(format!("djvulpes-oracles-{}", std::process::id()));
         fs::create_dir_all(&oracle_dir).expect("oracle directory should be created");
@@ -1814,17 +1679,44 @@ mod tests {
 
         run_render_page(Path::new("Rypka-HIL.djvu"), 1, &oracle)
             .expect("page oracle should render");
-        run_compare_render_pages(
+        run_compare_render(
             Path::new("Rypka-HIL.djvu"),
-            &oracle_dir,
-            PageRenderMode::Full,
-            1,
-            Some(1),
+            CompareRenderOptions {
+                oracle: None,
+                oracle_dir: Some(&oracle_dir),
+                page: None,
+                mode: PageRenderMode::Full,
+                from_page: 1,
+                to_page: Some(1),
+            },
             RenderCompareLimits::new(0, 0, Some(0), 0.0),
         )
         .expect("render should match generated oracle exactly");
         let _ = fs::remove_file(&oracle);
         let _ = fs::remove_dir(&oracle_dir);
+    }
+
+    #[test]
+    fn compare_render_accepts_exact_generated_single_oracle() {
+        let oracle =
+            std::env::temp_dir().join(format!("djvulpes-page-1-{}.ppm", std::process::id()));
+
+        run_render_page(Path::new("Rypka-HIL.djvu"), 1, &oracle)
+            .expect("page oracle should render");
+        run_compare_render(
+            Path::new("Rypka-HIL.djvu"),
+            CompareRenderOptions {
+                oracle: Some(&oracle),
+                oracle_dir: None,
+                page: Some(1),
+                mode: PageRenderMode::Full,
+                from_page: 1,
+                to_page: None,
+            },
+            RenderCompareLimits::new(0, 0, Some(0), 0.0),
+        )
+        .expect("render should match generated oracle exactly");
+        let _ = fs::remove_file(&oracle);
     }
 
     #[test]

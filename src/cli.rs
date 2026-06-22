@@ -1,9 +1,9 @@
 use crate::commands::{
-    Iw44PixelInspectOptions, Iw44PixelTrace, RenderPdfOptions, RenderPdfProgress, run_compare_ppm,
-    run_compare_render_page, run_compare_render_page_layer, run_compare_render_pages, run_dirm,
-    run_dump_bitonal, run_dump_image_layers, run_extract_text, run_form, run_forms,
+    CompareRenderOptions, Iw44PixelInspectOptions, Iw44PixelTrace, RenderPdfOptions,
+    RenderPdfProgress, run_compare_ppm, run_compare_render, run_compare_render_page_layer,
+    run_dirm, run_dump_bitonal, run_dump_image_layers, run_extract_text, run_form, run_forms,
     run_inspect_iw44_pixel, run_outline, run_page, run_pages, run_render_page,
-    run_render_page_layer, run_render_pdf, run_render_plan, run_summary, run_text,
+    run_render_page_layer, run_render_pdf, run_render_plan, run_summary,
 };
 use clap::{Parser, Subcommand};
 use djvulpes::{PageRenderMode, RenderCompareLimits};
@@ -73,23 +73,14 @@ enum Command {
         timings: bool,
         file: PathBuf,
     },
-    /// Compare a rendered page against a binary RGB PPM oracle.
-    CompareRenderPage {
-        number: usize,
-        oracle: PathBuf,
-        #[arg(long, default_value_t = 0)]
-        max_different_pixels: usize,
-        #[arg(long, default_value_t = 0)]
-        max_abs_delta: u8,
+    /// Compare rendered pages against binary RGB PPM oracle files.
+    CompareRender {
         #[arg(long)]
-        max_delta_pixels: Option<usize>,
-        #[arg(long, default_value_t = 0.0)]
-        max_mean_abs_delta: f64,
-        file: PathBuf,
-    },
-    /// Compare a page range against page-<number>.ppm files in an oracle directory.
-    CompareRenderPages {
-        oracle_dir: PathBuf,
+        oracle: Option<PathBuf>,
+        #[arg(long)]
+        oracle_dir: Option<PathBuf>,
+        #[arg(long)]
+        page: Option<usize>,
         #[arg(long, default_value = "full")]
         mode: PageRenderMode,
         #[arg(long, default_value_t = 1)]
@@ -168,13 +159,6 @@ enum Command {
         trace_reconstruction: bool,
         file: PathBuf,
     },
-    /// Extract hidden text from one page by 1-based page number.
-    Text {
-        number: usize,
-        #[arg(long)]
-        zones: bool,
-        file: PathBuf,
-    },
     /// Extract hidden text as raw djvutxt-compatible or structured djvused-style output.
     ExtractText {
         #[arg(long, default_value_t = 1)]
@@ -213,8 +197,7 @@ fn run_command(command: Command) -> anyhow::Result<()> {
             None => run_forms(&file)?,
         },
         Command::Dirm { file } => run_dirm(&file)?,
-        Command::CompareRenderPage { .. }
-        | Command::CompareRenderPages { .. }
+        Command::CompareRender { .. }
         | Command::CompareRenderPageLayer { .. }
         | Command::ComparePpm { .. } => unreachable!("compare command already handled"),
         Command::RenderPlan { .. }
@@ -254,11 +237,6 @@ fn run_command(command: Command) -> anyhow::Result<()> {
                 ],
             ),
         )?,
-        Command::Text {
-            number,
-            zones,
-            file,
-        } => run_text(&file, number, zones)?,
         Command::ExtractText {
             from_page,
             to_page,
@@ -354,27 +332,10 @@ fn iw44_pixel_inspect_options(
 
 fn run_compare_command(command: &Command) -> anyhow::Result<bool> {
     match command {
-        Command::CompareRenderPage {
-            number,
+        Command::CompareRender {
             oracle,
-            max_different_pixels,
-            max_abs_delta,
-            max_delta_pixels,
-            max_mean_abs_delta,
-            file,
-        } => run_compare_render_page(
-            file,
-            *number,
-            oracle,
-            RenderCompareLimits::new(
-                *max_different_pixels,
-                *max_abs_delta,
-                *max_delta_pixels,
-                *max_mean_abs_delta,
-            ),
-        )?,
-        Command::CompareRenderPages {
             oracle_dir,
+            page,
             mode,
             from_page,
             to_page,
@@ -383,12 +344,16 @@ fn run_compare_command(command: &Command) -> anyhow::Result<bool> {
             max_delta_pixels,
             max_mean_abs_delta,
             file,
-        } => run_compare_render_pages(
+        } => run_compare_render(
             file,
-            oracle_dir,
-            *mode,
-            *from_page,
-            *to_page,
+            CompareRenderOptions {
+                oracle: oracle.as_deref(),
+                oracle_dir: oracle_dir.as_deref(),
+                page: *page,
+                mode: *mode,
+                from_page: *from_page,
+                to_page: *to_page,
+            },
             RenderCompareLimits::new(
                 *max_different_pixels,
                 *max_abs_delta,
