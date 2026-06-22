@@ -1,0 +1,1 @@
+- Always run tests in `--release` mode; tests take too long otherwise. The extra build time is more than worth it.
