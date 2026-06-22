@@ -185,6 +185,12 @@ struct Iw44InspectionLayer<'a> {
     geometry: djvulpes::Iw44LayerGeometry,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Iw44InspectionAxis {
+    X,
+    Y,
+}
+
 fn inspect_iw44_pixel(
     plan: &PageRenderPlan<'_>,
     bytes: &[u8],
@@ -212,15 +218,15 @@ fn inspect_iw44_pixel(
     let planes = decoder.reconstruct_planes();
     let source_x = iw44_source_coordinate(
         options.x,
-        layer.geometry.mapping.horizontal_overscan,
-        layer.geometry.mapping.subsample,
+        &layer.geometry.mapping,
         image.width,
+        Iw44InspectionAxis::X,
     );
     let source_y = iw44_source_coordinate(
         options.y,
-        layer.geometry.mapping.vertical_overscan,
-        layer.geometry.mapping.subsample,
+        &layer.geometry.mapping,
         image.height,
+        Iw44InspectionAxis::Y,
     );
     let rgb_offset = (source_y * image.width + source_x) * 3;
     let rgb = [
@@ -403,13 +409,59 @@ fn decode_iw44_payloads(
 
 fn iw44_source_coordinate(
     page_coordinate: u32,
-    overscan: u32,
-    subsample: u32,
+    mapping: &djvulpes::Iw44PageMapping,
     source_extent: usize,
+    axis: Iw44InspectionAxis,
 ) -> usize {
-    let centered = page_coordinate.saturating_add(overscan / 2);
-    let scaled = centered / subsample.max(1);
-    (scaled as usize).min(source_extent.saturating_sub(1))
+    if mapping.subsample == 1 {
+        let overscan = match axis {
+            Iw44InspectionAxis::X => mapping.horizontal_overscan,
+            Iw44InspectionAxis::Y => mapping.vertical_overscan,
+        };
+        let source = page_coordinate.saturating_add(overscan) / mapping.subsample.max(1);
+        return usize::try_from(source)
+            .unwrap_or(usize::MAX)
+            .min(source_extent.saturating_sub(1));
+    }
+
+    let fixed = match axis {
+        Iw44InspectionAxis::X => {
+            iw44_scaler_coordinate(source_extent, mapping.subsample, page_coordinate)
+        }
+        Iw44InspectionAxis::Y => {
+            iw44_top_down_scaler_coordinate(source_extent, mapping, page_coordinate)
+        }
+    };
+    let index = fixed >> 4;
+    usize::try_from(index)
+        .unwrap_or(0)
+        .min(source_extent.saturating_sub(1))
+}
+
+fn iw44_scaler_coordinate(input_size: usize, subsample: u32, output_coordinate: u32) -> i32 {
+    let input = i64::try_from(input_size).expect("IW44 image dimension should fit i64");
+    let numer = i64::from(subsample.max(1));
+    let len = 16i64;
+    let coordinate = ((len + numer) / (2 * numer)) - 8
+        + ((numer / 2) + (i64::from(output_coordinate) * len)) / numer;
+    let max_coordinate = input.saturating_sub(1).saturating_mul(16);
+    i32::try_from(coordinate.min(max_coordinate)).expect("IW44 scaler coordinate should fit i32")
+}
+
+fn iw44_top_down_scaler_coordinate(
+    input_size: usize,
+    mapping: &djvulpes::Iw44PageMapping,
+    top_down_coordinate: u32,
+) -> i32 {
+    let bottom_up_coordinate = mapping
+        .page_height
+        .saturating_sub(1)
+        .saturating_sub(top_down_coordinate);
+    let bottom_up_fixed =
+        iw44_scaler_coordinate(input_size, mapping.subsample, bottom_up_coordinate);
+    let max_fixed = i32::try_from(input_size.saturating_sub(1).saturating_mul(16))
+        .expect("IW44 scaler coordinate should fit i32");
+    max_fixed - bottom_up_fixed
 }
 
 fn iw44_plane_sample(
@@ -455,35 +507,18 @@ fn iw44_luma_neighborhood(
     let min_page_y = y.saturating_sub(radius);
     let max_page_x = x.saturating_add(radius).min(mapping.page_width - 1);
     let max_page_y = y.saturating_add(radius).min(mapping.page_height - 1);
-    let source_min_x = iw44_source_coordinate(
-        min_page_x,
-        mapping.horizontal_overscan,
-        mapping.subsample,
-        image_width,
-    );
-    let source_min_y = iw44_source_coordinate(
-        min_page_y,
-        mapping.vertical_overscan,
-        mapping.subsample,
-        image_height,
-    );
+    let source_min_x =
+        iw44_source_coordinate(min_page_x, mapping, image_width, Iw44InspectionAxis::X);
+    let source_min_y =
+        iw44_source_coordinate(min_page_y, mapping, image_height, Iw44InspectionAxis::Y);
     let mut rows = Vec::new();
 
     for page_y in min_page_y..=max_page_y {
-        let source_y = iw44_source_coordinate(
-            page_y,
-            mapping.vertical_overscan,
-            mapping.subsample,
-            image_height,
-        );
+        let source_y = iw44_source_coordinate(page_y, mapping, image_height, Iw44InspectionAxis::Y);
         let mut row = Vec::new();
         for page_x in min_page_x..=max_page_x {
-            let source_x = iw44_source_coordinate(
-                page_x,
-                mapping.horizontal_overscan,
-                mapping.subsample,
-                image_width,
-            );
+            let source_x =
+                iw44_source_coordinate(page_x, mapping, image_width, Iw44InspectionAxis::X);
             row.push(iw44_plane_sample(
                 planes,
                 djvulpes::Iw44Plane::Y,

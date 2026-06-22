@@ -10,63 +10,40 @@ use clap::{Parser, Subcommand};
 use djvulpes::{PageRenderMode, RenderCompareLimits};
 use std::path::PathBuf;
 
-const DEFAULT_FILE: &str = "Rypka-HIL.djvu";
-
 #[derive(Debug, Parser)]
-#[command(version, about, long_about = None, args_conflicts_with_subcommands = true)]
+#[command(
+    version,
+    about,
+    long_about = None,
+    args_conflicts_with_subcommands = true,
+    subcommand_required = true,
+    arg_required_else_help = true
+)]
 struct Cli {
-    #[arg(default_value = DEFAULT_FILE)]
-    file: PathBuf,
-
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Print a high-level document summary.
-    Summary {
-        #[arg(default_value = DEFAULT_FILE)]
-        file: PathBuf,
-    },
+    Summary { file: PathBuf },
     /// List pages with basic page metadata.
-    Pages {
-        #[arg(default_value = DEFAULT_FILE)]
-        file: PathBuf,
-    },
+    Pages { file: PathBuf },
     /// List forms referenced by the document directory.
-    Forms {
-        #[arg(default_value = DEFAULT_FILE)]
-        file: PathBuf,
-    },
+    Forms { file: PathBuf },
     /// Inspect a FORM at an absolute byte offset.
-    Form {
-        offset: usize,
-        #[arg(default_value = DEFAULT_FILE)]
-        file: PathBuf,
-    },
+    Form { offset: usize, file: PathBuf },
     /// Inspect the bundled document directory.
-    Dirm {
-        #[arg(default_value = DEFAULT_FILE)]
-        file: PathBuf,
-    },
+    Dirm { file: PathBuf },
     /// Inspect one page by 1-based page number.
-    Page {
-        number: usize,
-        #[arg(default_value = DEFAULT_FILE)]
-        file: PathBuf,
-    },
+    Page { number: usize, file: PathBuf },
     /// Show the renderer-facing chunk plan for one page.
-    RenderPlan {
-        number: usize,
-        #[arg(default_value = DEFAULT_FILE)]
-        file: PathBuf,
-    },
+    RenderPlan { number: usize, file: PathBuf },
     /// Render a page-sized RGB PPM image.
     RenderPage {
         number: usize,
         output: PathBuf,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Render one page layer mode to a page-sized RGB PPM image.
@@ -74,14 +51,12 @@ enum Command {
         number: usize,
         mode: PageRenderMode,
         output: PathBuf,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Render a page-sized RGB PDF image.
     RenderPagePdf {
         number: usize,
         output: PathBuf,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Render all pages into one RGB PDF.
@@ -99,7 +74,6 @@ enum Command {
         verbose: bool,
         #[arg(long)]
         timings: bool,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Compare a rendered page against a binary RGB PPM oracle.
@@ -114,7 +88,6 @@ enum Command {
         max_delta_pixels: Option<usize>,
         #[arg(long, default_value_t = 0.0)]
         max_mean_abs_delta: f64,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Compare a page range against page-<number>.ppm files in an oracle directory.
@@ -134,7 +107,6 @@ enum Command {
         max_delta_pixels: Option<usize>,
         #[arg(long, default_value_t = 0.0)]
         max_mean_abs_delta: f64,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Compare one rendered page layer mode against a binary RGB PPM oracle.
@@ -150,7 +122,6 @@ enum Command {
         max_delta_pixels: Option<usize>,
         #[arg(long, default_value_t = 0.0)]
         max_mean_abs_delta: f64,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Compare two binary RGB PPM images.
@@ -170,14 +141,12 @@ enum Command {
     DumpBitonal {
         number: usize,
         output_dir: PathBuf,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Dump FG44/BG44 IW44 payloads for one page.
     DumpImageLayers {
         number: usize,
         output_dir: PathBuf,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Inspect decoded IW44 samples at a page-space pixel.
@@ -200,7 +169,6 @@ enum Command {
         trace_events: bool,
         #[arg(long)]
         trace_reconstruction: bool,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Extract hidden text from one page by 1-based page number.
@@ -208,7 +176,6 @@ enum Command {
         number: usize,
         #[arg(long)]
         zones: bool,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Extract hidden text as raw djvutxt-compatible or structured djvused-style output.
@@ -219,19 +186,15 @@ enum Command {
         to_page: Option<usize>,
         #[arg(long)]
         structured: bool,
-        #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
     /// Print the document outline/bookmarks.
-    Outline {
-        #[arg(default_value = DEFAULT_FILE)]
-        file: PathBuf,
-    },
+    Outline { file: PathBuf },
 }
 
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    run_command(cli.command.unwrap_or(Command::Summary { file: cli.file }))
+    run_command(cli.command)
 }
 
 fn run_command(command: Command) -> anyhow::Result<()> {
