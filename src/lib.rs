@@ -7,7 +7,7 @@
 //!
 //! The high-level PDF entry points are [`render_document_pdf`] and
 //! [`render_document_pdf_with_events`]. They use the same in-house BZZ/ZP, JB2,
-//! IW44, and compositing paths as the bitmap render APIs.
+//! IW44, text, outline, and compositing paths as the bitmap render APIs.
 
 #![forbid(unsafe_code)]
 #![warn(clippy::pedantic, clippy::nursery)]
@@ -20,6 +20,7 @@ pub(crate) mod error;
 pub(crate) mod info;
 pub(crate) mod iw44;
 pub(crate) mod jb2;
+pub(crate) mod navm;
 pub(crate) mod page;
 pub(crate) mod pdf;
 pub(crate) mod render;
@@ -47,6 +48,7 @@ pub use jb2::{
     read_jb2_record_prefix, render_jb2_image, render_jb2_image_with_dictionary,
     render_jb2_supported_prefix,
 };
+pub use navm::{Bookmark, extract_document_bookmarks, parse_navm_bookmarks};
 pub use page::{PageChunk, PageChunkKind, PageChunkPayload, PageDetails, read_page_details};
 pub use pdf::{
     DjvuPdfError, DjvuPdfRenderEvent, DjvuPdfResult, PdfError, PdfPageImage, PdfResult,
@@ -63,4 +65,9 @@ pub use render::{
     bitmap_diff_tile_summaries, render_document_page, render_document_pages,
     render_document_pages_with_events,
 };
-pub use text::{TextPayload, TextZone, TextZoneKind, parse_text_payload, parse_text_zones};
+pub use text::{
+    ExtractedTextPage, ExtractedTextZonePage, TextError, TextPayload, TextResult, TextZone,
+    TextZoneKind, extract_document_text, extract_document_text_pages,
+    extract_document_text_zone_pages, format_document_text_zones, parse_text_payload,
+    parse_text_zones,
+};

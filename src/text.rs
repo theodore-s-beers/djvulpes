@@ -1,11 +1,44 @@
 use crate::chunk::require_range;
+use crate::document::Document;
 use crate::error::{ParseError, ParseResult};
+use crate::page::PageChunkKind;
+use crate::{BzzError, decode_bzz, decode_dirm_tail, parse_dirm_tail};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum TextError {
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+    #[error(transparent)]
+    Bzz(#[from] BzzError),
+    #[error("from_page must be 1 or greater")]
+    ZeroFromPage,
+    #[error("to_page must be greater than or equal to from_page")]
+    ReversedPageRange,
+    #[error("page {page} not found; document has {page_count} pages")]
+    PageOutOfRange { page: usize, page_count: usize },
+}
+
+pub type TextResult<T> = Result<T, TextError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextPayload<'a> {
     pub text: &'a str,
     pub text_len: usize,
     pub zone_data: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedTextPage {
+    pub page_number: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedTextZonePage {
+    pub page_number: usize,
+    pub text: String,
+    pub zone: Option<TextZone>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +63,305 @@ pub enum TextZoneKind {
     Word,
     Character,
     Unknown(u8),
+}
+
+/// Extracts hidden text from a page range.
+///
+/// Page numbers are 1-based. If `to_page` is `None`, extraction continues
+/// through the final page. Shared `INCL` forms are resolved in the same order as
+/// the rendering path before `TXTa`/`TXTz` chunks are collected.
+///
+/// # Errors
+///
+/// Returns an error if the document cannot be parsed, the bundled directory
+/// cannot be decoded, the range is invalid, or a selected text chunk is
+/// malformed.
+pub fn extract_document_text_pages(
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+) -> TextResult<Vec<ExtractedTextPage>> {
+    let document = Document::parse(bytes)?;
+    let decoded_tail;
+    let tail_entries = if let Some(dirm) = &document.directory {
+        decoded_tail = decode_dirm_tail(bytes, dirm)?;
+        parse_dirm_tail(dirm, &decoded_tail)?
+    } else {
+        Vec::new()
+    };
+    let page_count = document.form_kind_counts().pages;
+    let end_page = checked_text_page_range(page_count, from_page, to_page)?;
+    let mut pages = Vec::new();
+    let mut selected_pages = 0usize;
+
+    for (index, page) in document.pages(bytes).enumerate() {
+        let page_number = index + 1;
+        if page_number < from_page || page_number > end_page {
+            continue;
+        }
+
+        let page = page?;
+        let chunks = document.resolved_page_chunks(bytes, &page, &tail_entries)?;
+        let mut text = String::new();
+        for chunk in chunks
+            .iter()
+            .filter(|chunk| matches!(chunk.chunk.kind, PageChunkKind::Txta | PageChunkKind::Txtz))
+        {
+            let data = &chunk.chunk.chunk;
+            let payload =
+                text_chunk_payload(bytes, chunk.chunk.kind, data.data_start, data.data_end)?;
+            text.push_str(parse_text_payload(&payload)?.text);
+        }
+        pages.push(ExtractedTextPage { page_number, text });
+        selected_pages += 1;
+    }
+
+    if selected_pages == 0 {
+        return Err(TextError::PageOutOfRange {
+            page: from_page,
+            page_count,
+        });
+    }
+
+    Ok(pages)
+}
+
+/// Extracts hidden text and its zone tree from a page range.
+///
+/// Empty pages are preserved with an empty text string and no zone tree,
+/// matching `djvused print-txt` page selection behavior.
+///
+/// # Errors
+///
+/// Returns an error if the document cannot be parsed, the bundled directory
+/// cannot be decoded, the range is invalid, or a selected text chunk or zone
+/// stream is malformed.
+pub fn extract_document_text_zone_pages(
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+) -> TextResult<Vec<ExtractedTextZonePage>> {
+    let document = Document::parse(bytes)?;
+    let decoded_tail;
+    let tail_entries = if let Some(dirm) = &document.directory {
+        decoded_tail = decode_dirm_tail(bytes, dirm)?;
+        parse_dirm_tail(dirm, &decoded_tail)?
+    } else {
+        Vec::new()
+    };
+    let page_count = document.form_kind_counts().pages;
+    let end_page = checked_text_page_range(page_count, from_page, to_page)?;
+    let mut pages = Vec::new();
+    let mut selected_pages = 0usize;
+
+    for (index, page) in document.pages(bytes).enumerate() {
+        let page_number = index + 1;
+        if page_number < from_page || page_number > end_page {
+            continue;
+        }
+
+        let page = page?;
+        let chunks = document.resolved_page_chunks(bytes, &page, &tail_entries)?;
+        let mut text = String::new();
+        let mut zone = None;
+        for chunk in chunks
+            .iter()
+            .filter(|chunk| matches!(chunk.chunk.kind, PageChunkKind::Txta | PageChunkKind::Txtz))
+        {
+            let data = &chunk.chunk.chunk;
+            let payload =
+                text_chunk_payload(bytes, chunk.chunk.kind, data.data_start, data.data_end)?;
+            let parsed = parse_text_payload(&payload)?;
+            text.push_str(parsed.text);
+            if zone.is_none() {
+                zone = parse_text_zones(parsed.zone_data)?;
+            }
+        }
+        pages.push(ExtractedTextZonePage {
+            page_number,
+            text,
+            zone,
+        });
+        selected_pages += 1;
+    }
+
+    if selected_pages == 0 {
+        return Err(TextError::PageOutOfRange {
+            page: from_page,
+            page_count,
+        });
+    }
+
+    Ok(pages)
+}
+
+/// Extracts hidden text from a page range using `djvutxt`-compatible page
+/// separators.
+///
+/// Empty pages emit no bytes. Non-empty pages emit the page text followed by a
+/// newline and a form-feed byte, matching `djvutxt --page=N`.
+///
+/// # Errors
+///
+/// Returns the same errors as [`extract_document_text_pages`].
+pub fn extract_document_text(
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+) -> TextResult<String> {
+    let mut text = String::new();
+    for page in extract_document_text_pages(bytes, from_page, to_page)? {
+        if !page.text.is_empty() {
+            text.push_str(&page.text);
+            text.push('\n');
+            text.push('\x0c');
+        }
+    }
+
+    Ok(text)
+}
+
+/// Formats a page range as `djvused print-txt` style text-zone expressions.
+///
+/// # Errors
+///
+/// Returns the same errors as [`extract_document_text_zone_pages`].
+pub fn format_document_text_zones(
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+) -> TextResult<String> {
+    let mut output = String::new();
+    for page in extract_document_text_zone_pages(bytes, from_page, to_page)? {
+        match &page.zone {
+            Some(zone) => {
+                format_text_zone_expression(&mut output, zone, &page.text, zone.height, 0, 0);
+            }
+            None => output.push_str("(page 0 0 0 0 \"\")\n"),
+        }
+    }
+
+    Ok(output)
+}
+
+fn format_text_zone_expression(
+    output: &mut String,
+    zone: &TextZone,
+    text: &str,
+    page_height: i32,
+    depth: usize,
+    trailing_closes: usize,
+) {
+    output.push_str(&" ".repeat(depth));
+    output.push('(');
+    output.push_str(zone.kind.as_str());
+    {
+        use std::fmt::Write as _;
+        write!(
+            output,
+            " {} {} {} {}",
+            zone.x_min(),
+            zone.y_min(page_height),
+            zone.x_max(),
+            zone.y_max(page_height)
+        )
+        .expect("writing to string should not fail");
+    }
+
+    if zone.children.is_empty() {
+        output.push_str(" \"");
+        output.push_str(&escape_text_zone_string(zone_text(zone, text)));
+        output.push_str("\")");
+        for _ in 0..trailing_closes {
+            output.push(')');
+        }
+        output.push('\n');
+        return;
+    }
+
+    output.push('\n');
+    for (index, child) in zone.children.iter().enumerate() {
+        let child_trailing_closes = if index + 1 == zone.children.len() {
+            trailing_closes + 1
+        } else {
+            0
+        };
+        format_text_zone_expression(
+            output,
+            child,
+            text,
+            page_height,
+            depth + 1,
+            child_trailing_closes,
+        );
+    }
+}
+
+fn zone_text<'a>(zone: &TextZone, text: &'a str) -> &'a str {
+    text.get(zone.text_start..zone.text_end())
+        .unwrap_or("")
+        .trim_end()
+}
+
+fn escape_text_zone_string(value: &str) -> String {
+    let mut escaped = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'"' => escaped.push_str("\\\""),
+            b'\\' => escaped.push_str("\\\\"),
+            0x20..=0x7e => escaped.push(char::from(*byte)),
+            _ => {
+                use std::fmt::Write as _;
+                write!(&mut escaped, "\\{byte:03o}").expect("writing to string should not fail");
+            }
+        }
+    }
+
+    escaped
+}
+
+fn checked_text_page_range(
+    page_count: usize,
+    from_page: usize,
+    to_page: Option<usize>,
+) -> TextResult<usize> {
+    if from_page == 0 {
+        return Err(TextError::ZeroFromPage);
+    }
+    if let Some(to_page) = to_page
+        && to_page < from_page
+    {
+        return Err(TextError::ReversedPageRange);
+    }
+
+    let end_page = to_page.unwrap_or(page_count);
+    if from_page > page_count {
+        return Err(TextError::PageOutOfRange {
+            page: from_page,
+            page_count,
+        });
+    }
+    if end_page > page_count {
+        return Err(TextError::PageOutOfRange {
+            page: end_page,
+            page_count,
+        });
+    }
+
+    Ok(end_page)
+}
+
+fn text_chunk_payload(
+    bytes: &[u8],
+    kind: PageChunkKind,
+    start: usize,
+    end: usize,
+) -> TextResult<Vec<u8>> {
+    match kind {
+        PageChunkKind::Txta => Ok(bytes[start..end].to_vec()),
+        PageChunkKind::Txtz => Ok(decode_bzz(&bytes[start..end])?),
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// Parses a decompressed `TXTa`/`TXTz` payload.
@@ -181,7 +513,9 @@ fn parse_zone(
         (None, _) => encoded_x,
     };
     let y_top = match (parent, previous_sibling) {
-        (Some(parent), Some(_)) if uses_parent_y(kind) => parent.y_top + encoded_y,
+        (Some(_), Some(previous)) if uses_previous_sibling_baseline(kind) => {
+            previous.y_top + previous.height - encoded_y - height
+        }
         (Some(_), Some(previous)) => previous.y_top + previous.height + encoded_y,
         (Some(parent), None) => parent.y_top + encoded_y,
         (None, _) => encoded_y,
@@ -231,7 +565,7 @@ const fn uses_previous_sibling_right(kind: TextZoneKind) -> bool {
     matches!(kind, TextZoneKind::Word | TextZoneKind::Character)
 }
 
-const fn uses_parent_y(kind: TextZoneKind) -> bool {
+const fn uses_previous_sibling_baseline(kind: TextZoneKind) -> bool {
     matches!(kind, TextZoneKind::Word | TextZoneKind::Character)
 }
 
@@ -265,7 +599,10 @@ fn add_text_delta(base: usize, delta: i32) -> ParseResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextZoneKind, parse_text_payload, parse_text_zones};
+    use super::{
+        TextError, TextZoneKind, extract_document_text, extract_document_text_pages,
+        format_document_text_zones, parse_text_payload, parse_text_zones,
+    };
 
     #[test]
     fn parses_text_and_keeps_zone_data() {
@@ -285,8 +622,12 @@ mod tests {
         let zone_data = [
             0x01, 0x01, 0x80, 0x00, 0x80, 0x00, 0x8d, 0x74, 0x93, 0xe0, 0x80, 0x00, 0x00, 0x00,
             0x1f, 0x00, 0x00, 0x01, 0x05, 0x83, 0x2e, 0x82, 0x60, 0x87, 0x06, 0x80, 0x41, 0x80,
-            0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x01, 0x06, 0x80, 0x00, 0x80, 0x04, 0x81, 0xb9,
-            0x80, 0x3d, 0x80, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x04, 0x06, 0x80, 0x00, 0x80, 0x04, 0x81, 0xb9,
+            0x80, 0x3d, 0x80, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x06, 0x80, 0x32, 0x80,
+            0x01, 0x80, 0x7c, 0x80, 0x3d, 0x80, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x06,
+            0x80, 0x33, 0x80, 0x00, 0x81, 0xba, 0x80, 0x40, 0x80, 0x00, 0x00, 0x00, 0x08, 0x00,
+            0x00, 0x00, 0x06, 0x80, 0x32, 0x80, 0x00, 0x82, 0x80, 0x80, 0x3e, 0x80, 0x00, 0x00,
+            0x00, 0x0b, 0x00, 0x00, 0x00,
         ];
 
         let page = parse_text_zones(&zone_data)
@@ -316,5 +657,99 @@ mod tests {
         assert_eq!(word.y_max(page.height), 4476);
         assert_eq!(word.text_start, 0);
         assert_eq!(word.text_len, 8);
+
+        let word = &line.children[1];
+        assert_eq!(word.kind, TextZoneKind::Word);
+        assert_eq!(word.x_min(), 1305);
+        assert_eq!(word.y_min(page.height), 4416);
+        assert_eq!(word.x_max(), 1429);
+        assert_eq!(word.y_max(page.height), 4477);
+        assert_eq!(word.text_start, 8);
+        assert_eq!(word.text_len, 3);
+    }
+
+    #[test]
+    fn extract_document_text_matches_djvutxt_page_separator_convention() {
+        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
+
+        let text = extract_document_text(RYPKA, 3, Some(3)).expect("page 3 text should extract");
+
+        assert_eq!(text, "HISTORY OF IRANIAN LITERATURE \n\n\x0c");
+    }
+
+    #[test]
+    fn format_document_text_zones_matches_djvused_page_expression() {
+        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
+
+        let text =
+            format_document_text_zones(RYPKA, 3, Some(3)).expect("page 3 zones should format");
+
+        assert_eq!(
+            text,
+            concat!(
+                "(page 0 0 3444 5088\n",
+                " (line 814 4415 2612 4480\n",
+                "  (word 814 4415 1255 4476 \"HISTORY\")\n",
+                "  (word 1305 4416 1429 4477 \"OF\")\n",
+                "  (word 1480 4416 1922 4480 \"IRANIAN\")\n",
+                "  (word 1972 4416 2612 4478 \"LITERATURE\")))\n",
+            )
+        );
+    }
+
+    #[test]
+    fn format_document_text_zones_preserves_empty_pages() {
+        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
+
+        let text = format_document_text_zones(RYPKA, 1, Some(3)).expect("page range should format");
+
+        assert_eq!(
+            text,
+            concat!(
+                "(page 0 0 0 0 \"\")\n",
+                "(page 0 0 0 0 \"\")\n",
+                "(page 0 0 3444 5088\n",
+                " (line 814 4415 2612 4480\n",
+                "  (word 814 4415 1255 4476 \"HISTORY\")\n",
+                "  (word 1305 4416 1429 4477 \"OF\")\n",
+                "  (word 1480 4416 1922 4480 \"IRANIAN\")\n",
+                "  (word 1972 4416 2612 4478 \"LITERATURE\")))\n",
+            )
+        );
+    }
+
+    #[test]
+    fn extract_document_text_pages_preserves_empty_pages() {
+        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
+
+        let pages =
+            extract_document_text_pages(RYPKA, 1, Some(3)).expect("text range should extract");
+
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0].page_number, 1);
+        assert_eq!(pages[0].text, "");
+        assert_eq!(pages[2].page_number, 3);
+        assert_eq!(pages[2].text, "HISTORY OF IRANIAN LITERATURE \n");
+    }
+
+    #[test]
+    fn extract_document_text_rejects_invalid_ranges() {
+        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
+
+        assert!(matches!(
+            extract_document_text(RYPKA, 0, None),
+            Err(TextError::ZeroFromPage)
+        ));
+        assert!(matches!(
+            extract_document_text(RYPKA, 3, Some(2)),
+            Err(TextError::ReversedPageRange)
+        ));
+        assert!(matches!(
+            extract_document_text(RYPKA, 962, None),
+            Err(TextError::PageOutOfRange {
+                page: 962,
+                page_count: 961
+            })
+        ));
     }
 }

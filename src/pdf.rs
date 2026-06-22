@@ -1,9 +1,13 @@
 use crate::{
-    BzzError, DjvuPageRenderEvent, DjvuRenderError, PageRenderMode, ParseError, RenderError,
+    Bookmark, BzzError, DjvuRenderError, Document, PageRenderMode, ParseError, RenderError,
+    TextError, TextZone, TextZoneKind, decode_dirm_tail, extract_document_bookmarks,
+    extract_document_text_zone_pages, parse_dirm_tail,
     render::{PageBitmap, PartialPageRender, PixelFormat},
-    render_document_pages_with_events,
 };
-use std::fmt;
+use std::{
+    collections::BTreeMap,
+    fmt::{self, Write as _},
+};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PdfError(String);
@@ -18,6 +22,8 @@ pub enum DjvuPdfError {
     Parse(#[from] ParseError),
     #[error("{0}")]
     Bzz(#[from] BzzError),
+    #[error("{0}")]
+    Text(#[from] TextError),
     #[error("{0}")]
     Render(#[from] RenderError),
     #[error("{0}")]
@@ -51,6 +57,10 @@ pub enum DjvuPdfRenderEvent<'a> {
         page_number: usize,
         end_page: usize,
     },
+    PageImagePrepared {
+        page_number: usize,
+        image: &'a PdfPageImage,
+    },
     PageRendered {
         page_number: usize,
         render: &'a PartialPageRender,
@@ -71,6 +81,40 @@ pub enum PdfPageImage {
         dpi: u16,
         mask: Vec<u8>,
     },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PdfBookmark {
+    pub title: String,
+    pub page_index: usize,
+    pub children: Vec<Self>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct NumberedPdfBookmark {
+    id: usize,
+    title: String,
+    page_index: usize,
+    children: Vec<Self>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PdfTextPage {
+    spans: Vec<PdfTextSpan>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PdfTextSpan {
+    text: String,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PdfTextEncoding {
+    custom_codes: BTreeMap<char, u8>,
 }
 
 impl PdfError {
@@ -135,23 +179,92 @@ where
     I: IntoIterator<Item = Result<PdfPageImage, E>>,
     E: From<PdfError>,
 {
+    write_page_image_pdf_iter_with_bookmarks_and_text(page_count, pages, &[], None)
+}
+
+fn write_page_image_pdf_iter_with_bookmarks<I, E>(
+    page_count: usize,
+    pages: I,
+    bookmarks: &[PdfBookmark],
+) -> Result<Vec<u8>, E>
+where
+    I: IntoIterator<Item = Result<PdfPageImage, E>>,
+    E: From<PdfError>,
+{
+    write_page_image_pdf_iter_with_bookmarks_and_text(page_count, pages, bookmarks, None)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "PDF object numbering and serialization are kept together for consistency"
+)]
+fn write_page_image_pdf_iter_with_bookmarks_and_text<I, E>(
+    page_count: usize,
+    pages: I,
+    bookmarks: &[PdfBookmark],
+    text_pages: Option<&[PdfTextPage]>,
+) -> Result<Vec<u8>, E>
+where
+    I: IntoIterator<Item = Result<PdfPageImage, E>>,
+    E: From<PdfError>,
+{
     if page_count == 0 {
         return Err(PdfError::new("cannot write a PDF with no pages").into());
+    }
+    if let Some(text_pages) = text_pages
+        && text_pages.len() != page_count
+    {
+        return Err(PdfError::new(format!(
+            "PDF text layer has {} pages, expected {page_count}",
+            text_pages.len()
+        ))
+        .into());
     }
     let catalog_id = 1;
     let pages_id = 2;
     let first_page_id = 3;
     let first_content_id = first_page_id + page_count;
     let first_image_id = first_content_id + page_count;
+    let has_text_layer =
+        text_pages.is_some_and(|pages| pages.iter().any(|page| !page.spans.is_empty()));
+    let text_encoding = if has_text_layer {
+        Some(PdfTextEncoding::from_pages(text_pages.expect(
+            "text pages should exist when text layer is present",
+        ))?)
+    } else {
+        None
+    };
+    let font_id = first_image_id + page_count;
+    let to_unicode_id = font_id + 1;
+    let text_object_count = if has_text_layer { 2 } else { 0 };
+    let outline_root_id = first_image_id + page_count + text_object_count;
+    let first_outline_item_id = outline_root_id + 1;
+    let outline_item_count = count_pdf_bookmarks(bookmarks);
+    let has_outline = outline_item_count != 0;
+    let numbered_bookmarks = if has_outline {
+        let mut next_id = first_outline_item_id;
+        number_pdf_bookmarks(bookmarks, &mut next_id)
+    } else {
+        Vec::new()
+    };
+    let max_object_id = if has_outline {
+        first_outline_item_id + outline_item_count - 1
+    } else if has_text_layer {
+        to_unicode_id
+    } else {
+        first_image_id + page_count - 1
+    };
     let mut pdf = b"%PDF-1.4\n%\xff\xff\xff\xff\n".to_vec();
-    let mut offsets = vec![0usize; first_image_id + page_count];
+    let mut offsets = vec![0usize; max_object_id + 1];
 
-    append_pdf_object(
-        &mut pdf,
-        &mut offsets,
-        catalog_id,
-        format!("<< /Type /Catalog /Pages {pages_id} 0 R >>").as_bytes(),
-    );
+    let catalog = if has_outline {
+        format!(
+            "<< /Type /Catalog /Pages {pages_id} 0 R /Outlines {outline_root_id} 0 R /PageMode /UseOutlines >>"
+        )
+    } else {
+        format!("<< /Type /Catalog /Pages {pages_id} 0 R >>")
+    };
+    append_pdf_object(&mut pdf, &mut offsets, catalog_id, catalog.as_bytes());
 
     let kids = (0..page_count)
         .map(|index| format!("{} 0 R", first_page_id + index))
@@ -181,16 +294,29 @@ where
         let image_name = format!("Im{}", index + 1);
         let width_points = points_from_pixels(page_image.width(), page_image.dpi());
         let height_points = points_from_pixels(page_image.height(), page_image.dpi());
+        let font_resource = if has_text_layer {
+            format!(" /Font << /Ftxt {font_id} 0 R >>")
+        } else {
+            String::new()
+        };
         let page = format!(
-            "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {width_points} {height_points}] /Resources << /XObject << /{image_name} {image_id} 0 R >> >> /Contents {content_id} 0 R >>"
+            "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {width_points} {height_points}] /Resources << /XObject << /{image_name} {image_id} 0 R >>{font_resource} >> /Contents {content_id} 0 R >>"
         );
         append_pdf_object(&mut pdf, &mut offsets, page_object_id, page.as_bytes());
 
-        let content = if page_image.is_bitonal_mask() {
-            format!("q\n0 g\n{width_points} 0 0 {height_points} 0 0 cm\n/{image_name} Do\nQ\n")
+        let mut content = if page_image.is_bitonal_mask() {
+            format!(
+                "q\n1 g\n0 0 {width_points} {height_points} re f\n0 g\n{width_points} 0 0 {height_points} 0 0 cm\n/{image_name} Do\nQ\n"
+            )
         } else {
             format!("q\n{width_points} 0 0 {height_points} 0 0 cm\n/{image_name} Do\nQ\n")
         };
+        if let (Some(text_page), Some(text_encoding)) = (
+            text_pages.and_then(|pages| pages.get(index)),
+            text_encoding.as_ref(),
+        ) {
+            append_pdf_text_layer(&mut content, text_page, page_image.dpi(), text_encoding);
+        }
         let content_stream = stream_object(&[], content.as_bytes());
         append_pdf_object(&mut pdf, &mut offsets, content_id, &content_stream);
 
@@ -206,13 +332,45 @@ where
         .into());
     }
 
+    if has_text_layer {
+        append_pdf_object(
+            &mut pdf,
+            &mut offsets,
+            font_id,
+            format!(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode {to_unicode_id} 0 R >>"
+            )
+            .as_bytes(),
+        );
+        let to_unicode_stream = stream_object(
+            &[],
+            pdf_to_unicode_cmap(
+                text_encoding
+                    .as_ref()
+                    .expect("text encoding should exist when writing text layer"),
+            )
+            .as_bytes(),
+        );
+        append_pdf_object(&mut pdf, &mut offsets, to_unicode_id, &to_unicode_stream);
+    }
+
+    if has_outline {
+        append_pdf_outlines(
+            &mut pdf,
+            &mut offsets,
+            outline_root_id,
+            first_page_id,
+            &numbered_bookmarks,
+        );
+    }
+
     Ok(finish_pdf(pdf, &offsets, catalog_id))
 }
 
 /// Writes a PDF from an iterator of rendered pages.
 ///
 /// This preserves the same image embedding choices as [`PdfPageImage::from_render`]:
-/// bitonal-only renders can become 1-bit image masks, while renders containing
+/// bitonal-only renders can become 1-bit grayscale images, while renders containing
 /// IW44 layers are embedded as RGB images.
 ///
 /// # Errors
@@ -225,11 +383,24 @@ where
     I: IntoIterator<Item = Result<PartialPageRender, E>>,
     E: From<PdfError>,
 {
-    write_page_image_pdf_iter(
+    write_rendered_pages_pdf_iter_with_bookmarks(page_count, renders, &[])
+}
+
+fn write_rendered_pages_pdf_iter_with_bookmarks<I, E>(
+    page_count: usize,
+    renders: I,
+    bookmarks: &[PdfBookmark],
+) -> Result<Vec<u8>, E>
+where
+    I: IntoIterator<Item = Result<PartialPageRender, E>>,
+    E: From<PdfError>,
+{
+    write_page_image_pdf_iter_with_bookmarks(
         page_count,
         renders
             .into_iter()
             .map(|render| render.map(|render| PdfPageImage::from_render(&render))),
+        bookmarks,
     )
 }
 
@@ -253,9 +424,10 @@ pub fn render_document_pdf(
 
 /// Renders a `DjVu` document byte slice to a PDF, reporting page-level events.
 ///
-/// The event callback is invoked before each selected page is rendered and
-/// after the page's compositor output is available. The rendered page reference
-/// passed to `PageRendered` is valid only for the duration of the callback.
+/// The event callback is invoked before each selected page is prepared. Pages
+/// that can be embedded directly as 1-bit images emit `PageImagePrepared`.
+/// Fallback pages emit `PageRendered` after compositor output is available. Any
+/// borrowed event payload is valid only for the duration of the callback.
 ///
 /// # Errors
 ///
@@ -268,35 +440,485 @@ pub fn render_document_pdf_with_events(
     to_page: Option<usize>,
     mut event: impl FnMut(DjvuPdfRenderEvent<'_>),
 ) -> DjvuPdfResult<Vec<u8>> {
-    let renders = render_document_pages_with_events(
-        bytes,
-        from_page,
-        to_page,
-        PageRenderMode::Full,
-        |item| match item {
-            DjvuPageRenderEvent::PageStarted {
-                page_number,
-                end_page,
-            } => event(DjvuPdfRenderEvent::PageStarted {
-                page_number,
-                end_page,
-            }),
-            DjvuPageRenderEvent::PageRendered {
-                page_number,
-                render,
-            } => event(DjvuPdfRenderEvent::PageRendered {
-                page_number,
-                render,
-            }),
-        },
-    )?;
+    let document = Document::parse(bytes)?;
+    let decoded_tail;
+    let tail_entries = if let Some(dirm) = &document.directory {
+        decoded_tail = decode_dirm_tail(bytes, dirm)?;
+        parse_dirm_tail(dirm, &decoded_tail)?
+    } else {
+        Vec::new()
+    };
+    let page_count = document.form_kind_counts().pages;
+    let end_page = checked_document_pdf_page_range(page_count, from_page, to_page)?;
+    let bookmarks = extract_document_bookmarks(bytes)?.map_or_else(Vec::new, |bookmarks| {
+        pdf_bookmarks_from_djvu(&bookmarks, from_page, end_page)
+    });
+    let text_pages = pdf_text_pages_from_djvu(bytes, from_page, Some(end_page))?;
+    let mut page_images = Vec::new();
 
-    write_rendered_pages_pdf_iter(
-        renders.len(),
-        renders
+    for (index, page) in document.pages(bytes).enumerate() {
+        let page_number = index + 1;
+        if page_number < from_page || page_number > end_page {
+            continue;
+        }
+
+        event(DjvuPdfRenderEvent::PageStarted {
+            page_number,
+            end_page,
+        });
+        let page = page?;
+        let plan = document.page_render_plan(bytes, &page, &tail_entries)?;
+        if let Some(image) = direct_bitonal_pdf_page_image(bytes, &plan)? {
+            event(DjvuPdfRenderEvent::PageImagePrepared {
+                page_number,
+                image: &image,
+            });
+            page_images.push(image);
+            continue;
+        }
+
+        let render = plan.render_bitmap_with_mode(bytes, PageRenderMode::Full)?;
+        event(DjvuPdfRenderEvent::PageRendered {
+            page_number,
+            render: &render,
+        });
+        page_images.push(PdfPageImage::from_render(&render));
+    }
+
+    if page_images.is_empty() {
+        return Err(DjvuPdfError::PageOutOfRange {
+            page: from_page,
+            page_count,
+        });
+    }
+
+    write_page_image_pdf_iter_with_bookmarks_and_text(
+        page_images.len(),
+        page_images
             .into_iter()
-            .map(|page| Ok::<PartialPageRender, DjvuPdfError>(page.render)),
+            .map(Ok::<PdfPageImage, DjvuPdfError>),
+        &bookmarks,
+        Some(&text_pages),
     )
+}
+
+fn checked_document_pdf_page_range(
+    page_count: usize,
+    from_page: usize,
+    to_page: Option<usize>,
+) -> DjvuPdfResult<usize> {
+    if from_page == 0 {
+        return Err(DjvuPdfError::ZeroFromPage);
+    }
+    if let Some(to_page) = to_page
+        && to_page < from_page
+    {
+        return Err(DjvuPdfError::ReversedPageRange);
+    }
+
+    let end_page = to_page.unwrap_or(page_count);
+    if from_page > page_count {
+        return Err(DjvuPdfError::PageOutOfRange {
+            page: from_page,
+            page_count,
+        });
+    }
+    if end_page > page_count {
+        return Err(DjvuPdfError::PageOutOfRange {
+            page: end_page,
+            page_count,
+        });
+    }
+
+    Ok(end_page)
+}
+
+fn direct_bitonal_pdf_page_image(
+    bytes: &[u8],
+    plan: &crate::PageRenderPlan<'_>,
+) -> Result<Option<PdfPageImage>, RenderError> {
+    if !plan.background_layers.is_empty() || !plan.foreground_layers.is_empty() {
+        return Ok(None);
+    }
+
+    let masks = plan.bitonal_masks(bytes).map_err(RenderError::from)?;
+    let [(.., partial)] = masks.as_slice() else {
+        return Ok(None);
+    };
+    if partial.mask.width != u32::from(plan.info.width)
+        || partial.mask.height != u32::from(plan.info.height)
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(PdfPageImage::BitonalMask {
+        width: partial.mask.width,
+        height: partial.mask.height,
+        dpi: plan.info.dpi,
+        mask: partial.mask.to_image_mask_bytes(),
+    }))
+}
+
+fn pdf_text_pages_from_djvu(
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+) -> DjvuPdfResult<Vec<PdfTextPage>> {
+    extract_document_text_zone_pages(bytes, from_page, to_page)?
+        .iter()
+        .map(|page| {
+            let mut spans = Vec::new();
+            if let Some(zone) = &page.zone {
+                collect_pdf_text_spans(zone, &page.text, zone.height, &mut spans);
+            }
+            Ok(PdfTextPage { spans })
+        })
+        .collect()
+}
+
+fn collect_pdf_text_spans(
+    zone: &TextZone,
+    text: &str,
+    page_height: i32,
+    spans: &mut Vec<PdfTextSpan>,
+) {
+    if matches!(zone.kind, TextZoneKind::Line) {
+        let mut words = Vec::new();
+        collect_pdf_line_words(zone, text, &mut words);
+        let line = words.join(" ");
+        if !line.is_empty() {
+            spans.push(PdfTextSpan {
+                text: line,
+                x: zone.x_min(),
+                y: zone.y_min(page_height),
+                width: zone.width,
+                height: zone.height,
+            });
+        }
+        return;
+    }
+
+    if matches!(zone.kind, TextZoneKind::Word) {
+        let word = pdf_text_zone_word(zone, text);
+        if !word.is_empty() {
+            spans.push(PdfTextSpan {
+                text: word,
+                x: zone.x_min(),
+                y: zone.y_min(page_height),
+                width: zone.width,
+                height: zone.height,
+            });
+        }
+        return;
+    }
+
+    for child in &zone.children {
+        collect_pdf_text_spans(child, text, page_height, spans);
+    }
+}
+
+fn collect_pdf_line_words(zone: &TextZone, text: &str, words: &mut Vec<String>) {
+    if matches!(zone.kind, TextZoneKind::Word) {
+        let word = pdf_text_zone_word(zone, text);
+        if !word.is_empty() {
+            words.push(word);
+        }
+        return;
+    }
+
+    for child in &zone.children {
+        collect_pdf_line_words(child, text, words);
+    }
+}
+
+fn pdf_text_zone_word(zone: &TextZone, text: &str) -> String {
+    text.get(zone.text_start..zone.text_end())
+        .unwrap_or("")
+        .trim_end()
+        .to_string()
+}
+
+fn pdf_bookmarks_from_djvu(
+    bookmarks: &[Bookmark],
+    from_page: usize,
+    end_page: usize,
+) -> Vec<PdfBookmark> {
+    let mut pdf_bookmarks = Vec::new();
+    for bookmark in bookmarks {
+        let children = pdf_bookmarks_from_djvu(&bookmark.children, from_page, end_page);
+        match djvu_bookmark_page(&bookmark.url) {
+            Some(page) if (from_page..=end_page).contains(&page) => {
+                pdf_bookmarks.push(PdfBookmark {
+                    title: bookmark.title.clone(),
+                    page_index: page - from_page,
+                    children,
+                });
+            }
+            _ => pdf_bookmarks.extend(children),
+        }
+    }
+
+    pdf_bookmarks
+}
+
+fn djvu_bookmark_page(url: &str) -> Option<usize> {
+    url.strip_prefix('#')?.parse().ok()
+}
+
+fn append_pdf_text_layer(
+    content: &mut String,
+    page: &PdfTextPage,
+    dpi: u16,
+    encoding: &PdfTextEncoding,
+) {
+    if page.spans.is_empty() {
+        return;
+    }
+
+    content.push_str("q\nBT\n3 Tr\n/Ftxt 1 Tf\n");
+    for span in &page.spans {
+        let x = points_from_signed_pixels(span.x, dpi);
+        let y = points_from_signed_pixels(span.y, dpi);
+        let height = points_from_signed_pixels(span.height.max(1), dpi);
+        let encoded_text = encoding.encode(&span.text);
+        write!(
+            content,
+            "/Span << /ActualText {} >> BDC\n{height} 0 0 {height} {x} {y} Tm\n{} Tj\nEMC\n",
+            pdf_text_string(&span.text),
+            pdf_literal_bytes(&encoded_text),
+        )
+        .expect("writing to string should not fail");
+    }
+    content.push_str("ET\nQ\n");
+}
+
+fn pdf_literal_bytes(value: &[u8]) -> String {
+    let mut escaped = String::from("(");
+    for byte in value {
+        match *byte {
+            b'(' => escaped.push_str("\\("),
+            b')' => escaped.push_str("\\)"),
+            b'\\' => escaped.push_str("\\\\"),
+            b'\n' => escaped.push_str("\\n"),
+            b'\r' => escaped.push_str("\\r"),
+            b'\t' => escaped.push_str("\\t"),
+            0x20..=0x7e => escaped.push(char::from(*byte)),
+            _ => write!(&mut escaped, "\\{byte:03o}").expect("writing to string should not fail"),
+        }
+    }
+    escaped.push(')');
+
+    escaped
+}
+
+fn count_pdf_bookmarks(bookmarks: &[PdfBookmark]) -> usize {
+    bookmarks
+        .iter()
+        .map(|bookmark| 1 + count_pdf_bookmarks(&bookmark.children))
+        .sum()
+}
+
+fn number_pdf_bookmarks(
+    bookmarks: &[PdfBookmark],
+    next_id: &mut usize,
+) -> Vec<NumberedPdfBookmark> {
+    bookmarks
+        .iter()
+        .map(|bookmark| {
+            let id = *next_id;
+            *next_id += 1;
+            let children = number_pdf_bookmarks(&bookmark.children, next_id);
+            NumberedPdfBookmark {
+                id,
+                title: bookmark.title.clone(),
+                page_index: bookmark.page_index,
+                children,
+            }
+        })
+        .collect()
+}
+
+fn append_pdf_outlines(
+    pdf: &mut Vec<u8>,
+    offsets: &mut [usize],
+    root_id: usize,
+    first_page_id: usize,
+    bookmarks: &[NumberedPdfBookmark],
+) {
+    let first_id = bookmarks
+        .first()
+        .expect("outline root should have at least one bookmark")
+        .id;
+    let last_id = bookmarks
+        .last()
+        .expect("outline root should have at least one bookmark")
+        .id;
+    let count = count_numbered_pdf_bookmarks(bookmarks);
+    append_pdf_object(
+        pdf,
+        offsets,
+        root_id,
+        format!("<< /Type /Outlines /First {first_id} 0 R /Last {last_id} 0 R /Count {count} >>")
+            .as_bytes(),
+    );
+    append_pdf_outline_items(pdf, offsets, root_id, first_page_id, bookmarks);
+}
+
+fn append_pdf_outline_items(
+    pdf: &mut Vec<u8>,
+    offsets: &mut [usize],
+    parent_id: usize,
+    first_page_id: usize,
+    bookmarks: &[NumberedPdfBookmark],
+) {
+    for (index, bookmark) in bookmarks.iter().enumerate() {
+        let mut dictionary = format!(
+            "<< /Title {} /Parent {parent_id} 0 R /Dest [{} 0 R /Fit]",
+            pdf_text_string(&bookmark.title),
+            first_page_id + bookmark.page_index
+        );
+        if let Some(previous) = index.checked_sub(1).and_then(|index| bookmarks.get(index)) {
+            write!(&mut dictionary, " /Prev {} 0 R", previous.id)
+                .expect("writing to string should not fail");
+        }
+        if let Some(next) = bookmarks.get(index + 1) {
+            write!(&mut dictionary, " /Next {} 0 R", next.id)
+                .expect("writing to string should not fail");
+        }
+        if let Some(first_child) = bookmark.children.first() {
+            let last_child = bookmark
+                .children
+                .last()
+                .expect("non-empty child list should have last child");
+            let child_count = count_numbered_pdf_bookmarks(&bookmark.children);
+            write!(
+                &mut dictionary,
+                " /First {} 0 R /Last {} 0 R /Count {child_count}",
+                first_child.id, last_child.id
+            )
+            .expect("writing to string should not fail");
+        }
+        dictionary.push_str(" >>");
+        append_pdf_object(pdf, offsets, bookmark.id, dictionary.as_bytes());
+        append_pdf_outline_items(pdf, offsets, bookmark.id, first_page_id, &bookmark.children);
+    }
+}
+
+fn count_numbered_pdf_bookmarks(bookmarks: &[NumberedPdfBookmark]) -> usize {
+    bookmarks
+        .iter()
+        .map(|bookmark| 1 + count_numbered_pdf_bookmarks(&bookmark.children))
+        .sum()
+}
+
+fn pdf_text_string(value: &str) -> String {
+    let mut hex = String::from("<FEFF");
+    for unit in value.encode_utf16() {
+        write!(&mut hex, "{unit:04X}").expect("writing to string should not fail");
+    }
+    hex.push('>');
+
+    hex
+}
+
+impl PdfTextEncoding {
+    fn from_pages(pages: &[PdfTextPage]) -> PdfResult<Self> {
+        let mut custom_codes = BTreeMap::new();
+        let mut next_code = 0x80u8;
+        for span in pages.iter().flat_map(|page| &page.spans) {
+            for character in span.text.chars() {
+                if character.is_ascii_graphic() || character == ' ' {
+                    continue;
+                }
+                if custom_codes.contains_key(&character) {
+                    continue;
+                }
+                custom_codes.insert(character, next_code);
+                next_code = next_code.checked_add(1).ok_or_else(|| {
+                    PdfError::new("PDF text layer uses more than 128 non-ASCII characters")
+                })?;
+            }
+        }
+
+        Ok(Self { custom_codes })
+    }
+
+    fn encode(&self, value: &str) -> Vec<u8> {
+        value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_graphic() || character == ' ' {
+                    u8::try_from(u32::from(character)).expect("ASCII character should fit in u8")
+                } else {
+                    self.custom_codes
+                        .get(&character)
+                        .copied()
+                        .expect("PDF text character should have a custom encoding")
+                }
+            })
+            .collect()
+    }
+
+    fn unicode_entries(&self) -> Vec<(u8, char)> {
+        let mut entries = (0x20u8..=0x7e)
+            .map(|code| (code, char::from(code)))
+            .collect::<Vec<_>>();
+        entries.extend(
+            self.custom_codes
+                .iter()
+                .map(|(character, code)| (*code, *character)),
+        );
+        entries.sort_by_key(|(code, _)| *code);
+        entries
+    }
+}
+
+fn pdf_to_unicode_cmap(encoding: &PdfTextEncoding) -> String {
+    let entries = encoding.unicode_entries();
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n\
+         12 dict begin\n\
+         begincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /DjvulpesText def\n\
+         /CMapType 2 def\n\
+         1 begincodespacerange\n\
+         <20> <FF>\n\
+         endcodespacerange\n",
+    );
+
+    for chunk in entries.chunks(100) {
+        writeln!(&mut cmap, "{} beginbfchar", chunk.len())
+            .expect("writing to string should not fail");
+        for (code, character) in chunk {
+            writeln!(
+                &mut cmap,
+                "<{code:02X}> <{}>",
+                pdf_utf16be_hex_char(*character)
+            )
+            .expect("writing to string should not fail");
+        }
+        cmap.push_str("endbfchar\n");
+    }
+
+    cmap.push_str(
+        "endcmap\n\
+         CMapName currentdict /CMap defineresource pop\n\
+         end\n\
+         end",
+    );
+
+    cmap
+}
+
+fn pdf_utf16be_hex_char(character: char) -> String {
+    let mut hex = String::new();
+    let mut units = [0u16; 2];
+    for unit in character.encode_utf16(&mut units) {
+        write!(&mut hex, "{unit:04X}").expect("writing to string should not fail");
+    }
+
+    hex
 }
 
 impl PdfPageImage {
@@ -376,7 +998,7 @@ impl PdfPageImage {
                 ..
             } => (
                 format!(
-                    "/Type /XObject /Subtype /Image /Width {width} /Height {height} /ImageMask true /BitsPerComponent 1"
+                    "/Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]"
                 ),
                 mask,
             ),
@@ -460,6 +1082,11 @@ fn bitonal_len(width: u32, height: u32) -> PdfResult<usize> {
 fn points_from_pixels(pixels: u32, dpi: u16) -> String {
     let dpi = u32::from(dpi.max(1));
     let points = f64::from(pixels) * 72.0 / f64::from(dpi);
+    format!("{points:.4}")
+}
+
+fn points_from_signed_pixels(pixels: i32, dpi: u16) -> String {
+    let points = f64::from(pixels) * 72.0 / f64::from(dpi.max(1));
     format!("{points:.4}")
 }
 
@@ -615,9 +1242,10 @@ mod tests {
         let text = String::from_utf8_lossy(&pdf);
 
         assert!(text.contains("/MediaBox [0 0 32.0000 1.0000]"));
-        assert!(text.contains("/ImageMask true /BitsPerComponent 1"));
+        assert!(text.contains("/ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]"));
         assert!(text.contains("/Filter /RunLengthDecode"));
         assert!(text.contains("/Length 3"));
+        assert!(text.contains("1 g\n0 0 32.0000 1.0000 re f\n0 g"));
         assert!(text.contains("0 g\n32.0000 0 0 1.0000 0 0 cm"));
         assert!(pdf.windows(3).any(|window| window == [253, 0, 128]));
     }
@@ -647,7 +1275,44 @@ mod tests {
 
         assert!(text.contains("/Type /Pages /Count 2 /Kids [3 0 R 4 0 R]"));
         assert!(text.contains("/ColorSpace /DeviceRGB /BitsPerComponent 8"));
-        assert!(text.contains("/ImageMask true /BitsPerComponent 1"));
+        assert!(text.contains("/ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]"));
+    }
+
+    #[test]
+    fn write_page_image_pdf_iter_embeds_bookmark_outline() {
+        let page = PdfPageImage::Rgb8 {
+            width: 1,
+            height: 1,
+            dpi: 72,
+            pixels: vec![0, 0, 0],
+        };
+        let bookmarks = [PdfBookmark {
+            title: "Root".to_string(),
+            page_index: 0,
+            children: vec![PdfBookmark {
+                title: "Child".to_string(),
+                page_index: 0,
+                children: Vec::new(),
+            }],
+        }];
+
+        let pdf = write_page_image_pdf_iter_with_bookmarks(
+            1,
+            [Ok::<PdfPageImage, PdfError>(page)],
+            &bookmarks,
+        )
+        .expect("PDF with outline should serialize");
+        let text = String::from_utf8_lossy(&pdf);
+
+        assert!(
+            text.contains("/Type /Catalog /Pages 2 0 R /Outlines 6 0 R /PageMode /UseOutlines")
+        );
+        assert!(text.contains("6 0 obj\n<< /Type /Outlines /First 7 0 R /Last 7 0 R /Count 2 >>"));
+        assert!(text.contains("7 0 obj\n<< /Title <FEFF0052006F006F0074> /Parent 6 0 R /Dest [3 0 R /Fit] /First 8 0 R /Last 8 0 R /Count 1 >>"));
+        assert!(text.contains(
+            "8 0 obj\n<< /Title <FEFF004300680069006C0064> /Parent 7 0 R /Dest [3 0 R /Fit] >>"
+        ));
+        assert!(text.contains("xref\n0 9\n"));
     }
 
     #[test]
@@ -677,7 +1342,16 @@ mod tests {
                 page_number,
                 end_page,
             } => {
-                events.push((page_number, end_page, false, 0, 0));
+                events.push((page_number, end_page, "started", 0, 0));
+            }
+            DjvuPdfRenderEvent::PageImagePrepared { page_number, image } => {
+                events.push((
+                    page_number,
+                    page_number,
+                    "prepared",
+                    image.width(),
+                    image.height(),
+                ));
             }
             DjvuPdfRenderEvent::PageRendered {
                 page_number,
@@ -686,7 +1360,7 @@ mod tests {
                 events.push((
                     page_number,
                     page_number,
-                    true,
+                    "rendered",
                     render.bitmap.width,
                     render.bitmap.height,
                 ));
@@ -695,9 +1369,12 @@ mod tests {
         .expect("fixture page should render to PDF");
         let text = String::from_utf8_lossy(&pdf);
 
-        assert_eq!(events, [(68, 68, false, 0, 0), (68, 68, true, 3423, 5075),]);
+        assert_eq!(
+            events,
+            [(68, 68, "started", 0, 0), (68, 68, "prepared", 3423, 5075),]
+        );
         assert!(text.contains("/Type /Pages /Count 1"));
-        assert!(text.contains("/ImageMask true /BitsPerComponent 1"));
+        assert!(text.contains("/ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]"));
     }
 
     #[test]
@@ -711,6 +1388,66 @@ mod tests {
         assert!(text.contains("/ColorSpace /DeviceRGB /BitsPerComponent 8"));
         assert!(!text.contains("/ImageMask true"));
         assert!(pdf.ends_with(b"%%EOF\n"));
+    }
+
+    #[test]
+    fn render_document_pdf_embeds_rypka_navm_outline_for_selected_range() {
+        let pdf = render_document_pdf(RYPKA, 1, Some(1)).expect("cover page should render to PDF");
+        let text = String::from_utf8_lossy(&pdf);
+
+        assert!(text.contains("/Outlines "));
+        assert!(text.contains("/PageMode /UseOutlines"));
+        assert!(text.contains("/Count 1"));
+        assert!(text.contains("/Title <FEFF0043006F0076006500720020>"));
+        assert!(text.contains("/Dest [3 0 R /Fit]"));
+    }
+
+    #[test]
+    fn render_document_pdf_embeds_unicode_navm_outline_title() {
+        let pdf =
+            render_document_pdf(RYPKA, 33, Some(33)).expect("unicode outline page should render");
+        let text = String::from_utf8_lossy(&pdf);
+
+        assert!(text.contains("/Outlines "));
+        assert!(text.contains(
+            "/Title <FEFF004F00540041004B004100520020004B004C00CD004D0041003A0020004100560045005300540041002E00200041004E004300490045004E00540020005000450052005300490041004E00200049004E0053004300520049005000540049004F004E0053002E0020004D004900440044004C00450020005000450052005300490041004E0020004C0049005400450052004100540055005200450020>"
+        ));
+    }
+
+    #[test]
+    fn render_document_pdf_embeds_searchable_text_layer() {
+        let pdf = render_document_pdf(RYPKA, 3, Some(3)).expect("text page should render to PDF");
+        let text = String::from_utf8_lossy(&pdf);
+
+        assert!(text.contains("/Font << /Ftxt "));
+        assert!(text.contains(
+            "/Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode "
+        ));
+        assert!(text.contains("/CMapName /DjvulpesText"));
+        assert!(text.contains("<41> <0041>"));
+        assert!(text.contains("3 Tr\n/Ftxt 1 Tf"));
+        assert!(text.contains(
+            "/ActualText <FEFF0048004900530054004F005200590020004F00460020004900520041004E00490041004E0020004C004900540045005200410054005500520045>"
+        ));
+    }
+
+    #[test]
+    fn render_document_pdf_embeds_unicode_actual_text() {
+        let pdf = render_document_pdf(RYPKA, 7, Some(7)).expect("unicode text page should render");
+        let text = String::from_utf8_lossy(&pdf);
+
+        assert!(text.contains(
+            "/ActualText <FEFF004F00540041004B004100520020004B004C00CD004D0041002C00200056011A005200410020004B0055004200CD010C004B004F005600C1002C002000460045004C00490058002000540041005500450052002C>"
+        ));
+    }
+
+    #[test]
+    fn render_document_pdf_omits_outline_when_selected_range_has_no_bookmarks() {
+        let pdf = render_document_pdf(RYPKA, 2, Some(2)).expect("single page should render to PDF");
+        let text = String::from_utf8_lossy(&pdf);
+
+        assert!(!text.contains("/Outlines "));
+        assert!(!text.contains("/PageMode /UseOutlines"));
     }
 
     #[test]

@@ -19,6 +19,18 @@ pub struct DirmTailEntry<'a> {
     pub name: &'a str,
 }
 
+impl DirmTailEntry<'_> {
+    #[must_use]
+    pub const fn is_page(&self) -> bool {
+        self.flags & 0x01 != 0
+    }
+
+    #[must_use]
+    pub const fn is_shared(&self) -> bool {
+        !self.is_page()
+    }
+}
+
 impl Dirm {
     #[must_use]
     pub const fn compressed_tail_end(&self) -> usize {
@@ -179,6 +191,16 @@ mod tests {
                     name: "shared.djbz",
                 },
             ]
+        );
+        assert!(entries.iter().all(DirmTailEntry::is_shared));
+        assert!(
+            DirmTailEntry {
+                offset: 200,
+                size: 42,
+                flags: 1,
+                name: "page.djvu",
+            }
+            .is_page()
         );
     }
 

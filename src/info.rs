@@ -11,6 +11,30 @@ pub struct PageInfo {
     pub rotation: u8,
 }
 
+impl PageInfo {
+    /// Returns the raw `DjVu` orientation flag, normalized like `DjVuLibre`.
+    ///
+    /// `DjVuLibre` documents `{1, 6, 2, 5}` as the valid `INFO` orientation
+    /// values and treats any other value as `1`, the right-side-up default.
+    #[must_use]
+    pub const fn normalized_rotation_flag(&self) -> u8 {
+        normalized_rotation_flag(self.rotation)
+    }
+
+    #[must_use]
+    pub const fn is_rightside_up(&self) -> bool {
+        self.normalized_rotation_flag() == 1
+    }
+}
+
+#[must_use]
+const fn normalized_rotation_flag(rotation: u8) -> u8 {
+    match rotation {
+        1 | 6 | 2 | 5 => rotation,
+        _ => 1,
+    }
+}
+
 /// Reads the first `INFO` chunk from a `FORM:DJVU` page, if present.
 ///
 /// # Errors
@@ -43,7 +67,7 @@ pub fn read_page_info(bytes: &[u8], form: &Form<'_>) -> ParseResult<Option<PageI
 
 #[cfg(test)]
 mod tests {
-    use super::read_page_info;
+    use super::{PageInfo, read_page_info};
     use crate::chunk::parse_form_at;
 
     fn push_chunk(bytes: &mut Vec<u8>, id: [u8; 4], payload: &[u8]) {
@@ -85,5 +109,38 @@ mod tests {
         assert_eq!(info.dpi, 600);
         assert!((info.gamma - 2.2).abs() < f32::EPSILON);
         assert_eq!(info.rotation, 1);
+        assert_eq!(info.normalized_rotation_flag(), 1);
+        assert!(info.is_rightside_up());
+    }
+
+    #[test]
+    fn page_info_normalizes_invalid_rotation_flags_to_rightside_up() {
+        let info = PageInfo {
+            width: 1,
+            height: 1,
+            version: 25,
+            dpi: 300,
+            gamma: 2.2,
+            rotation: 0,
+        };
+
+        assert_eq!(info.normalized_rotation_flag(), 1);
+        assert!(info.is_rightside_up());
+    }
+
+    #[test]
+    fn page_info_preserves_valid_rotation_flags() {
+        for flag in [1, 6, 2, 5] {
+            let info = PageInfo {
+                width: 1,
+                height: 1,
+                version: 25,
+                dpi: 300,
+                gamma: 2.2,
+                rotation: flag,
+            };
+
+            assert_eq!(info.normalized_rotation_flag(), flag);
+        }
     }
 }

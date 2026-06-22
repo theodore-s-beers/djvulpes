@@ -1,9 +1,9 @@
 use crate::commands::{
     Iw44PixelInspectOptions, Iw44PixelTrace, run_compare_ppm, run_compare_render_page,
     run_compare_render_page_layer, run_compare_render_pages, run_dirm, run_dump_bitonal,
-    run_dump_image_layers, run_form, run_forms, run_inspect_iw44_pixel, run_page, run_pages,
-    run_render_page, run_render_page_layer, run_render_page_pdf, run_render_pdf, run_render_plan,
-    run_summary, run_text,
+    run_dump_image_layers, run_extract_text, run_form, run_forms, run_inspect_iw44_pixel,
+    run_outline, run_page, run_pages, run_render_page, run_render_page_layer, run_render_page_pdf,
+    run_render_pdf, run_render_plan, run_summary, run_text,
 };
 use clap::{Parser, Subcommand};
 use djvulpes::{PageRenderMode, RenderCompareLimits};
@@ -202,6 +202,22 @@ enum Command {
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
+    /// Extract hidden text as raw djvutxt-compatible or structured djvused-style output.
+    ExtractText {
+        #[arg(long, default_value_t = 1)]
+        from_page: usize,
+        #[arg(long)]
+        to_page: Option<usize>,
+        #[arg(long)]
+        structured: bool,
+        #[arg(default_value = DEFAULT_FILE)]
+        file: PathBuf,
+    },
+    /// Print the document outline/bookmarks.
+    Outline {
+        #[arg(default_value = DEFAULT_FILE)]
+        file: PathBuf,
+    },
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -209,6 +225,10 @@ pub fn run() -> anyhow::Result<()> {
     run_command(cli.command.unwrap_or(Command::Summary { file: cli.file }))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "CLI command dispatch is intentionally centralized"
+)]
 fn run_command(command: Command) -> anyhow::Result<()> {
     if run_compare_command(&command)? {
         return Ok(());
@@ -304,6 +324,13 @@ fn run_command(command: Command) -> anyhow::Result<()> {
             zones,
             file,
         } => run_text(&file, number, zones)?,
+        Command::ExtractText {
+            from_page,
+            to_page,
+            structured,
+            file,
+        } => run_extract_text(&file, from_page, to_page, structured)?,
+        Command::Outline { file } => run_outline(&file)?,
     }
 
     Ok(())

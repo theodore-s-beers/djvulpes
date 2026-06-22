@@ -964,42 +964,47 @@ fn iw44_background_pixel(
 fn iw44_upsampled_2x_pixel(image: &Iw44RgbImage, scaled_x: u32, scaled_y: u32) -> [u8; 3] {
     let mut pixel = [0; 3];
     for (channel, component) in pixel.iter_mut().enumerate() {
-        let top = iw44_upsampled_2x_row_channel(image, scaled_x, scaled_y / 2, channel);
-        let bottom = iw44_upsampled_2x_row_channel(image, scaled_x, (scaled_y / 2) + 1, channel);
-        let previous = iw44_upsampled_2x_row_channel(
-            image,
-            scaled_x,
-            (scaled_y / 2).saturating_sub(1),
-            channel,
-        );
-        let value = if scaled_y.is_multiple_of(2) {
-            (previous + (top * 3) + 2) / 4
+        let source_x = scaled_x / 2;
+        let (left_x, right_x) = if scaled_x.is_multiple_of(2) {
+            (source_x.saturating_sub(1), source_x)
         } else {
-            ((top * 3) + bottom + 2) / 4
+            (source_x, source_x.saturating_add(1))
+        };
+        let left = iw44_upsampled_2x_col_channel(image, left_x, scaled_y, channel);
+        let right = iw44_upsampled_2x_col_channel(image, right_x, scaled_y, channel);
+        let value = if scaled_x.is_multiple_of(2) {
+            (left + (right * 3) + 2) / 4
+        } else {
+            ((left * 3) + right + 2) / 4
         };
         *component = u8::try_from(value).expect("weighted RGB value should fit u8");
     }
     pixel
 }
 
-fn iw44_upsampled_2x_row_channel(
+fn iw44_upsampled_2x_col_channel(
     image: &Iw44RgbImage,
-    scaled_x: u32,
-    source_y: u32,
+    source_x: u32,
+    scaled_y: u32,
     channel: usize,
 ) -> u16 {
-    let source_x = scaled_x / 2;
+    let source_y = scaled_y / 2;
     let current = u16::from(iw44_native_channel(image, source_x, source_y, channel));
-    if scaled_x.is_multiple_of(2) {
+    if scaled_y.is_multiple_of(2) {
         let previous = u16::from(iw44_native_channel(
             image,
-            source_x.saturating_sub(1),
-            source_y,
+            source_x,
+            source_y.saturating_sub(1),
             channel,
         ));
         (previous + (current * 3) + 2) / 4
     } else {
-        let next = u16::from(iw44_native_channel(image, source_x + 1, source_y, channel));
+        let next = u16::from(iw44_native_channel(
+            image,
+            source_x,
+            source_y.saturating_add(1),
+            channel,
+        ));
         ((current * 3) + next + 2) / 4
     }
 }
@@ -2342,6 +2347,36 @@ mod tests {
     }
 
     #[test]
+    fn render_plan_recognizes_all_rypka_effective_chunks() {
+        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
+        let document = Document::parse(RYPKA).expect("fixture DjVu should parse");
+        let decoded_tail;
+        let tail_entries = if let Some(dirm) = &document.directory {
+            decoded_tail = decode_dirm_tail(RYPKA, dirm).expect("DIRM tail should decode");
+            parse_dirm_tail(dirm, &decoded_tail).expect("DIRM tail should parse")
+        } else {
+            Vec::new()
+        };
+
+        let mut page_count = 0usize;
+        for (index, page) in document.pages(RYPKA).enumerate() {
+            let page = page.expect("fixture page should parse");
+            let plan = document
+                .page_render_plan(RYPKA, &page, &tail_entries)
+                .expect("fixture page should plan");
+            assert!(
+                plan.unknown_chunks.is_empty(),
+                "page {} has unknown effective chunks: {:?}",
+                index + 1,
+                plan.unknown_chunks
+            );
+            page_count += 1;
+        }
+
+        assert_eq!(page_count, 961);
+    }
+
+    #[test]
     fn render_plan_extracts_bitonal_payloads_by_chunk_index() {
         let mut plan = PageRenderPlan::new(
             page_info(),
@@ -2838,7 +2873,7 @@ mod tests {
                 stats.component_sum,
                 stats.fingerprint,
             ),
-            (0, 0, 2_547_446, 621_545_909, 14_319_312_755_699_683_013)
+            (0, 0, 2_547_440, 621_553_200, 9_231_463_871_951_002_652)
         );
 
         let pdf = write_bitmap_pdf(std::slice::from_ref(&render.bitmap))

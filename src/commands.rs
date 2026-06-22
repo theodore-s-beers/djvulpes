@@ -1,8 +1,11 @@
 use anyhow::{Context, bail};
 use djvulpes::{
+    Bookmark, extract_document_bookmarks, extract_document_text, format_document_text_zones,
+};
+use djvulpes::{
     Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkKind,
     PageChunkPayload, PageChunkSource, PageRenderMode, PageRenderPlan, ParseResult,
-    PartialPageRender, RenderCompareLimits, TextZone, bitmap_diff_failures,
+    PartialPageRender, PdfPageImage, RenderCompareLimits, TextZone, bitmap_diff_failures,
     bitmap_diff_region_summary, bitmap_diff_tile_summaries, parse_chunks, parse_dirm_tail,
     parse_form_at, parse_text_payload, parse_text_zones, read_page_details,
     render_document_pdf_with_events,
@@ -372,25 +375,35 @@ pub fn run_render_page_layer(
 pub fn run_render_page_pdf(path: &Path, number: usize, output: &Path) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
     let mut rendered = None;
-    let pdf = render_document_pdf_with_events(&bytes, number, Some(number), |event| {
-        if let djvulpes::DjvuPdfRenderEvent::PageRendered { render, .. } = event {
+    let mut prepared_image = None;
+    let pdf = render_document_pdf_with_events(&bytes, number, Some(number), |event| match event {
+        djvulpes::DjvuPdfRenderEvent::PageImagePrepared { image, .. } => {
+            prepared_image = Some(image.clone());
+        }
+        djvulpes::DjvuPdfRenderEvent::PageRendered { render, .. } => {
             rendered = Some(render.clone());
         }
+        djvulpes::DjvuPdfRenderEvent::PageStarted { .. } => {}
     })?;
-    let render = rendered.context("render-page-pdf did not render the requested page")?;
 
     fs::write(output, pdf).with_context(|| format!("failed to write {}", output.display()))?;
 
     println!("file: {}", path.display());
     println!("page: {number}");
-    println!(
-        "rendered: {}x{} dpi={} format=PDF",
-        render.bitmap.width, render.bitmap.height, render.bitmap.dpi
-    );
+    if let Some(render) = rendered {
+        println!(
+            "rendered: {}x{} dpi={} format=PDF",
+            render.bitmap.width, render.bitmap.height, render.bitmap.dpi
+        );
+        print_bitmap_stats(&render.bitmap);
+        print_partial_render_summary(&render.bitonal_masks);
+        print_iw44_render_summary(&render.iw44_layers);
+    } else if let Some(image) = prepared_image {
+        print_pdf_page_image_summary(&image);
+    } else {
+        bail!("render-page-pdf did not prepare the requested page");
+    }
     println!("output: {}", output.display());
-    print_bitmap_stats(&render.bitmap);
-    print_partial_render_summary(&render.bitonal_masks);
-    print_iw44_render_summary(&render.iw44_layers);
 
     Ok(())
 }
@@ -418,6 +431,11 @@ pub fn run_render_pdf(
             eprintln!("rendered page {page_number}");
             render_count += 1;
             summaries.push(render_pdf_page_summary(page_number, render));
+        }
+        djvulpes::DjvuPdfRenderEvent::PageImagePrepared { page_number, image } => {
+            eprintln!("prepared page {page_number}");
+            render_count += 1;
+            summaries.push(pdf_page_image_summary(page_number, image));
         }
     })?;
 
@@ -780,6 +798,51 @@ fn render_pdf_page_summary(page_number: usize, render: &PartialPageRender) -> St
     write_iw44_render_summary(&mut summary, &render.iw44_layers);
 
     summary
+}
+
+fn pdf_page_image_summary(page_number: usize, image: &PdfPageImage) -> String {
+    let mut summary = String::new();
+    writeln!(&mut summary, "page: {page_number}").expect("writing to string should not fail");
+    write_pdf_page_image_summary(&mut summary, image);
+
+    summary
+}
+
+fn print_pdf_page_image_summary(image: &PdfPageImage) {
+    let mut summary = String::new();
+    write_pdf_page_image_summary(&mut summary, image);
+    print!("{summary}");
+}
+
+fn write_pdf_page_image_summary(summary: &mut String, image: &PdfPageImage) {
+    match image {
+        PdfPageImage::Rgb8 {
+            width,
+            height,
+            dpi,
+            pixels,
+        } => {
+            writeln!(
+                summary,
+                "prepared: {width}x{height} dpi={dpi} format=PDF/RGB bytes={}",
+                pixels.len()
+            )
+            .expect("writing to string should not fail");
+        }
+        PdfPageImage::BitonalMask {
+            width,
+            height,
+            dpi,
+            mask,
+        } => {
+            writeln!(
+                summary,
+                "prepared: {width}x{height} dpi={dpi} format=PDF/DeviceGray1 bytes={}",
+                mask.len()
+            )
+            .expect("writing to string should not fail");
+        }
+    }
 }
 
 fn render_page_layer(
@@ -2472,8 +2535,81 @@ pub fn run_text(path: &Path, number: usize, show_zones: bool) -> anyhow::Result<
     Ok(())
 }
 
+pub fn run_extract_text(
+    path: &Path,
+    from_page: usize,
+    to_page: Option<usize>,
+    structured: bool,
+) -> anyhow::Result<()> {
+    let bytes = read_file(path)?;
+    let text = if structured {
+        format_document_text_zones(&bytes, from_page, to_page)?
+    } else {
+        extract_document_text(&bytes, from_page, to_page)?
+    };
+    print!("{text}");
+
+    Ok(())
+}
+
+pub fn run_outline(path: &Path) -> anyhow::Result<()> {
+    let bytes = read_file(path)?;
+    let Some(bookmarks) = extract_document_bookmarks(&bytes)? else {
+        return Ok(());
+    };
+
+    println!("(bookmarks");
+    for (index, bookmark) in bookmarks.iter().enumerate() {
+        let trailing_closes = usize::from(index + 1 == bookmarks.len());
+        print_bookmark(bookmark, 1, trailing_closes);
+    }
+
+    Ok(())
+}
+
 fn read_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn print_bookmark(bookmark: &Bookmark, indent: usize, trailing_closes: usize) {
+    print!("{}", " ".repeat(indent));
+    println!("(\"{}\"", escape_bookmark_string(&bookmark.title));
+    print!("{}", " ".repeat(indent + 1));
+    print!("\"{}\"", escape_bookmark_string(&bookmark.url));
+    if bookmark.children.is_empty() {
+        print!(" )");
+        for _ in 0..trailing_closes {
+            print!(" )");
+        }
+        println!();
+        return;
+    }
+
+    println!();
+    for (index, child) in bookmark.children.iter().enumerate() {
+        let child_trailing_closes = if index + 1 == bookmark.children.len() {
+            trailing_closes + 1
+        } else {
+            0
+        };
+        print_bookmark(child, indent + 1, child_trailing_closes);
+    }
+}
+
+fn escape_bookmark_string(value: &str) -> String {
+    let mut escaped = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'"' => escaped.push_str("\\\""),
+            b'\\' => escaped.push_str("\\\\"),
+            0x20..=0x7e => escaped.push(char::from(*byte)),
+            _ => {
+                write!(&mut escaped, "\\{byte:03o}").expect("writing to string should not fail");
+            }
+        }
+    }
+
+    escaped
 }
 
 fn print_root_chunk_counts(document: &Document<'_>, bytes: &[u8]) -> ParseResult<()> {
@@ -3369,7 +3505,7 @@ mod tests {
             mask,
         } = &bitonal_image
         else {
-            panic!("bitonal-only page should be embedded as an image mask");
+            panic!("bitonal-only page should be embedded as a 1-bit image");
         };
         assert_eq!((*width, *height, *dpi), (3423, 5075, 600));
         assert_eq!(mask.len(), 428 * 5075);
@@ -3399,7 +3535,9 @@ mod tests {
         let text = String::from_utf8_lossy(&pdf);
 
         assert!(text.contains("/Type /Pages /Count 2"));
-        assert!(text.contains("/Subtype /Image /Width 3423 /Height 5075 /ImageMask true"));
+        assert!(text.contains(
+            "/Subtype /Image /Width 3423 /Height 5075 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]"
+        ));
         assert!(text.contains("/Subtype /Image /Width 3486 /Height 2783"));
         assert!(text.contains("/ColorSpace /DeviceRGB /BitsPerComponent 8"));
     }
@@ -3436,7 +3574,9 @@ mod tests {
 
         assert!(text.starts_with("%PDF-1.4\n"));
         assert!(text.contains("/Type /Pages /Count 1"));
-        assert!(text.contains("/Subtype /Image /Width 3423 /Height 5075 /ImageMask true"));
+        assert!(text.contains(
+            "/Subtype /Image /Width 3423 /Height 5075 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]"
+        ));
         assert!(text.contains("/BitsPerComponent 1"));
         assert!(!text.contains("/ColorSpace /DeviceRGB"));
         assert!(pdf.ends_with(b"%%EOF\n"));
@@ -3457,7 +3597,9 @@ mod tests {
 
         assert!(text.starts_with("%PDF-1.4\n"));
         assert!(text.contains("/Type /Pages /Count 1"));
-        assert!(text.contains("/Subtype /Image /Width 3423 /Height 5075 /ImageMask true"));
+        assert!(text.contains(
+            "/Subtype /Image /Width 3423 /Height 5075 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]"
+        ));
         assert!(text.contains("/BitsPerComponent 1"));
         assert!(!text.contains("/ColorSpace /DeviceRGB"));
         assert!(pdf.ends_with(b"%%EOF\n"));
