@@ -212,13 +212,17 @@ pub fn extract_document_text(
     let mut text = String::new();
     for page in extract_document_text_pages(bytes, from_page, to_page)? {
         if !page.text.is_empty() {
-            text.push_str(&page.text);
+            push_without_nul(&mut text, &page.text);
             text.push('\n');
             text.push('\x0c');
         }
     }
 
     Ok(text)
+}
+
+fn push_without_nul(output: &mut String, text: &str) {
+    output.extend(text.chars().filter(|&character| character != '\0'));
 }
 
 /// Formats a page range as `djvused print-txt` style text-zone expressions.
@@ -235,7 +239,7 @@ pub fn format_document_text_zones(
     for page in extract_document_text_zone_pages(bytes, from_page, to_page)? {
         match &page.zone {
             Some(zone) => {
-                format_text_zone_expression(&mut output, zone, &page.text, zone.height, 0, 0);
+                format_text_zone_expression(&mut output, zone, &page.text, 0, 0);
             }
             None => output.push_str("(page 0 0 0 0 \"\")\n"),
         }
@@ -248,7 +252,6 @@ fn format_text_zone_expression(
     output: &mut String,
     zone: &TextZone,
     text: &str,
-    page_height: i32,
     depth: usize,
     trailing_closes: usize,
 ) {
@@ -261,9 +264,9 @@ fn format_text_zone_expression(
             output,
             " {} {} {} {}",
             zone.x_min(),
-            zone.y_min(page_height),
+            zone.y_min(),
             zone.x_max(),
-            zone.y_max(page_height)
+            zone.y_max()
         )
         .expect("writing to string should not fail");
     }
@@ -286,14 +289,7 @@ fn format_text_zone_expression(
         } else {
             0
         };
-        format_text_zone_expression(
-            output,
-            child,
-            text,
-            page_height,
-            depth + 1,
-            child_trailing_closes,
-        );
+        format_text_zone_expression(output, child, text, depth + 1, child_trailing_closes);
     }
 }
 
@@ -305,15 +301,19 @@ fn zone_text<'a>(zone: &TextZone, text: &'a str) -> &'a str {
 
 fn escape_text_zone_string(value: &str) -> String {
     let mut escaped = String::new();
-    for byte in value.as_bytes() {
-        match *byte {
-            b'"' => escaped.push_str("\\\""),
-            b'\\' => escaped.push_str("\\\\"),
-            0x20..=0x7e => escaped.push(char::from(*byte)),
-            _ => {
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            character if character.is_control() => {
                 use std::fmt::Write as _;
-                write!(&mut escaped, "\\{byte:03o}").expect("writing to string should not fail");
+                let mut buffer = [0; 4];
+                for byte in character.encode_utf8(&mut buffer).as_bytes() {
+                    write!(&mut escaped, "\\{byte:03o}")
+                        .expect("writing to string should not fail");
+                }
             }
+            character => escaped.push(character),
         }
     }
 
@@ -472,13 +472,13 @@ impl TextZone {
     }
 
     #[must_use]
-    pub const fn y_min(&self, page_height: i32) -> i32 {
-        page_height - self.y_top - self.height
+    pub const fn y_min(&self) -> i32 {
+        self.y_top
     }
 
     #[must_use]
-    pub const fn y_max(&self, page_height: i32) -> i32 {
-        page_height - self.y_top
+    pub const fn y_max(&self) -> i32 {
+        self.y_top + self.height
     }
 }
 
@@ -486,6 +486,7 @@ impl TextZone {
 struct ZoneContext {
     x: i32,
     y_top: i32,
+    height: i32,
     text_start: usize,
 }
 
@@ -505,19 +506,17 @@ fn parse_zone(
     let child_count = read_u24(bytes, cursor)?;
 
     let x = match (parent, previous_sibling) {
-        (Some(_), Some(previous)) if uses_previous_sibling_right(kind) => {
-            previous.x + previous.width + encoded_x
-        }
-        (Some(_), Some(previous)) => previous.x + encoded_x,
+        (Some(_), Some(previous)) if uses_previous_sibling_left(kind) => previous.x + encoded_x,
+        (Some(_), Some(previous)) => previous.x + previous.width + encoded_x,
         (Some(parent), None) => parent.x + encoded_x,
         (None, _) => encoded_x,
     };
     let y_top = match (parent, previous_sibling) {
-        (Some(_), Some(previous)) if uses_previous_sibling_baseline(kind) => {
-            previous.y_top + previous.height - encoded_y - height
+        (Some(_), Some(previous)) if uses_previous_sibling_lower_left(kind) => {
+            previous.y_top - encoded_y - height
         }
-        (Some(_), Some(previous)) => previous.y_top + previous.height + encoded_y,
-        (Some(parent), None) => parent.y_top + encoded_y,
+        (Some(_), Some(previous)) => previous.y_top + encoded_y,
+        (Some(parent), None) => parent.y_top + parent.height - encoded_y - height,
         (None, _) => encoded_y,
     };
     let text_start = match (parent, previous_sibling) {
@@ -530,6 +529,7 @@ fn parse_zone(
     let child_context = ZoneContext {
         x,
         y_top,
+        height,
         text_start,
     };
     for _ in 0..child_count {
@@ -561,12 +561,18 @@ fn read_u8(bytes: &[u8], cursor: &mut usize) -> ParseResult<u8> {
     Ok(value)
 }
 
-const fn uses_previous_sibling_right(kind: TextZoneKind) -> bool {
-    matches!(kind, TextZoneKind::Word | TextZoneKind::Character)
+const fn uses_previous_sibling_left(kind: TextZoneKind) -> bool {
+    matches!(
+        kind,
+        TextZoneKind::Page | TextZoneKind::Paragraph | TextZoneKind::Line
+    )
 }
 
-const fn uses_previous_sibling_baseline(kind: TextZoneKind) -> bool {
-    matches!(kind, TextZoneKind::Word | TextZoneKind::Character)
+const fn uses_previous_sibling_lower_left(kind: TextZoneKind) -> bool {
+    matches!(
+        kind,
+        TextZoneKind::Page | TextZoneKind::Paragraph | TextZoneKind::Line
+    )
 }
 
 fn read_biased_u16(bytes: &[u8], cursor: &mut usize) -> ParseResult<i32> {
@@ -599,7 +605,7 @@ fn add_text_delta(base: usize, delta: i32) -> ParseResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextZoneKind, parse_text_payload, parse_text_zones};
+    use super::{TextZone, TextZoneKind, parse_text_payload, parse_text_zones};
 
     #[test]
     fn parses_text_and_keeps_zone_data() {
@@ -633,35 +639,52 @@ mod tests {
 
         assert_eq!(page.kind, TextZoneKind::Page);
         assert_eq!(page.x_min(), 0);
-        assert_eq!(page.y_min(page.height), 0);
+        assert_eq!(page.y_min(), 0);
         assert_eq!(page.x_max(), 3444);
-        assert_eq!(page.y_max(page.height), 5088);
+        assert_eq!(page.y_max(), 5088);
         assert_eq!(page.text_len, 31);
         assert_eq!(page.children.len(), 1);
 
         let line = &page.children[0];
         assert_eq!(line.kind, TextZoneKind::Line);
         assert_eq!(line.x_min(), 814);
-        assert_eq!(line.y_min(page.height), 4415);
+        assert_eq!(line.y_min(), 4415);
         assert_eq!(line.x_max(), 2612);
-        assert_eq!(line.y_max(page.height), 4480);
+        assert_eq!(line.y_max(), 4480);
 
         let word = &line.children[0];
         assert_eq!(word.kind, TextZoneKind::Word);
         assert_eq!(word.x_min(), 814);
-        assert_eq!(word.y_min(page.height), 4415);
+        assert_eq!(word.y_min(), 4415);
         assert_eq!(word.x_max(), 1255);
-        assert_eq!(word.y_max(page.height), 4476);
+        assert_eq!(word.y_max(), 4476);
         assert_eq!(word.text_start, 0);
         assert_eq!(word.text_len, 8);
 
         let word = &line.children[1];
         assert_eq!(word.kind, TextZoneKind::Word);
         assert_eq!(word.x_min(), 1305);
-        assert_eq!(word.y_min(page.height), 4416);
+        assert_eq!(word.y_min(), 4416);
         assert_eq!(word.x_max(), 1429);
-        assert_eq!(word.y_max(page.height), 4477);
+        assert_eq!(word.y_max(), 4477);
         assert_eq!(word.text_start, 8);
         assert_eq!(word.text_len, 3);
+    }
+
+    #[test]
+    fn formats_root_zone_with_nonzero_page_offset() {
+        let page = TextZone {
+            kind: TextZoneKind::Page,
+            text_start: 0,
+            text_len: 0,
+            x: 167,
+            y_top: 314,
+            width: 1264,
+            height: 2147,
+            children: Vec::new(),
+        };
+
+        assert_eq!(page.y_min(), 314);
+        assert_eq!(page.y_max(), 2461);
     }
 }

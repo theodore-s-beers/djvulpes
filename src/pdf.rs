@@ -922,19 +922,14 @@ fn pdf_text_pages_from_djvu(
         .map(|page| {
             let mut spans = Vec::new();
             if let Some(zone) = &page.zone {
-                collect_pdf_text_spans(zone, &page.text, zone.height, &mut spans);
+                collect_pdf_text_spans(zone, &page.text, &mut spans);
             }
             Ok(PdfTextPage { spans })
         })
         .collect()
 }
 
-fn collect_pdf_text_spans(
-    zone: &TextZone,
-    text: &str,
-    page_height: i32,
-    spans: &mut Vec<PdfTextSpan>,
-) {
+fn collect_pdf_text_spans(zone: &TextZone, text: &str, spans: &mut Vec<PdfTextSpan>) {
     if matches!(zone.kind, TextZoneKind::Line) {
         let mut words = Vec::new();
         collect_pdf_line_words(zone, text, &mut words);
@@ -943,7 +938,7 @@ fn collect_pdf_text_spans(
             spans.push(PdfTextSpan {
                 text: line,
                 x: zone.x_min(),
-                y: zone.y_min(page_height),
+                y: zone.y_min(),
                 width: zone.width,
                 height: zone.height,
             });
@@ -957,7 +952,7 @@ fn collect_pdf_text_spans(
             spans.push(PdfTextSpan {
                 text: word,
                 x: zone.x_min(),
-                y: zone.y_min(page_height),
+                y: zone.y_min(),
                 width: zone.width,
                 height: zone.height,
             });
@@ -966,7 +961,7 @@ fn collect_pdf_text_spans(
     }
 
     for child in &zone.children {
-        collect_pdf_text_spans(child, text, page_height, spans);
+        collect_pdf_text_spans(child, text, spans);
     }
 }
 

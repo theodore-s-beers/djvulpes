@@ -1422,7 +1422,7 @@ fn print_text_chunk(
         match parse_text_zones(parsed.zone_data)? {
             Some(root) => {
                 println!("zones:");
-                print_text_zone(&root, parsed.text, root.height, 0);
+                print_text_zone(&root, parsed.text, 0);
             }
             None => println!("zones: none"),
         }
@@ -1431,22 +1431,22 @@ fn print_text_chunk(
     Ok(())
 }
 
-fn print_text_zone(zone: &TextZone, text: &str, page_height: i32, depth: usize) {
+fn print_text_zone(zone: &TextZone, text: &str, depth: usize) {
     let indent = "  ".repeat(depth);
     println!(
         "{indent}{} bbox=({}, {}, {}, {}) text=[{}..{}){}",
         zone.kind.as_str(),
         zone.x_min(),
-        zone.y_min(page_height),
+        zone.y_min(),
         zone.x_max(),
-        zone.y_max(page_height),
+        zone.y_max(),
         zone.text_start,
         zone.text_end(),
         format_zone_text(zone, text)
     );
 
     for child in &zone.children {
-        print_text_zone(child, text, page_height, depth + 1);
+        print_text_zone(child, text, depth + 1);
     }
 }
 

@@ -332,12 +332,7 @@ impl PageBitmap {
                     continue;
                 }
 
-                let source_x = iw44_source_coordinate(
-                    x,
-                    mapping.horizontal_overscan,
-                    mapping.subsample,
-                    image.width,
-                );
+                let source_x = iw44_source_coordinate(x, 0, mapping.subsample, image.width);
                 let source_offset = (source_y * image.width + source_x) * 3;
                 self.set_rgb(
                     x,
@@ -541,6 +536,22 @@ fn iw44_background_pixel(
     x: u32,
     y: u32,
 ) -> [u8; 3] {
+    if mapping.subsample == 1 {
+        let source_y = iw44_source_coordinate(
+            y,
+            mapping.vertical_overscan,
+            mapping.subsample,
+            image.height,
+        );
+        let source_x = iw44_source_coordinate(
+            x,
+            mapping.horizontal_overscan,
+            mapping.subsample,
+            image.width,
+        );
+        return iw44_native_pixel(image, source_x, source_y);
+    }
+
     if mapping.subsample == 2 {
         return iw44_upsampled_2x_pixel(
             image,
@@ -549,19 +560,98 @@ fn iw44_background_pixel(
         );
     }
 
-    let source_y = iw44_source_coordinate(
-        y,
-        mapping.vertical_overscan,
-        mapping.subsample,
-        image.height,
-    );
-    let source_x = iw44_source_coordinate(
-        x,
-        mapping.horizontal_overscan,
-        mapping.subsample,
-        image.width,
-    );
-    iw44_native_pixel(image, source_x, source_y)
+    if mapping.subsample == 3
+        && usize::try_from(mapping.scaled_width).ok() == image.width.checked_mul(3)
+        && usize::try_from(mapping.scaled_height).ok() == image.height.checked_mul(3)
+        && mapping.page_width <= mapping.scaled_width
+        && mapping.page_height <= mapping.scaled_height
+    {
+        return iw44_upsampled_3x_pixel(image, x, y.saturating_add(mapping.vertical_overscan));
+    }
+
+    iw44_scaled_pixel(image, mapping, x, y)
+}
+
+fn iw44_upsampled_3x_pixel(image: &Iw44RgbImage, scaled_x: u32, scaled_y: u32) -> [u8; 3] {
+    let source_x = scaled_x / 3;
+    let source_y = scaled_y / 3;
+    let (left_x, right_x, x_fraction) = match scaled_x % 3 {
+        0 => (source_x.saturating_sub(1), source_x, 11),
+        1 => (source_x, source_x, 0),
+        _ => (source_x, source_x.saturating_add(1), 6),
+    };
+    let (top_y, bottom_y, y_fraction) = match scaled_y % 3 {
+        0 => (source_y.saturating_sub(1), source_y, 10),
+        1 => (source_y, source_y, 0),
+        _ => (source_y, source_y.saturating_add(1), 5),
+    };
+
+    let mut pixel = [0; 3];
+    for (channel, component) in pixel.iter_mut().enumerate() {
+        let left = iw44_interpolate_fixed(
+            u16::from(iw44_native_channel(image, left_x, top_y, channel)),
+            u16::from(iw44_native_channel(image, left_x, bottom_y, channel)),
+            y_fraction,
+        );
+        let right = iw44_interpolate_fixed(
+            u16::from(iw44_native_channel(image, right_x, top_y, channel)),
+            u16::from(iw44_native_channel(image, right_x, bottom_y, channel)),
+            y_fraction,
+        );
+        let value = iw44_interpolate_fixed(left, right, x_fraction);
+        *component = u8::try_from(value).expect("weighted RGB value should fit u8");
+    }
+
+    pixel
+}
+
+fn iw44_scaled_pixel(image: &Iw44RgbImage, mapping: &Iw44PageMapping, x: u32, y: u32) -> [u8; 3] {
+    let fixed_x = iw44_scaler_coordinate(image.width, mapping.page_width, x);
+    let fixed_y = iw44_scaler_coordinate(image.height, mapping.page_height, y);
+    let (left_x, x_fraction) = iw44_scaler_index_and_fraction(fixed_x);
+    let (top_y, y_fraction) = iw44_scaler_index_and_fraction(fixed_y);
+    let right_x = left_x + 1;
+    let bottom_y = top_y + 1;
+
+    let mut pixel = [0; 3];
+    for (channel, component) in pixel.iter_mut().enumerate() {
+        let left = iw44_interpolate_fixed(
+            u16::from(iw44_native_channel_at(image, left_x, top_y, channel)),
+            u16::from(iw44_native_channel_at(image, left_x, bottom_y, channel)),
+            y_fraction,
+        );
+        let right = iw44_interpolate_fixed(
+            u16::from(iw44_native_channel_at(image, right_x, top_y, channel)),
+            u16::from(iw44_native_channel_at(image, right_x, bottom_y, channel)),
+            y_fraction,
+        );
+        let value = iw44_interpolate_fixed(left, right, x_fraction);
+        *component = u8::try_from(value).expect("weighted RGB value should fit u8");
+    }
+
+    pixel
+}
+
+fn iw44_scaler_coordinate(input_size: usize, output_size: u32, output_coordinate: u32) -> i32 {
+    let input = i64::try_from(input_size).expect("IW44 image dimension should fit i64");
+    let output = i64::from(output_size.max(1));
+    let coordinate = (((input * 16) + output) / (2 * output)) - 8
+        + (i64::from(output_coordinate) * input * 16 / output);
+    i32::try_from(coordinate).expect("IW44 scaler coordinate should fit i32")
+}
+
+fn iw44_scaler_index_and_fraction(fixed_coordinate: i32) -> (i32, u16) {
+    let index = fixed_coordinate.div_euclid(16);
+    let fraction = fixed_coordinate.rem_euclid(16);
+    let fraction = u16::try_from(fraction).expect("fixed-point fraction should fit u16");
+    (index, fraction)
+}
+
+fn iw44_interpolate_fixed(first: u16, second: u16, fraction: u16) -> u16 {
+    let delta = i32::from(second) - i32::from(first);
+    let rounded_delta = ((delta * i32::from(fraction)) + 8) >> 4;
+    u16::try_from(i32::from(first) + rounded_delta)
+        .expect("interpolated RGB channel should fit u16")
 }
 
 fn iw44_upsampled_2x_pixel(image: &Iw44RgbImage, scaled_x: u32, scaled_y: u32) -> [u8; 3] {
@@ -627,6 +717,16 @@ fn iw44_native_channel(image: &Iw44RgbImage, x: u32, y: u32, channel: usize) -> 
         .min(image.width.saturating_sub(1));
     let y = usize::try_from(y)
         .unwrap_or(usize::MAX)
+        .min(image.height.saturating_sub(1));
+    image.pixels[(y * image.width + x) * 3 + channel]
+}
+
+fn iw44_native_channel_at(image: &Iw44RgbImage, x: i32, y: i32, channel: usize) -> u8 {
+    let x = usize::try_from(x)
+        .unwrap_or(0)
+        .min(image.width.saturating_sub(1));
+    let y = usize::try_from(y)
+        .unwrap_or(0)
         .min(image.height.saturating_sub(1));
     image.pixels[(y * image.width + x) * 3 + channel]
 }
@@ -1569,6 +1669,61 @@ mod tests {
     }
 
     #[test]
+    fn page_bitmap_paints_exact_3x_iw44_rgb_layer_with_accumulated_fraction_pattern() {
+        let image = Iw44RgbImage {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                0, 0, 0, 160, 160, 160, //
+                80, 80, 80, 240, 240, 240,
+            ],
+        };
+
+        assert_eq!(iw44_upsampled_3x_pixel(&image, 1, 1), [0, 0, 0]);
+        assert_eq!(iw44_upsampled_3x_pixel(&image, 2, 0), [60, 60, 60]);
+        assert_eq!(iw44_upsampled_3x_pixel(&image, 0, 2), [25, 25, 25]);
+        assert_eq!(iw44_upsampled_3x_pixel(&image, 2, 2), [85, 85, 85]);
+    }
+
+    #[test]
+    fn page_bitmap_paints_exact_3x_iw44_rgb_layer_with_vertical_overscan_crop() {
+        let image = Iw44RgbImage {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                0, 0, 0, 160, 160, 160, //
+                80, 80, 80, 240, 240, 240,
+            ],
+        };
+        let mapping = Iw44PageMapping {
+            page_width: 4,
+            page_height: 5,
+            layer_width: 2,
+            layer_height: 2,
+            subsample: 3,
+            scaled_width: 6,
+            scaled_height: 6,
+            horizontal_overscan: 2,
+            vertical_overscan: 1,
+        };
+        let mut bitmap = PageBitmap::new_rgb8(4, 5, 300, [0xff, 0xff, 0xff]);
+
+        assert!(bitmap.paint_iw44_rgb_layer(&image, &mapping));
+
+        for y in 0..bitmap.height {
+            for x in 0..bitmap.width {
+                let offset = bitmap
+                    .pixel_offset(x, y)
+                    .expect("test pixel should be in bitmap");
+                assert_eq!(
+                    &bitmap.pixels[offset..offset + 3],
+                    iw44_upsampled_3x_pixel(&image, x, y + 1),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn page_bitmap_crops_iw44_overscan_from_top_left() {
         let mut bitmap = PageBitmap::new_rgb8(2, 4, 300, [0xff, 0xff, 0xff]);
         let image = Iw44RgbImage {
@@ -1636,6 +1791,34 @@ mod tests {
         assert_eq!(&bitmap.pixels[3..6], &[0xff, 0x00, 0x00]);
         assert_eq!(&bitmap.pixels[42..45], &[0xff, 0xff, 0xff]);
         assert_eq!(&bitmap.pixels[45..48], &[0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn page_bitmap_paints_iw44_foreground_through_mask_without_horizontal_overscan() {
+        let mut bitmap = PageBitmap::new_rgb8(2, 1, 300, [0xff, 0xff, 0xff]);
+        let mut mask = BitonalBitmap::new(2, 1);
+        assert!(mask.set_bit(0, 0, true));
+        assert!(mask.set_bit(1, 0, true));
+        let image = Iw44RgbImage {
+            width: 2,
+            height: 1,
+            pixels: vec![0x10, 0x00, 0x00, 0x20, 0x00, 0x00],
+        };
+        let mapping = Iw44PageMapping {
+            page_width: 2,
+            page_height: 1,
+            layer_width: 2,
+            layer_height: 1,
+            subsample: 2,
+            scaled_width: 4,
+            scaled_height: 2,
+            horizontal_overscan: 2,
+            vertical_overscan: 0,
+        };
+
+        assert!(bitmap.paint_iw44_rgb_layer_through_mask(&image, &mapping, &mask));
+
+        assert_eq!(bitmap.pixels, vec![0x10, 0x00, 0x00, 0x10, 0x00, 0x00]);
     }
 
     #[test]
