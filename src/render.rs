@@ -606,8 +606,8 @@ fn iw44_upsampled_3x_pixel(image: &Iw44RgbImage, scaled_x: u32, scaled_y: u32) -
 }
 
 fn iw44_scaled_pixel(image: &Iw44RgbImage, mapping: &Iw44PageMapping, x: u32, y: u32) -> [u8; 3] {
-    let fixed_x = iw44_scaler_coordinate(image.width, mapping.page_width, x);
-    let fixed_y = iw44_scaler_coordinate(image.height, mapping.page_height, y);
+    let fixed_x = iw44_scaler_coordinate(image.width, mapping.subsample, x);
+    let fixed_y = iw44_top_down_scaler_coordinate(image.height, mapping, y);
     let (left_x, x_fraction) = iw44_scaler_index_and_fraction(fixed_x);
     let (top_y, y_fraction) = iw44_scaler_index_and_fraction(fixed_y);
     let right_x = left_x + 1;
@@ -632,12 +632,30 @@ fn iw44_scaled_pixel(image: &Iw44RgbImage, mapping: &Iw44PageMapping, x: u32, y:
     pixel
 }
 
-fn iw44_scaler_coordinate(input_size: usize, output_size: u32, output_coordinate: u32) -> i32 {
+fn iw44_scaler_coordinate(input_size: usize, subsample: u32, output_coordinate: u32) -> i32 {
     let input = i64::try_from(input_size).expect("IW44 image dimension should fit i64");
-    let output = i64::from(output_size.max(1));
-    let coordinate = (((input * 16) + output) / (2 * output)) - 8
-        + (i64::from(output_coordinate) * input * 16 / output);
-    i32::try_from(coordinate).expect("IW44 scaler coordinate should fit i32")
+    let numer = i64::from(subsample.max(1));
+    let len = 16i64;
+    let coordinate = ((len + numer) / (2 * numer)) - 8
+        + ((numer / 2) + (i64::from(output_coordinate) * len)) / numer;
+    let max_coordinate = input.saturating_sub(1).saturating_mul(16);
+    i32::try_from(coordinate.min(max_coordinate)).expect("IW44 scaler coordinate should fit i32")
+}
+
+fn iw44_top_down_scaler_coordinate(
+    input_size: usize,
+    mapping: &Iw44PageMapping,
+    top_down_coordinate: u32,
+) -> i32 {
+    let bottom_up_coordinate = mapping
+        .page_height
+        .saturating_sub(1)
+        .saturating_sub(top_down_coordinate);
+    let bottom_up_fixed =
+        iw44_scaler_coordinate(input_size, mapping.subsample, bottom_up_coordinate);
+    let max_fixed = i32::try_from(input_size.saturating_sub(1).saturating_mul(16))
+        .expect("IW44 scaler coordinate should fit i32");
+    max_fixed - bottom_up_fixed
 }
 
 fn iw44_scaler_index_and_fraction(fixed_coordinate: i32) -> (i32, u16) {
@@ -846,7 +864,7 @@ impl<'a> PageRenderPlan<'a> {
                 PageChunkKind::Bg44 => plan.background_layers.push(index),
                 PageChunkKind::Txta | PageChunkKind::Txtz => plan.text_chunks.push(index),
                 PageChunkKind::Unknown => plan.unknown_chunks.push(index),
-                PageChunkKind::Info | PageChunkKind::Include => {}
+                PageChunkKind::Info | PageChunkKind::Include | PageChunkKind::Cida => {}
             }
         }
 

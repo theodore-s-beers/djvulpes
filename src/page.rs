@@ -24,6 +24,7 @@ pub enum PageChunkKind {
     Sjbz,
     Fg44,
     Bg44,
+    Cida,
     Txta,
     Txtz,
     Unknown,
@@ -68,6 +69,7 @@ impl PageChunkKind {
             "Sjbz" => Self::Sjbz,
             "FG44" => Self::Fg44,
             "BG44" => Self::Bg44,
+            "CIDa" => Self::Cida,
             "TXTa" => Self::Txta,
             "TXTz" => Self::Txtz,
             _ => Self::Unknown,
@@ -83,6 +85,7 @@ impl PageChunkKind {
             Self::Sjbz => "sjbz",
             Self::Fg44 => "fg44",
             Self::Bg44 => "bg44",
+            Self::Cida => "cida",
             Self::Txta => "txta",
             Self::Txtz => "txtz",
             Self::Unknown => "unknown",
@@ -143,6 +146,7 @@ mod tests {
             &[0x06, 0x18, 0x06, 0x61, 25, 0, 200, 0, 22, 1],
         );
         push_chunk(&mut children, *b"INCL", b"shared");
+        push_chunk(&mut children, *b"CIDa", b"id");
         push_chunk(&mut children, *b"Sjbz", b"bitonal");
         push_chunk(&mut children, *b"ZZZZ", b"unknown");
 
@@ -152,11 +156,12 @@ mod tests {
         let details = read_page_details(&bytes, &form).expect("page details should parse");
 
         assert_eq!(details.info.as_ref().map(|info| info.dpi), Some(200));
-        assert_eq!(details.chunks.len(), 4);
+        assert_eq!(details.chunks.len(), 5);
         assert_eq!(details.chunks[0].kind, PageChunkKind::Info);
         assert_eq!(details.chunks[1].kind, PageChunkKind::Include);
-        assert_eq!(details.chunks[2].kind, PageChunkKind::Sjbz);
-        assert_eq!(details.chunks[3].kind, PageChunkKind::Unknown);
+        assert_eq!(details.chunks[2].kind, PageChunkKind::Cida);
+        assert_eq!(details.chunks[3].kind, PageChunkKind::Sjbz);
+        assert_eq!(details.chunks[4].kind, PageChunkKind::Unknown);
         assert_eq!(
             details.chunks[1].payload,
             PageChunkPayload::Include { id: "shared" }
