@@ -1239,10 +1239,9 @@ impl Iw44CoefficientEventTemplate {
     }
 }
 
-#[allow(clippy::cast_possible_truncation)]
 const fn iw44_coefficient(value: i32) -> i16 {
-    // IW44 lifting arithmetic narrows through two's-complement i16 wrapping.
-    value as i16
+    let [low, high, ..] = value.to_le_bytes();
+    i16::from_le_bytes([low, high])
 }
 
 fn normalize_iw44_sample(value: i16) -> i32 {

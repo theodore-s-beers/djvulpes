@@ -270,10 +270,6 @@ where
     Ok(pdf.into_inner())
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "PDF object numbering and serialization are kept together for consistency"
-)]
 fn write_page_image_pdf_iter_with_bookmarks_and_text_to_writer<W, I, E>(
     writer: W,
     page_count: usize,
@@ -299,11 +295,6 @@ where
         ))
         .into());
     }
-    let catalog_id = 1;
-    let pages_id = 2;
-    let first_page_id = 3;
-    let first_content_id = first_page_id + page_count;
-    let first_image_id = first_content_id + page_count;
     let has_text_layer =
         text_pages.is_some_and(|pages| pages.iter().any(|page| !page.spans.is_empty()));
     let text_encoding = if has_text_layer {
@@ -313,48 +304,149 @@ where
     } else {
         None
     };
-    let font_id = first_image_id + page_count;
-    let to_unicode_id = font_id + 1;
-    let text_object_count = if has_text_layer { 2 } else { 0 };
-    let outline_root_id = first_image_id + page_count + text_object_count;
-    let first_outline_item_id = outline_root_id + 1;
     let outline_item_count = count_pdf_bookmarks(bookmarks);
     let has_outline = outline_item_count != 0;
+    let ids = PdfObjectIds::new(page_count, has_text_layer, outline_item_count);
     let numbered_bookmarks = if has_outline {
-        let mut next_id = first_outline_item_id;
+        let mut next_id = ids.first_outline_item;
         number_pdf_bookmarks(bookmarks, &mut next_id)
     } else {
         Vec::new()
     };
-    let max_object_id = if has_outline {
-        first_outline_item_id + outline_item_count - 1
-    } else if has_text_layer {
-        to_unicode_id
-    } else {
-        first_image_id + page_count - 1
-    };
-    let mut pdf = PdfObjectWriter::new(writer, max_object_id).map_err(E::from)?;
+    let mut pdf = PdfObjectWriter::new(writer, ids.max_object).map_err(E::from)?;
 
+    write_pdf_catalog_and_page_tree(&mut pdf, ids, page_count, has_outline).map_err(E::from)?;
+    let actual_page_count = write_pdf_page_objects(
+        &mut pdf,
+        ids,
+        page_count,
+        pages,
+        text_pages,
+        text_encoding.as_ref(),
+        &mut timing,
+    )?;
+    if actual_page_count != page_count {
+        return Err(PdfError::new(format!(
+            "PDF page iterator produced {actual_page_count} pages, expected {page_count}"
+        ))
+        .into());
+    }
+
+    write_pdf_text_objects(&mut pdf, ids, text_encoding.as_ref()).map_err(E::from)?;
+
+    if has_outline {
+        write_pdf_outlines(
+            &mut pdf,
+            ids.outline_root,
+            ids.first_page,
+            &numbered_bookmarks,
+        )
+        .map_err(E::from)?;
+    }
+
+    let finish_start = timing.is_some().then(Instant::now);
+    let result = pdf.finish(ids.catalog).map_err(E::from);
+    if let Some(finish_start) = finish_start
+        && let Some(timing) = timing
+    {
+        timing(DjvuPdfTimingEvent {
+            stage: DjvuPdfTimingStage::PdfWrite,
+            duration: finish_start.elapsed(),
+        });
+    }
+
+    result
+}
+
+#[derive(Clone, Copy)]
+struct PdfObjectIds {
+    catalog: usize,
+    pages: usize,
+    first_page: usize,
+    first_content: usize,
+    first_image: usize,
+    font: usize,
+    to_unicode: usize,
+    outline_root: usize,
+    first_outline_item: usize,
+    max_object: usize,
+}
+
+impl PdfObjectIds {
+    const fn new(page_count: usize, has_text_layer: bool, outline_item_count: usize) -> Self {
+        let catalog = 1;
+        let pages = 2;
+        let first_page = 3;
+        let first_content = first_page + page_count;
+        let first_image = first_content + page_count;
+        let font = first_image + page_count;
+        let to_unicode = font + 1;
+        let text_object_count = if has_text_layer { 2 } else { 0 };
+        let outline_root = first_image + page_count + text_object_count;
+        let first_outline_item = outline_root + 1;
+        let max_object = if outline_item_count != 0 {
+            first_outline_item + outline_item_count - 1
+        } else if has_text_layer {
+            to_unicode
+        } else {
+            first_image + page_count - 1
+        };
+
+        Self {
+            catalog,
+            pages,
+            first_page,
+            first_content,
+            first_image,
+            font,
+            to_unicode,
+            outline_root,
+            first_outline_item,
+            max_object,
+        }
+    }
+}
+
+fn write_pdf_catalog_and_page_tree<W: Write>(
+    pdf: &mut PdfObjectWriter<W>,
+    ids: PdfObjectIds,
+    page_count: usize,
+    has_outline: bool,
+) -> PdfResult<()> {
     let catalog = if has_outline {
         format!(
-            "<< /Type /Catalog /Pages {pages_id} 0 R /Outlines {outline_root_id} 0 R /PageMode /UseOutlines >>"
+            "<< /Type /Catalog /Pages {} 0 R /Outlines {} 0 R /PageMode /UseOutlines >>",
+            ids.pages, ids.outline_root
         )
     } else {
-        format!("<< /Type /Catalog /Pages {pages_id} 0 R >>")
+        format!("<< /Type /Catalog /Pages {} 0 R >>", ids.pages)
     };
-    pdf.write_object(catalog_id, catalog.as_bytes())
-        .map_err(E::from)?;
+    pdf.write_object(ids.catalog, catalog.as_bytes())?;
 
     let kids = (0..page_count)
-        .map(|index| format!("{} 0 R", first_page_id + index))
+        .map(|index| format!("{} 0 R", ids.first_page + index))
         .collect::<Vec<_>>()
         .join(" ");
     pdf.write_object(
-        pages_id,
+        ids.pages,
         format!("<< /Type /Pages /Count {page_count} /Kids [{kids}] >>").as_bytes(),
     )
-    .map_err(E::from)?;
+}
 
+fn write_pdf_page_objects<W, I, E>(
+    pdf: &mut PdfObjectWriter<W>,
+    ids: PdfObjectIds,
+    page_count: usize,
+    pages: I,
+    text_pages: Option<&[PdfTextPage]>,
+    text_encoding: Option<&PdfTextEncoding>,
+    timing: &mut Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+) -> Result<usize, E>
+where
+    W: Write,
+    I: IntoIterator<Item = Result<PdfPageImage, E>>,
+    E: From<PdfError>,
+{
     let mut actual_page_count = 0usize;
     for (index, page_image) in pages.into_iter().enumerate() {
         if index >= page_count {
@@ -366,104 +458,151 @@ where
         let page_image = page_image?;
         validate_page_image(&page_image).map_err(E::from)?;
         actual_page_count += 1;
-        let page_object_id = first_page_id + index;
-        let content_id = first_content_id + index;
-        let image_id = first_image_id + index;
-        let image_name = format!("Im{}", index + 1);
-        let width_points = points_from_pixels(page_image.width(), page_image.dpi());
-        let height_points = points_from_pixels(page_image.height(), page_image.dpi());
-        let font_resource = if has_text_layer {
-            format!(" /Font << /Ftxt {font_id} 0 R >>")
-        } else {
-            String::new()
-        };
-        let page = format!(
-            "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {width_points} {height_points}] /Resources << /XObject << /{image_name} {image_id} 0 R >>{font_resource} >> /Contents {content_id} 0 R >>"
-        );
-        pdf.write_object(page_object_id, page.as_bytes())
-            .map_err(E::from)?;
-
-        let mut content = if page_image.is_bitonal_mask() {
-            format!(
-                "q\n1 g\n0 0 {width_points} {height_points} re f\n0 g\n{width_points} 0 0 {height_points} 0 0 cm\n/{image_name} Do\nQ\n"
-            )
-        } else {
-            format!("q\n{width_points} 0 0 {height_points} 0 0 cm\n/{image_name} Do\nQ\n")
-        };
-        if let (Some(text_page), Some(text_encoding)) = (
+        write_pdf_single_page_objects(
+            pdf,
+            ids,
+            index,
+            &page_image,
             text_pages.and_then(|pages| pages.get(index)),
-            text_encoding.as_ref(),
-        ) {
-            append_pdf_text_layer(&mut content, text_page, page_image.dpi(), text_encoding);
-        }
-        let content_stream = stream_object(&[], content.as_bytes());
-        pdf.write_object(content_id, &content_stream)
-            .map_err(E::from)?;
-
-        let image_start = timing.is_some().then(Instant::now);
-        let image_stream = page_image.image_stream_object();
-        pdf.write_object(image_id, &image_stream).map_err(E::from)?;
-        if let Some(image_start) = image_start
-            && let Some(timing) = timing.as_deref_mut()
-        {
-            timing(DjvuPdfTimingEvent {
-                stage: DjvuPdfTimingStage::PdfWrite,
-                duration: image_start.elapsed(),
-            });
-        }
+            text_encoding,
+            timing,
+        )?;
     }
 
-    if actual_page_count != page_count {
-        return Err(PdfError::new(format!(
-            "PDF page iterator produced {actual_page_count} pages, expected {page_count}"
-        ))
-        .into());
-    }
+    Ok(actual_page_count)
+}
 
-    if has_text_layer {
-        pdf.write_object(
-            font_id,
-            format!(
-                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode {to_unicode_id} 0 R >>"
-            )
-            .as_bytes(),
-        )
+fn write_pdf_single_page_objects<W, E>(
+    pdf: &mut PdfObjectWriter<W>,
+    ids: PdfObjectIds,
+    index: usize,
+    page_image: &PdfPageImage,
+    text_page: Option<&PdfTextPage>,
+    text_encoding: Option<&PdfTextEncoding>,
+    timing: &mut Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+) -> Result<(), E>
+where
+    W: Write,
+    E: From<PdfError>,
+{
+    let page_object_id = ids.first_page + index;
+    let content_id = ids.first_content + index;
+    let image_id = ids.first_image + index;
+    let image_name = format!("Im{}", index + 1);
+    let width_points = points_from_pixels(page_image.width(), page_image.dpi());
+    let height_points = points_from_pixels(page_image.height(), page_image.dpi());
+    let font_resource = if text_encoding.is_some() {
+        format!(" /Font << /Ftxt {} 0 R >>", ids.font)
+    } else {
+        String::new()
+    };
+    let page = format!(
+        "<< /Type /Page /Parent {} 0 R /MediaBox [0 0 {width_points} {height_points}] /Resources << /XObject << /{image_name} {image_id} 0 R >>{font_resource} >> /Contents {content_id} 0 R >>",
+        ids.pages
+    );
+    pdf.write_object(page_object_id, page.as_bytes())
         .map_err(E::from)?;
-        let to_unicode_stream = stream_object(
-            &[],
-            pdf_to_unicode_cmap(
-                text_encoding
-                    .as_ref()
-                    .expect("text encoding should exist when writing text layer"),
-            )
-            .as_bytes(),
+
+    write_pdf_page_content(
+        pdf,
+        content_id,
+        PdfPageContent {
+            image_name: &image_name,
+            page_image,
+            text_page,
+            text_encoding,
+            width_points: &width_points,
+            height_points: &height_points,
+        },
+    )?;
+    write_pdf_page_image(pdf, image_id, page_image, timing)
+}
+
+#[derive(Clone, Copy)]
+struct PdfPageContent<'a> {
+    image_name: &'a str,
+    page_image: &'a PdfPageImage,
+    text_page: Option<&'a PdfTextPage>,
+    text_encoding: Option<&'a PdfTextEncoding>,
+    width_points: &'a str,
+    height_points: &'a str,
+}
+
+fn write_pdf_page_content<W, E>(
+    pdf: &mut PdfObjectWriter<W>,
+    content_id: usize,
+    page: PdfPageContent<'_>,
+) -> Result<(), E>
+where
+    W: Write,
+    E: From<PdfError>,
+{
+    let width_points = page.width_points;
+    let height_points = page.height_points;
+    let image_name = page.image_name;
+    let mut content = if page.page_image.is_bitonal_mask() {
+        format!(
+            "q\n1 g\n0 0 {width_points} {height_points} re f\n0 g\n{width_points} 0 0 {height_points} 0 0 cm\n/{image_name} Do\nQ\n"
+        )
+    } else {
+        format!("q\n{width_points} 0 0 {height_points} 0 0 cm\n/{image_name} Do\nQ\n")
+    };
+    if let (Some(text_page), Some(text_encoding)) = (page.text_page, page.text_encoding) {
+        append_pdf_text_layer(
+            &mut content,
+            text_page,
+            page.page_image.dpi(),
+            text_encoding,
         );
-        pdf.write_object(to_unicode_id, &to_unicode_stream)
-            .map_err(E::from)?;
     }
+    let content_stream = stream_object(&[], content.as_bytes());
+    pdf.write_object(content_id, &content_stream)
+        .map_err(E::from)
+}
 
-    if has_outline {
-        write_pdf_outlines(
-            &mut pdf,
-            outline_root_id,
-            first_page_id,
-            &numbered_bookmarks,
-        )
-        .map_err(E::from)?;
-    }
-
-    let finish_start = timing.is_some().then(Instant::now);
-    let result = pdf.finish(catalog_id).map_err(E::from);
-    if let Some(finish_start) = finish_start
-        && let Some(timing) = timing
+fn write_pdf_page_image<W, E>(
+    pdf: &mut PdfObjectWriter<W>,
+    image_id: usize,
+    page_image: &PdfPageImage,
+    timing: &mut Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+) -> Result<(), E>
+where
+    W: Write,
+    E: From<PdfError>,
+{
+    let image_start = timing.is_some().then(Instant::now);
+    let image_stream = page_image.image_stream_object();
+    pdf.write_object(image_id, &image_stream).map_err(E::from)?;
+    if let Some(image_start) = image_start
+        && let Some(timing) = timing.as_deref_mut()
     {
         timing(DjvuPdfTimingEvent {
             stage: DjvuPdfTimingStage::PdfWrite,
-            duration: finish_start.elapsed(),
+            duration: image_start.elapsed(),
         });
     }
 
-    result
+    Ok(())
+}
+
+fn write_pdf_text_objects<W: Write>(
+    pdf: &mut PdfObjectWriter<W>,
+    ids: PdfObjectIds,
+    text_encoding: Option<&PdfTextEncoding>,
+) -> PdfResult<()> {
+    let Some(text_encoding) = text_encoding else {
+        return Ok(());
+    };
+    pdf.write_object(
+        ids.font,
+        format!(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode {} 0 R >>",
+            ids.to_unicode
+        )
+        .as_bytes(),
+    )?;
+    let to_unicode_stream = stream_object(&[], pdf_to_unicode_cmap(text_encoding).as_bytes());
+    pdf.write_object(ids.to_unicode, &to_unicode_stream)
 }
 
 /// Writes a PDF from an iterator of rendered pages.

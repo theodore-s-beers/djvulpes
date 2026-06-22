@@ -394,18 +394,30 @@ impl PageBitmap {
     }
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "bitmap comparison reports a human-readable floating-point mean"
-)]
 fn mean_delta(total_abs_delta: u64, component_count: usize) -> f64 {
-    total_abs_delta as f64 / component_count as f64
+    u64_to_f64(total_abs_delta) / usize_to_f64(component_count)
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "bitmap comparison reports a human-readable floating-point mean"
-)]
 fn mean_signed_delta(signed_delta: i64, component_count: usize) -> f64 {
-    signed_delta as f64 / component_count as f64
+    i64_to_f64(signed_delta) / usize_to_f64(component_count)
+}
+
+fn usize_to_f64(value: usize) -> f64 {
+    u64_to_f64(u64::try_from(value).expect("usize should fit u64"))
+}
+
+fn i64_to_f64(value: i64) -> f64 {
+    if value < 0 {
+        -u64_to_f64(value.unsigned_abs())
+    } else {
+        u64_to_f64(u64::try_from(value).expect("non-negative i64 should fit u64"))
+    }
+}
+
+fn u64_to_f64(value: u64) -> f64 {
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = value.to_le_bytes();
+    let low = u32::from_le_bytes([b0, b1, b2, b3]);
+    let high = u32::from_le_bytes([b4, b5, b6, b7]);
+
+    f64::from(high).mul_add(4_294_967_296.0, f64::from(low))
 }

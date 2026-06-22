@@ -208,7 +208,6 @@ pub fn read_jb2_image_header(bytes: &[u8]) -> Jb2Result<Jb2ImageHeader> {
 /// # Errors
 ///
 /// Returns an error if the JB2 header or a supported prefix record is malformed.
-#[allow(clippy::too_many_lines)]
 pub fn read_jb2_record_prefix(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2RecordPrefix> {
     let mut decoder = Jb2Decoder::new(bytes)?;
     let header = decoder.read_header()?;
@@ -216,94 +215,9 @@ pub fn read_jb2_record_prefix(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2
 
     for index in 0..max_records {
         let kind = decoder.next_record_kind()?;
-        let record = match kind {
-            Jb2RecordKind::NewSymbolAddAndBlit | Jb2RecordKind::NewSymbolBlitOnly => {
-                let symbol_width = decoder.decode_symbol_width()?;
-                let symbol_height = decoder.decode_symbol_height()?;
-                let _ = decoder.decode_direct_bitmap(symbol_width, symbol_height)?;
-                let (x, y) = decoder.decode_symbol_coords(symbol_width, symbol_height);
-                Some(Jb2RecordSummary {
-                    index,
-                    kind,
-                    symbol_width: Some(symbol_width),
-                    symbol_height: Some(symbol_height),
-                    x: Some(x),
-                    y: Some(y),
-                })
-            }
-            Jb2RecordKind::StartOfImage => Some(Jb2RecordSummary {
-                index,
-                kind,
-                symbol_width: None,
-                symbol_height: None,
-                x: None,
-                y: None,
-            }),
-            Jb2RecordKind::NewSymbolAddOnly => {
-                let symbol_width = decoder.decode_symbol_width()?;
-                let symbol_height = decoder.decode_symbol_height()?;
-                let _ = decoder.decode_direct_bitmap(symbol_width, symbol_height)?;
-                Some(Jb2RecordSummary {
-                    index,
-                    kind,
-                    symbol_width: Some(symbol_width),
-                    symbol_height: Some(symbol_height),
-                    x: None,
-                    y: None,
-                })
-            }
-            Jb2RecordKind::NonSymbol => {
-                let symbol_width = decoder.decode_symbol_width()?;
-                let symbol_height = decoder.decode_symbol_height()?;
-                let _ = decoder.decode_direct_bitmap(symbol_width, symbol_height)?;
-                let image_width = i32::try_from(header.width)
-                    .map_err(|_| Jb2Error::new("JB2 image width exceeds scanner range"))?;
-                let image_height = i32::try_from(header.height)
-                    .map_err(|_| Jb2Error::new("JB2 image height exceeds scanner range"))?;
-                let x = decode_num(
-                    &mut decoder.zp,
-                    &mut decoder.horizontal_absolute_location_context,
-                    1,
-                    image_width,
-                ) - 1;
-                let top = decode_num(
-                    &mut decoder.zp,
-                    &mut decoder.vertical_absolute_location_context,
-                    1,
-                    image_height,
-                );
-                let symbol_height_i32 = i32::try_from(symbol_height)
-                    .map_err(|_| Jb2Error::new("JB2 symbol height exceeds scanner range"))?;
-                let y = top - symbol_height_i32;
-                Some(Jb2RecordSummary {
-                    index,
-                    kind,
-                    symbol_width: Some(symbol_width),
-                    symbol_height: Some(symbol_height),
-                    x: Some(x),
-                    y: Some(y),
-                })
-            }
-            Jb2RecordKind::Comment => {
-                let length = decode_num(
-                    &mut decoder.zp,
-                    &mut decoder.comment_length_context,
-                    0,
-                    262_142,
-                );
-                for _ in 0..length {
-                    decode_num(&mut decoder.zp, &mut decoder.comment_octet_context, 0, 255);
-                }
-                Some(Jb2RecordSummary {
-                    index,
-                    kind,
-                    symbol_width: None,
-                    symbol_height: None,
-                    x: None,
-                    y: None,
-                })
-            }
-            Jb2RecordKind::EndOfData => {
+        match read_jb2_record_prefix_record(&mut decoder, header, index, kind)? {
+            Jb2PrefixRecord::Record(record) => records.push(record),
+            Jb2PrefixRecord::EndOfData => {
                 records.push(Jb2RecordSummary {
                     index,
                     kind,
@@ -318,21 +232,13 @@ pub fn read_jb2_record_prefix(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2
                     stopped_before: None,
                 });
             }
-            Jb2RecordKind::MatchedRefineAddAndBlit
-            | Jb2RecordKind::MatchedRefineAddOnly
-            | Jb2RecordKind::MatchedRefineBlitOnly
-            | Jb2RecordKind::MatchedCopyBlitOnly
-            | Jb2RecordKind::RequiredDictOrReset => {
+            Jb2PrefixRecord::Unsupported => {
                 return Ok(Jb2RecordPrefix {
                     header,
                     records,
                     stopped_before: Some(kind),
                 });
             }
-        };
-
-        if let Some(record) = record {
-            records.push(record);
         }
     }
 
@@ -351,7 +257,6 @@ pub fn read_jb2_record_prefix(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2
 /// # Errors
 ///
 /// Returns an error if the JB2 header or a supported prefix record is malformed.
-#[allow(clippy::too_many_lines)]
 pub fn render_jb2_supported_prefix(bytes: &[u8], max_records: usize) -> Jb2Result<Jb2PartialImage> {
     render_jb2_records(bytes, max_records, None)
 }
@@ -461,7 +366,6 @@ fn decode_jb2_dictionary_with_inherited(
     ))
 }
 
-#[allow(clippy::too_many_lines)]
 fn render_jb2_records(
     bytes: &[u8],
     max_records: usize,
@@ -476,113 +380,17 @@ fn render_jb2_records(
 
     for index in 0..max_records {
         let kind = decoder.next_record_kind()?;
-        let record = match kind {
-            Jb2RecordKind::NewSymbolAddAndBlit => {
-                let symbol = decoder.decode_direct_symbol()?;
-                let (x, y) = decoder.decode_symbol_coords(symbol.width, symbol.height);
-                blit_symbol(&mut mask, &symbol, x, y);
-                let record = symbol_record(index, kind, &symbol, Some((x, y)));
-                dictionary.push(symbol.dictionary_symbol());
-                Some(record)
-            }
-            Jb2RecordKind::NewSymbolAddOnly => {
-                let symbol = decoder.decode_direct_symbol()?;
-                let record = symbol_record(index, kind, &symbol, None);
-                dictionary.push(symbol.dictionary_symbol());
-                Some(record)
-            }
-            Jb2RecordKind::NewSymbolBlitOnly => {
-                let symbol = decoder.decode_direct_symbol()?;
-                let (x, y) = decoder.decode_symbol_coords(symbol.width, symbol.height);
-                blit_symbol(&mut mask, &symbol, x, y);
-                Some(symbol_record(index, kind, &symbol, Some((x, y))))
-            }
-            Jb2RecordKind::NonSymbol => {
-                let symbol = decoder.decode_direct_symbol()?;
-                let image_width = i32::try_from(header.width)
-                    .map_err(|_| Jb2Error::new("JB2 image width exceeds scanner range"))?;
-                let image_height = i32::try_from(header.height)
-                    .map_err(|_| Jb2Error::new("JB2 image height exceeds scanner range"))?;
-                let x = decode_num(
-                    &mut decoder.zp,
-                    &mut decoder.horizontal_absolute_location_context,
-                    1,
-                    image_width,
-                ) - 1;
-                let top = decode_num(
-                    &mut decoder.zp,
-                    &mut decoder.vertical_absolute_location_context,
-                    1,
-                    image_height,
-                );
-                let symbol_height = i32::try_from(symbol.height)
-                    .map_err(|_| Jb2Error::new("JB2 symbol height exceeds scanner range"))?;
-                let y = top - symbol_height;
-                blit_symbol(&mut mask, &symbol, x, y);
-                Some(symbol_record(index, kind, &symbol, Some((x, y))))
-            }
-            Jb2RecordKind::MatchedRefineAddAndBlit => {
-                let symbol = decoder.decode_refined_symbol(&dictionary)?;
-                let (x, y) = decoder.decode_symbol_coords(symbol.width, symbol.height);
-                blit_symbol(&mut mask, &symbol, x, y);
-                let record = symbol_record(index, kind, &symbol, Some((x, y)));
-                dictionary.push(symbol.dictionary_symbol());
-                Some(record)
-            }
-            Jb2RecordKind::MatchedRefineAddOnly => {
-                let symbol = decoder.decode_refined_symbol(&dictionary)?;
-                let record = symbol_record(index, kind, &symbol, None);
-                dictionary.push(symbol.dictionary_symbol());
-                Some(record)
-            }
-            Jb2RecordKind::MatchedRefineBlitOnly => {
-                let symbol = decoder.decode_refined_symbol(&dictionary)?;
-                let (x, y) = decoder.decode_symbol_coords(symbol.width, symbol.height);
-                blit_symbol(&mut mask, &symbol, x, y);
-                Some(symbol_record(index, kind, &symbol, Some((x, y))))
-            }
-            Jb2RecordKind::MatchedCopyBlitOnly => {
-                if dictionary.is_empty() {
-                    return Err(Jb2Error::new(
-                        "JB2 copy record references an empty dictionary",
-                    ));
-                }
-                let symbol_index = decode_num(
-                    &mut decoder.zp,
-                    &mut decoder.symbol_index_context,
-                    0,
-                    i32::try_from(dictionary.len() - 1)
-                        .map_err(|_| Jb2Error::new("JB2 dictionary is too large"))?,
-                );
-                let symbol_index = usize::try_from(symbol_index)
-                    .map_err(|_| Jb2Error::new("JB2 copy symbol index is negative"))?;
-                let symbol = dictionary
-                    .get(symbol_index)
-                    .ok_or_else(|| Jb2Error::new("JB2 copy symbol index is out of range"))?;
-                let (x, y) = decoder.decode_symbol_coords(symbol.width, symbol.height);
-                blit_symbol(&mut mask, symbol, x, y);
-                Some(symbol_record(index, kind, symbol, Some((x, y))))
-            }
-            Jb2RecordKind::StartOfImage => Some(Jb2RecordSummary {
-                index,
-                kind,
-                symbol_width: None,
-                symbol_height: None,
-                x: None,
-                y: None,
-            }),
-            Jb2RecordKind::Comment => {
-                decoder.skip_comment();
-                Some(Jb2RecordSummary {
-                    index,
-                    kind,
-                    symbol_width: None,
-                    symbol_height: None,
-                    x: None,
-                    y: None,
-                })
-            }
-            Jb2RecordKind::EndOfData => {
+        match render_jb2_record(
+            &mut decoder,
+            header,
+            &mut mask,
+            &mut dictionary,
+            index,
+            kind,
+        )? {
+            Jb2RenderRecord::Record(record) => records.push(record),
+            Jb2RenderRecord::Skip => {}
+            Jb2RenderRecord::EndOfData => {
                 records.push(Jb2RecordSummary {
                     index,
                     kind,
@@ -600,11 +408,6 @@ fn render_jb2_records(
                     reached_end_of_data: true,
                 });
             }
-            Jb2RecordKind::RequiredDictOrReset => None,
-        };
-
-        if let Some(record) = record {
-            records.push(record);
         }
     }
 
@@ -616,6 +419,288 @@ fn render_jb2_records(
         stopped_before: None,
         reached_end_of_data: false,
     })
+}
+
+enum Jb2PrefixRecord {
+    Record(Jb2RecordSummary),
+    EndOfData,
+    Unsupported,
+}
+
+fn read_jb2_record_prefix_record(
+    decoder: &mut Jb2Decoder<'_>,
+    header: Jb2ImageHeader,
+    index: usize,
+    kind: Jb2RecordKind,
+) -> Jb2Result<Jb2PrefixRecord> {
+    match kind {
+        Jb2RecordKind::NewSymbolAddAndBlit | Jb2RecordKind::NewSymbolBlitOnly => {
+            read_jb2_direct_prefix_record(decoder, index, kind, PrefixRecordPosition::Relative)
+        }
+        Jb2RecordKind::NewSymbolAddOnly => {
+            read_jb2_direct_prefix_record(decoder, index, kind, PrefixRecordPosition::None)
+        }
+        Jb2RecordKind::NonSymbol => read_jb2_direct_prefix_record(
+            decoder,
+            index,
+            kind,
+            PrefixRecordPosition::Absolute(header),
+        ),
+        Jb2RecordKind::StartOfImage => Ok(Jb2PrefixRecord::Record(empty_record(index, kind))),
+        Jb2RecordKind::Comment => {
+            decoder.skip_comment();
+            Ok(Jb2PrefixRecord::Record(empty_record(index, kind)))
+        }
+        Jb2RecordKind::EndOfData => Ok(Jb2PrefixRecord::EndOfData),
+        Jb2RecordKind::MatchedRefineAddAndBlit
+        | Jb2RecordKind::MatchedRefineAddOnly
+        | Jb2RecordKind::MatchedRefineBlitOnly
+        | Jb2RecordKind::MatchedCopyBlitOnly
+        | Jb2RecordKind::RequiredDictOrReset => Ok(Jb2PrefixRecord::Unsupported),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PrefixRecordPosition {
+    None,
+    Relative,
+    Absolute(Jb2ImageHeader),
+}
+
+fn read_jb2_direct_prefix_record(
+    decoder: &mut Jb2Decoder<'_>,
+    index: usize,
+    kind: Jb2RecordKind,
+    position: PrefixRecordPosition,
+) -> Jb2Result<Jb2PrefixRecord> {
+    let symbol_width = decoder.decode_symbol_width()?;
+    let symbol_height = decoder.decode_symbol_height()?;
+    let _ = decoder.decode_direct_bitmap(symbol_width, symbol_height)?;
+    let position = match position {
+        PrefixRecordPosition::None => None,
+        PrefixRecordPosition::Relative => {
+            Some(decoder.decode_symbol_coords(symbol_width, symbol_height))
+        }
+        PrefixRecordPosition::Absolute(header) => {
+            Some(decoder.decode_absolute_symbol_coords(header, symbol_height)?)
+        }
+    };
+
+    Ok(Jb2PrefixRecord::Record(Jb2RecordSummary {
+        index,
+        kind,
+        symbol_width: Some(symbol_width),
+        symbol_height: Some(symbol_height),
+        x: position.map(|(x, _)| x),
+        y: position.map(|(_, y)| y),
+    }))
+}
+
+enum Jb2RenderRecord {
+    Record(Jb2RecordSummary),
+    Skip,
+    EndOfData,
+}
+
+fn render_jb2_record(
+    decoder: &mut Jb2Decoder<'_>,
+    header: Jb2ImageHeader,
+    mask: &mut BitonalBitmap,
+    dictionary: &mut Vec<Jb2SymbolBitmap>,
+    index: usize,
+    kind: Jb2RecordKind,
+) -> Jb2Result<Jb2RenderRecord> {
+    match kind {
+        Jb2RecordKind::NewSymbolAddAndBlit => render_new_symbol_record(
+            decoder,
+            mask,
+            dictionary,
+            index,
+            kind,
+            SymbolRecordAction::AddAndBlit,
+        ),
+        Jb2RecordKind::NewSymbolAddOnly => render_new_symbol_record(
+            decoder,
+            mask,
+            dictionary,
+            index,
+            kind,
+            SymbolRecordAction::AddOnly,
+        ),
+        Jb2RecordKind::NewSymbolBlitOnly => render_new_symbol_record(
+            decoder,
+            mask,
+            dictionary,
+            index,
+            kind,
+            SymbolRecordAction::BlitOnly,
+        ),
+        Jb2RecordKind::NonSymbol => render_non_symbol_record(decoder, header, mask, index, kind),
+        Jb2RecordKind::MatchedRefineAddAndBlit => render_refined_symbol_record(
+            decoder,
+            mask,
+            dictionary,
+            index,
+            kind,
+            SymbolRecordAction::AddAndBlit,
+        ),
+        Jb2RecordKind::MatchedRefineAddOnly => render_refined_symbol_record(
+            decoder,
+            mask,
+            dictionary,
+            index,
+            kind,
+            SymbolRecordAction::AddOnly,
+        ),
+        Jb2RecordKind::MatchedRefineBlitOnly => render_refined_symbol_record(
+            decoder,
+            mask,
+            dictionary,
+            index,
+            kind,
+            SymbolRecordAction::BlitOnly,
+        ),
+        Jb2RecordKind::MatchedCopyBlitOnly => {
+            render_copy_blit_record(decoder, mask, dictionary, index, kind)
+        }
+        Jb2RecordKind::StartOfImage => Ok(Jb2RenderRecord::Record(empty_record(index, kind))),
+        Jb2RecordKind::Comment => {
+            decoder.skip_comment();
+            Ok(Jb2RenderRecord::Record(empty_record(index, kind)))
+        }
+        Jb2RecordKind::EndOfData => Ok(Jb2RenderRecord::EndOfData),
+        Jb2RecordKind::RequiredDictOrReset => Ok(Jb2RenderRecord::Skip),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SymbolRecordAction {
+    AddAndBlit,
+    AddOnly,
+    BlitOnly,
+}
+
+impl SymbolRecordAction {
+    const fn adds_to_dictionary(self) -> bool {
+        matches!(self, Self::AddAndBlit | Self::AddOnly)
+    }
+
+    const fn blits(self) -> bool {
+        matches!(self, Self::AddAndBlit | Self::BlitOnly)
+    }
+}
+
+fn render_new_symbol_record(
+    decoder: &mut Jb2Decoder<'_>,
+    mask: &mut BitonalBitmap,
+    dictionary: &mut Vec<Jb2SymbolBitmap>,
+    index: usize,
+    kind: Jb2RecordKind,
+    action: SymbolRecordAction,
+) -> Jb2Result<Jb2RenderRecord> {
+    let symbol = decoder.decode_direct_symbol()?;
+    Ok(render_decoded_symbol_record(
+        decoder, mask, dictionary, index, kind, action, &symbol,
+    ))
+}
+
+fn render_refined_symbol_record(
+    decoder: &mut Jb2Decoder<'_>,
+    mask: &mut BitonalBitmap,
+    dictionary: &mut Vec<Jb2SymbolBitmap>,
+    index: usize,
+    kind: Jb2RecordKind,
+    action: SymbolRecordAction,
+) -> Jb2Result<Jb2RenderRecord> {
+    let symbol = decoder.decode_refined_symbol(dictionary)?;
+    Ok(render_decoded_symbol_record(
+        decoder, mask, dictionary, index, kind, action, &symbol,
+    ))
+}
+
+fn render_decoded_symbol_record(
+    decoder: &mut Jb2Decoder<'_>,
+    mask: &mut BitonalBitmap,
+    dictionary: &mut Vec<Jb2SymbolBitmap>,
+    index: usize,
+    kind: Jb2RecordKind,
+    action: SymbolRecordAction,
+    symbol: &Jb2SymbolBitmap,
+) -> Jb2RenderRecord {
+    let position = if action.blits() {
+        let (x, y) = decoder.decode_symbol_coords(symbol.width, symbol.height);
+        blit_symbol(mask, symbol, x, y);
+        Some((x, y))
+    } else {
+        None
+    };
+    let record = symbol_record(index, kind, symbol, position);
+    if action.adds_to_dictionary() {
+        dictionary.push(symbol.dictionary_symbol());
+    }
+
+    Jb2RenderRecord::Record(record)
+}
+
+fn render_non_symbol_record(
+    decoder: &mut Jb2Decoder<'_>,
+    header: Jb2ImageHeader,
+    mask: &mut BitonalBitmap,
+    index: usize,
+    kind: Jb2RecordKind,
+) -> Jb2Result<Jb2RenderRecord> {
+    let symbol = decoder.decode_direct_symbol()?;
+    let (x, y) = decoder.decode_absolute_symbol_coords(header, symbol.height)?;
+    blit_symbol(mask, &symbol, x, y);
+    Ok(Jb2RenderRecord::Record(symbol_record(
+        index,
+        kind,
+        &symbol,
+        Some((x, y)),
+    )))
+}
+
+fn render_copy_blit_record(
+    decoder: &mut Jb2Decoder<'_>,
+    mask: &mut BitonalBitmap,
+    dictionary: &[Jb2SymbolBitmap],
+    index: usize,
+    kind: Jb2RecordKind,
+) -> Jb2Result<Jb2RenderRecord> {
+    let symbol = decode_dictionary_symbol(decoder, dictionary)?;
+    let (x, y) = decoder.decode_symbol_coords(symbol.width, symbol.height);
+    blit_symbol(mask, symbol, x, y);
+
+    Ok(Jb2RenderRecord::Record(symbol_record(
+        index,
+        kind,
+        symbol,
+        Some((x, y)),
+    )))
+}
+
+fn decode_dictionary_symbol<'a>(
+    decoder: &mut Jb2Decoder<'_>,
+    dictionary: &'a [Jb2SymbolBitmap],
+) -> Jb2Result<&'a Jb2SymbolBitmap> {
+    if dictionary.is_empty() {
+        return Err(Jb2Error::new(
+            "JB2 copy record references an empty dictionary",
+        ));
+    }
+    let symbol_index = decode_num(
+        &mut decoder.zp,
+        &mut decoder.symbol_index_context,
+        0,
+        i32::try_from(dictionary.len() - 1)
+            .map_err(|_| Jb2Error::new("JB2 dictionary is too large"))?,
+    );
+    let symbol_index = usize::try_from(symbol_index)
+        .map_err(|_| Jb2Error::new("JB2 copy symbol index is negative"))?;
+
+    dictionary
+        .get(symbol_index)
+        .ok_or_else(|| Jb2Error::new("JB2 copy symbol index is out of range"))
 }
 
 fn initial_dictionary(
@@ -765,6 +850,33 @@ impl<'a> Jb2Decoder<'a> {
             i32::try_from(symbol_width).expect("symbol width should fit i32"),
             i32::try_from(symbol_height).expect("symbol height should fit i32"),
         )
+    }
+
+    fn decode_absolute_symbol_coords(
+        &mut self,
+        header: Jb2ImageHeader,
+        symbol_height: u32,
+    ) -> Jb2Result<(i32, i32)> {
+        let image_width = i32::try_from(header.width)
+            .map_err(|_| Jb2Error::new("JB2 image width exceeds scanner range"))?;
+        let image_height = i32::try_from(header.height)
+            .map_err(|_| Jb2Error::new("JB2 image height exceeds scanner range"))?;
+        let x = decode_num(
+            &mut self.zp,
+            &mut self.horizontal_absolute_location_context,
+            1,
+            image_width,
+        ) - 1;
+        let top = decode_num(
+            &mut self.zp,
+            &mut self.vertical_absolute_location_context,
+            1,
+            image_height,
+        );
+        let symbol_height = i32::try_from(symbol_height)
+            .map_err(|_| Jb2Error::new("JB2 symbol height exceeds scanner range"))?;
+
+        Ok((x, top - symbol_height))
     }
 
     fn skip_comment(&mut self) {
@@ -1127,6 +1239,17 @@ fn symbol_record(
         symbol_height: Some(symbol.height),
         x: position.map(|(x, _)| x),
         y: position.map(|(_, y)| y),
+    }
+}
+
+const fn empty_record(index: usize, kind: Jb2RecordKind) -> Jb2RecordSummary {
+    Jb2RecordSummary {
+        index,
+        kind,
+        symbol_width: None,
+        symbol_height: None,
+        x: None,
+        y: None,
     }
 }
 

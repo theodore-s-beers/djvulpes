@@ -67,16 +67,15 @@ fn ccitt_group4_encode_row(
 
         let vertical_offset = isize::try_from(a1).expect("CCITT a1 should fit isize")
             - isize::try_from(b1).expect("CCITT b1 should fit isize");
-        #[allow(clippy::unreadable_literal)]
         if (-3..=3).contains(&vertical_offset) {
             match vertical_offset {
                 0 => writer.write_code(0b1, 1),
                 1 => writer.write_code(0b011, 3),
                 -1 => writer.write_code(0b010, 3),
-                2 => writer.write_code(0b000011, 6),
-                -2 => writer.write_code(0b000010, 6),
-                3 => writer.write_code(0b0000011, 7),
-                -3 => writer.write_code(0b0000010, 7),
+                2 => writer.write_code(0b00_0011, 6),
+                -2 => writer.write_code(0b00_0010, 6),
+                3 => writer.write_code(0b000_0011, 7),
+                -3 => writer.write_code(0b000_0010, 7),
                 _ => unreachable!("vertical offset range already checked"),
             }
             a0 = CcittPosition::At(a1);
@@ -211,15 +210,13 @@ impl CcittBitWriter {
         self.bytes
     }
 }
-
-#[allow(clippy::unreadable_literal)]
 const WHITE_TERMINATING_CODES: [CcittCode; 64] = [
     CcittCode {
-        bits: 0b00110101,
+        bits: 0b0011_0101,
         len: 8,
     },
     CcittCode {
-        bits: 0b000111,
+        bits: 0b00_0111,
         len: 6,
     },
     CcittCode {
@@ -247,235 +244,233 @@ const WHITE_TERMINATING_CODES: [CcittCode; 64] = [
         len: 4,
     },
     CcittCode {
-        bits: 0b10011,
+        bits: 0b1_0011,
         len: 5,
     },
     CcittCode {
-        bits: 0b10100,
+        bits: 0b1_0100,
         len: 5,
     },
     CcittCode {
-        bits: 0b00111,
+        bits: 0b0_0111,
         len: 5,
     },
     CcittCode {
-        bits: 0b01000,
+        bits: 0b0_1000,
         len: 5,
     },
     CcittCode {
-        bits: 0b001000,
+        bits: 0b00_1000,
         len: 6,
     },
     CcittCode {
-        bits: 0b000011,
+        bits: 0b00_0011,
         len: 6,
     },
     CcittCode {
-        bits: 0b110100,
+        bits: 0b11_0100,
         len: 6,
     },
     CcittCode {
-        bits: 0b110101,
+        bits: 0b11_0101,
         len: 6,
     },
     CcittCode {
-        bits: 0b101010,
+        bits: 0b10_1010,
         len: 6,
     },
     CcittCode {
-        bits: 0b101011,
+        bits: 0b10_1011,
         len: 6,
     },
     CcittCode {
-        bits: 0b0100111,
+        bits: 0b010_0111,
         len: 7,
     },
     CcittCode {
-        bits: 0b0001100,
+        bits: 0b000_1100,
         len: 7,
     },
     CcittCode {
-        bits: 0b0001000,
+        bits: 0b000_1000,
         len: 7,
     },
     CcittCode {
-        bits: 0b0010111,
+        bits: 0b001_0111,
         len: 7,
     },
     CcittCode {
-        bits: 0b0000011,
+        bits: 0b000_0011,
         len: 7,
     },
     CcittCode {
-        bits: 0b0000100,
+        bits: 0b000_0100,
         len: 7,
     },
     CcittCode {
-        bits: 0b0101000,
+        bits: 0b010_1000,
         len: 7,
     },
     CcittCode {
-        bits: 0b0101011,
+        bits: 0b010_1011,
         len: 7,
     },
     CcittCode {
-        bits: 0b0010011,
+        bits: 0b001_0011,
         len: 7,
     },
     CcittCode {
-        bits: 0b0100100,
+        bits: 0b010_0100,
         len: 7,
     },
     CcittCode {
-        bits: 0b0011000,
+        bits: 0b001_1000,
         len: 7,
     },
     CcittCode {
-        bits: 0b00000010,
+        bits: 0b0000_0010,
         len: 8,
     },
     CcittCode {
-        bits: 0b00000011,
+        bits: 0b0000_0011,
         len: 8,
     },
     CcittCode {
-        bits: 0b00011010,
+        bits: 0b0001_1010,
         len: 8,
     },
     CcittCode {
-        bits: 0b00011011,
+        bits: 0b0001_1011,
         len: 8,
     },
     CcittCode {
-        bits: 0b00010010,
+        bits: 0b0001_0010,
         len: 8,
     },
     CcittCode {
-        bits: 0b00010011,
+        bits: 0b0001_0011,
         len: 8,
     },
     CcittCode {
-        bits: 0b00010100,
+        bits: 0b0001_0100,
         len: 8,
     },
     CcittCode {
-        bits: 0b00010101,
+        bits: 0b0001_0101,
         len: 8,
     },
     CcittCode {
-        bits: 0b00010110,
+        bits: 0b0001_0110,
         len: 8,
     },
     CcittCode {
-        bits: 0b00010111,
+        bits: 0b0001_0111,
         len: 8,
     },
     CcittCode {
-        bits: 0b00101000,
+        bits: 0b0010_1000,
         len: 8,
     },
     CcittCode {
-        bits: 0b00101001,
+        bits: 0b0010_1001,
         len: 8,
     },
     CcittCode {
-        bits: 0b00101010,
+        bits: 0b0010_1010,
         len: 8,
     },
     CcittCode {
-        bits: 0b00101011,
+        bits: 0b0010_1011,
         len: 8,
     },
     CcittCode {
-        bits: 0b00101100,
+        bits: 0b0010_1100,
         len: 8,
     },
     CcittCode {
-        bits: 0b00101101,
+        bits: 0b0010_1101,
         len: 8,
     },
     CcittCode {
-        bits: 0b00000100,
+        bits: 0b0000_0100,
         len: 8,
     },
     CcittCode {
-        bits: 0b00000101,
+        bits: 0b0000_0101,
         len: 8,
     },
     CcittCode {
-        bits: 0b00001010,
+        bits: 0b0000_1010,
         len: 8,
     },
     CcittCode {
-        bits: 0b00001011,
+        bits: 0b0000_1011,
         len: 8,
     },
     CcittCode {
-        bits: 0b01010010,
+        bits: 0b0101_0010,
         len: 8,
     },
     CcittCode {
-        bits: 0b01010011,
+        bits: 0b0101_0011,
         len: 8,
     },
     CcittCode {
-        bits: 0b01010100,
+        bits: 0b0101_0100,
         len: 8,
     },
     CcittCode {
-        bits: 0b01010101,
+        bits: 0b0101_0101,
         len: 8,
     },
     CcittCode {
-        bits: 0b00100100,
+        bits: 0b0010_0100,
         len: 8,
     },
     CcittCode {
-        bits: 0b00100101,
+        bits: 0b0010_0101,
         len: 8,
     },
     CcittCode {
-        bits: 0b01011000,
+        bits: 0b0101_1000,
         len: 8,
     },
     CcittCode {
-        bits: 0b01011001,
+        bits: 0b0101_1001,
         len: 8,
     },
     CcittCode {
-        bits: 0b01011010,
+        bits: 0b0101_1010,
         len: 8,
     },
     CcittCode {
-        bits: 0b01011011,
+        bits: 0b0101_1011,
         len: 8,
     },
     CcittCode {
-        bits: 0b01001010,
+        bits: 0b0100_1010,
         len: 8,
     },
     CcittCode {
-        bits: 0b01001011,
+        bits: 0b0100_1011,
         len: 8,
     },
     CcittCode {
-        bits: 0b00110010,
+        bits: 0b0011_0010,
         len: 8,
     },
     CcittCode {
-        bits: 0b00110011,
+        bits: 0b0011_0011,
         len: 8,
     },
     CcittCode {
-        bits: 0b00110100,
+        bits: 0b0011_0100,
         len: 8,
     },
 ];
-
-#[allow(clippy::unreadable_literal)]
 const BLACK_TERMINATING_CODES: [CcittCode; 64] = [
     CcittCode {
-        bits: 0b0000110111,
+        bits: 0b00_0011_0111,
         len: 10,
     },
     CcittCode {
@@ -497,798 +492,794 @@ const BLACK_TERMINATING_CODES: [CcittCode; 64] = [
         len: 4,
     },
     CcittCode {
-        bits: 0b00011,
+        bits: 0b0_0011,
         len: 5,
     },
     CcittCode {
-        bits: 0b000101,
+        bits: 0b00_0101,
         len: 6,
     },
     CcittCode {
-        bits: 0b000100,
+        bits: 0b00_0100,
         len: 6,
     },
     CcittCode {
-        bits: 0b0000100,
+        bits: 0b000_0100,
         len: 7,
     },
     CcittCode {
-        bits: 0b0000101,
+        bits: 0b000_0101,
         len: 7,
     },
     CcittCode {
-        bits: 0b0000111,
+        bits: 0b000_0111,
         len: 7,
     },
     CcittCode {
-        bits: 0b00000100,
+        bits: 0b0000_0100,
         len: 8,
     },
     CcittCode {
-        bits: 0b00000111,
+        bits: 0b0000_0111,
         len: 8,
     },
     CcittCode {
-        bits: 0b000011000,
+        bits: 0b0_0001_1000,
         len: 9,
     },
     CcittCode {
-        bits: 0b0000010111,
+        bits: 0b00_0001_0111,
         len: 10,
     },
     CcittCode {
-        bits: 0b0000011000,
+        bits: 0b00_0001_1000,
         len: 10,
     },
     CcittCode {
-        bits: 0b0000001000,
+        bits: 0b00_0000_1000,
         len: 10,
     },
     CcittCode {
-        bits: 0b00001100111,
+        bits: 0b000_0110_0111,
         len: 11,
     },
     CcittCode {
-        bits: 0b00001101000,
+        bits: 0b000_0110_1000,
         len: 11,
     },
     CcittCode {
-        bits: 0b00001101100,
+        bits: 0b000_0110_1100,
         len: 11,
     },
     CcittCode {
-        bits: 0b00000110111,
+        bits: 0b000_0011_0111,
         len: 11,
     },
     CcittCode {
-        bits: 0b00000101000,
+        bits: 0b000_0010_1000,
         len: 11,
     },
     CcittCode {
-        bits: 0b00000010111,
+        bits: 0b000_0001_0111,
         len: 11,
     },
     CcittCode {
-        bits: 0b00000011000,
+        bits: 0b000_0001_1000,
         len: 11,
     },
     CcittCode {
-        bits: 0b000011001010,
+        bits: 0b0000_1100_1010,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011001011,
+        bits: 0b0000_1100_1011,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011001100,
+        bits: 0b0000_1100_1100,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011001101,
+        bits: 0b0000_1100_1101,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001101000,
+        bits: 0b0000_0110_1000,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001101001,
+        bits: 0b0000_0110_1001,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001101010,
+        bits: 0b0000_0110_1010,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001101011,
+        bits: 0b0000_0110_1011,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011010010,
+        bits: 0b0000_1101_0010,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011010011,
+        bits: 0b0000_1101_0011,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011010100,
+        bits: 0b0000_1101_0100,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011010101,
+        bits: 0b0000_1101_0101,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011010110,
+        bits: 0b0000_1101_0110,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011010111,
+        bits: 0b0000_1101_0111,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001101100,
+        bits: 0b0000_0110_1100,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001101101,
+        bits: 0b0000_0110_1101,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011011010,
+        bits: 0b0000_1101_1010,
         len: 12,
     },
     CcittCode {
-        bits: 0b000011011011,
+        bits: 0b0000_1101_1011,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001010100,
+        bits: 0b0000_0101_0100,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001010101,
+        bits: 0b0000_0101_0101,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001010110,
+        bits: 0b0000_0101_0110,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001010111,
+        bits: 0b0000_0101_0111,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001100100,
+        bits: 0b0000_0110_0100,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001100101,
+        bits: 0b0000_0110_0101,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001010010,
+        bits: 0b0000_0101_0010,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001010011,
+        bits: 0b0000_0101_0011,
         len: 12,
     },
     CcittCode {
-        bits: 0b000000100100,
+        bits: 0b0000_0010_0100,
         len: 12,
     },
     CcittCode {
-        bits: 0b000000110111,
+        bits: 0b0000_0011_0111,
         len: 12,
     },
     CcittCode {
-        bits: 0b000000111000,
+        bits: 0b0000_0011_1000,
         len: 12,
     },
     CcittCode {
-        bits: 0b000000100111,
+        bits: 0b0000_0010_0111,
         len: 12,
     },
     CcittCode {
-        bits: 0b000000101000,
+        bits: 0b0000_0010_1000,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001011000,
+        bits: 0b0000_0101_1000,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001011001,
+        bits: 0b0000_0101_1001,
         len: 12,
     },
     CcittCode {
-        bits: 0b000000101011,
+        bits: 0b0000_0010_1011,
         len: 12,
     },
     CcittCode {
-        bits: 0b000000101100,
+        bits: 0b0000_0010_1100,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001011010,
+        bits: 0b0000_0101_1010,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001100110,
+        bits: 0b0000_0110_0110,
         len: 12,
     },
     CcittCode {
-        bits: 0b000001100111,
+        bits: 0b0000_0110_0111,
         len: 12,
     },
 ];
-
-#[allow(clippy::unreadable_literal)]
 const WHITE_MAKEUP_CODES: &[(usize, CcittCode)] = &[
     (
         64,
         CcittCode {
-            bits: 0b11011,
+            bits: 0b1_1011,
             len: 5,
         },
     ),
     (
         128,
         CcittCode {
-            bits: 0b10010,
+            bits: 0b1_0010,
             len: 5,
         },
     ),
     (
         192,
         CcittCode {
-            bits: 0b010111,
+            bits: 0b01_0111,
             len: 6,
         },
     ),
     (
         256,
         CcittCode {
-            bits: 0b0110111,
+            bits: 0b011_0111,
             len: 7,
         },
     ),
     (
         320,
         CcittCode {
-            bits: 0b00110110,
+            bits: 0b0011_0110,
             len: 8,
         },
     ),
     (
         384,
         CcittCode {
-            bits: 0b00110111,
+            bits: 0b0011_0111,
             len: 8,
         },
     ),
     (
         448,
         CcittCode {
-            bits: 0b01100100,
+            bits: 0b0110_0100,
             len: 8,
         },
     ),
     (
         512,
         CcittCode {
-            bits: 0b01100101,
+            bits: 0b0110_0101,
             len: 8,
         },
     ),
     (
         576,
         CcittCode {
-            bits: 0b01101000,
+            bits: 0b0110_1000,
             len: 8,
         },
     ),
     (
         640,
         CcittCode {
-            bits: 0b01100111,
+            bits: 0b0110_0111,
             len: 8,
         },
     ),
     (
         704,
         CcittCode {
-            bits: 0b011001100,
+            bits: 0b0_1100_1100,
             len: 9,
         },
     ),
     (
         768,
         CcittCode {
-            bits: 0b011001101,
+            bits: 0b0_1100_1101,
             len: 9,
         },
     ),
     (
         832,
         CcittCode {
-            bits: 0b011010010,
+            bits: 0b0_1101_0010,
             len: 9,
         },
     ),
     (
         896,
         CcittCode {
-            bits: 0b011010011,
+            bits: 0b0_1101_0011,
             len: 9,
         },
     ),
     (
         960,
         CcittCode {
-            bits: 0b011010100,
+            bits: 0b0_1101_0100,
             len: 9,
         },
     ),
     (
         1024,
         CcittCode {
-            bits: 0b011010101,
+            bits: 0b0_1101_0101,
             len: 9,
         },
     ),
     (
         1088,
         CcittCode {
-            bits: 0b011010110,
+            bits: 0b0_1101_0110,
             len: 9,
         },
     ),
     (
         1152,
         CcittCode {
-            bits: 0b011010111,
+            bits: 0b0_1101_0111,
             len: 9,
         },
     ),
     (
         1216,
         CcittCode {
-            bits: 0b011011000,
+            bits: 0b0_1101_1000,
             len: 9,
         },
     ),
     (
         1280,
         CcittCode {
-            bits: 0b011011001,
+            bits: 0b0_1101_1001,
             len: 9,
         },
     ),
     (
         1344,
         CcittCode {
-            bits: 0b011011010,
+            bits: 0b0_1101_1010,
             len: 9,
         },
     ),
     (
         1408,
         CcittCode {
-            bits: 0b011011011,
+            bits: 0b0_1101_1011,
             len: 9,
         },
     ),
     (
         1472,
         CcittCode {
-            bits: 0b010011000,
+            bits: 0b0_1001_1000,
             len: 9,
         },
     ),
     (
         1536,
         CcittCode {
-            bits: 0b010011001,
+            bits: 0b0_1001_1001,
             len: 9,
         },
     ),
     (
         1600,
         CcittCode {
-            bits: 0b010011010,
+            bits: 0b0_1001_1010,
             len: 9,
         },
     ),
     (
         1664,
         CcittCode {
-            bits: 0b011000,
+            bits: 0b01_1000,
             len: 6,
         },
     ),
     (
         1728,
         CcittCode {
-            bits: 0b010011011,
+            bits: 0b0_1001_1011,
             len: 9,
         },
     ),
     (
         1792,
         CcittCode {
-            bits: 0b00000001000,
+            bits: 0b000_0000_1000,
             len: 11,
         },
     ),
     (
         1856,
         CcittCode {
-            bits: 0b00000001100,
+            bits: 0b000_0000_1100,
             len: 11,
         },
     ),
     (
         1920,
         CcittCode {
-            bits: 0b00000001101,
+            bits: 0b000_0000_1101,
             len: 11,
         },
     ),
     (
         1984,
         CcittCode {
-            bits: 0b000000010010,
+            bits: 0b0000_0001_0010,
             len: 12,
         },
     ),
     (
         2048,
         CcittCode {
-            bits: 0b000000010011,
+            bits: 0b0000_0001_0011,
             len: 12,
         },
     ),
     (
         2112,
         CcittCode {
-            bits: 0b000000010100,
+            bits: 0b0000_0001_0100,
             len: 12,
         },
     ),
     (
         2176,
         CcittCode {
-            bits: 0b000000010101,
+            bits: 0b0000_0001_0101,
             len: 12,
         },
     ),
     (
         2240,
         CcittCode {
-            bits: 0b000000010110,
+            bits: 0b0000_0001_0110,
             len: 12,
         },
     ),
     (
         2304,
         CcittCode {
-            bits: 0b000000010111,
+            bits: 0b0000_0001_0111,
             len: 12,
         },
     ),
     (
         2368,
         CcittCode {
-            bits: 0b000000011100,
+            bits: 0b0000_0001_1100,
             len: 12,
         },
     ),
     (
         2432,
         CcittCode {
-            bits: 0b000000011101,
+            bits: 0b0000_0001_1101,
             len: 12,
         },
     ),
     (
         2496,
         CcittCode {
-            bits: 0b000000011110,
+            bits: 0b0000_0001_1110,
             len: 12,
         },
     ),
     (
         2560,
         CcittCode {
-            bits: 0b000000011111,
+            bits: 0b0000_0001_1111,
             len: 12,
         },
     ),
 ];
-
-#[allow(clippy::unreadable_literal)]
 const BLACK_MAKEUP_CODES: &[(usize, CcittCode)] = &[
     (
         64,
         CcittCode {
-            bits: 0b0000001111,
+            bits: 0b00_0000_1111,
             len: 10,
         },
     ),
     (
         128,
         CcittCode {
-            bits: 0b000011001000,
+            bits: 0b0000_1100_1000,
             len: 12,
         },
     ),
     (
         192,
         CcittCode {
-            bits: 0b000011001001,
+            bits: 0b0000_1100_1001,
             len: 12,
         },
     ),
     (
         256,
         CcittCode {
-            bits: 0b000001011011,
+            bits: 0b0000_0101_1011,
             len: 12,
         },
     ),
     (
         320,
         CcittCode {
-            bits: 0b000000110011,
+            bits: 0b0000_0011_0011,
             len: 12,
         },
     ),
     (
         384,
         CcittCode {
-            bits: 0b000000110100,
+            bits: 0b0000_0011_0100,
             len: 12,
         },
     ),
     (
         448,
         CcittCode {
-            bits: 0b000000110101,
+            bits: 0b0000_0011_0101,
             len: 12,
         },
     ),
     (
         512,
         CcittCode {
-            bits: 0b0000001101100,
+            bits: 0b0_0000_0110_1100,
             len: 13,
         },
     ),
     (
         576,
         CcittCode {
-            bits: 0b0000001101101,
+            bits: 0b0_0000_0110_1101,
             len: 13,
         },
     ),
     (
         640,
         CcittCode {
-            bits: 0b0000001001010,
+            bits: 0b0_0000_0100_1010,
             len: 13,
         },
     ),
     (
         704,
         CcittCode {
-            bits: 0b0000001001011,
+            bits: 0b0_0000_0100_1011,
             len: 13,
         },
     ),
     (
         768,
         CcittCode {
-            bits: 0b0000001001100,
+            bits: 0b0_0000_0100_1100,
             len: 13,
         },
     ),
     (
         832,
         CcittCode {
-            bits: 0b0000001001101,
+            bits: 0b0_0000_0100_1101,
             len: 13,
         },
     ),
     (
         896,
         CcittCode {
-            bits: 0b0000001110010,
+            bits: 0b0_0000_0111_0010,
             len: 13,
         },
     ),
     (
         960,
         CcittCode {
-            bits: 0b0000001110011,
+            bits: 0b0_0000_0111_0011,
             len: 13,
         },
     ),
     (
         1024,
         CcittCode {
-            bits: 0b0000001110100,
+            bits: 0b0_0000_0111_0100,
             len: 13,
         },
     ),
     (
         1088,
         CcittCode {
-            bits: 0b0000001110101,
+            bits: 0b0_0000_0111_0101,
             len: 13,
         },
     ),
     (
         1152,
         CcittCode {
-            bits: 0b0000001110110,
+            bits: 0b0_0000_0111_0110,
             len: 13,
         },
     ),
     (
         1216,
         CcittCode {
-            bits: 0b0000001110111,
+            bits: 0b0_0000_0111_0111,
             len: 13,
         },
     ),
     (
         1280,
         CcittCode {
-            bits: 0b0000001010010,
+            bits: 0b0_0000_0101_0010,
             len: 13,
         },
     ),
     (
         1344,
         CcittCode {
-            bits: 0b0000001010011,
+            bits: 0b0_0000_0101_0011,
             len: 13,
         },
     ),
     (
         1408,
         CcittCode {
-            bits: 0b0000001010100,
+            bits: 0b0_0000_0101_0100,
             len: 13,
         },
     ),
     (
         1472,
         CcittCode {
-            bits: 0b0000001010101,
+            bits: 0b0_0000_0101_0101,
             len: 13,
         },
     ),
     (
         1536,
         CcittCode {
-            bits: 0b0000001011010,
+            bits: 0b0_0000_0101_1010,
             len: 13,
         },
     ),
     (
         1600,
         CcittCode {
-            bits: 0b0000001011011,
+            bits: 0b0_0000_0101_1011,
             len: 13,
         },
     ),
     (
         1664,
         CcittCode {
-            bits: 0b0000001100100,
+            bits: 0b0_0000_0110_0100,
             len: 13,
         },
     ),
     (
         1728,
         CcittCode {
-            bits: 0b0000001100101,
+            bits: 0b0_0000_0110_0101,
             len: 13,
         },
     ),
     (
         1792,
         CcittCode {
-            bits: 0b00000001000,
+            bits: 0b000_0000_1000,
             len: 11,
         },
     ),
     (
         1856,
         CcittCode {
-            bits: 0b00000001100,
+            bits: 0b000_0000_1100,
             len: 11,
         },
     ),
     (
         1920,
         CcittCode {
-            bits: 0b00000001101,
+            bits: 0b000_0000_1101,
             len: 11,
         },
     ),
     (
         1984,
         CcittCode {
-            bits: 0b000000010010,
+            bits: 0b0000_0001_0010,
             len: 12,
         },
     ),
     (
         2048,
         CcittCode {
-            bits: 0b000000010011,
+            bits: 0b0000_0001_0011,
             len: 12,
         },
     ),
     (
         2112,
         CcittCode {
-            bits: 0b000000010100,
+            bits: 0b0000_0001_0100,
             len: 12,
         },
     ),
     (
         2176,
         CcittCode {
-            bits: 0b000000010101,
+            bits: 0b0000_0001_0101,
             len: 12,
         },
     ),
     (
         2240,
         CcittCode {
-            bits: 0b000000010110,
+            bits: 0b0000_0001_0110,
             len: 12,
         },
     ),
     (
         2304,
         CcittCode {
-            bits: 0b000000010111,
+            bits: 0b0000_0001_0111,
             len: 12,
         },
     ),
     (
         2368,
         CcittCode {
-            bits: 0b000000011100,
+            bits: 0b0000_0001_1100,
             len: 12,
         },
     ),
     (
         2432,
         CcittCode {
-            bits: 0b000000011101,
+            bits: 0b0000_0001_1101,
             len: 12,
         },
     ),
     (
         2496,
         CcittCode {
-            bits: 0b000000011110,
+            bits: 0b0000_0001_1110,
             len: 12,
         },
     ),
     (
         2560,
         CcittCode {
-            bits: 0b000000011111,
+            bits: 0b0000_0001_1111,
             len: 12,
         },
     ),

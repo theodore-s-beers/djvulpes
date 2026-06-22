@@ -234,12 +234,11 @@ pub fn run() -> anyhow::Result<()> {
     run_command(cli.command.unwrap_or(Command::Summary { file: cli.file }))
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "CLI command dispatch is intentionally centralized"
-)]
 fn run_command(command: Command) -> anyhow::Result<()> {
     if run_compare_command(&command)? {
+        return Ok(());
+    }
+    if run_render_command(&command)? {
         return Ok(());
     }
 
@@ -250,63 +249,17 @@ fn run_command(command: Command) -> anyhow::Result<()> {
         Command::Form { offset, file } => run_form(&file, offset)?,
         Command::Dirm { file } => run_dirm(&file)?,
         Command::Page { number, file } => run_page(&file, number)?,
-        Command::RenderPlan { number, file } => run_render_plan(&file, number)?,
-        Command::RenderPage {
-            number,
-            output,
-            file,
-        } => run_render_page(&file, number, &output)?,
-        Command::RenderPageLayer {
-            number,
-            mode,
-            output,
-            file,
-        } => run_render_page_layer(&file, number, mode, &output)?,
-        Command::RenderPagePdf {
-            number,
-            output,
-            file,
-        } => run_render_page_pdf(&file, number, &output)?,
-        Command::RenderPdf {
-            output,
-            from_page,
-            to_page,
-            progress,
-            quiet,
-            verbose,
-            timings,
-            file,
-        } => run_render_pdf(
-            &file,
-            &output,
-            from_page,
-            to_page,
-            RenderPdfOptions {
-                progress: if quiet {
-                    RenderPdfProgress::Quiet
-                } else if progress {
-                    RenderPdfProgress::PerPage
-                } else {
-                    RenderPdfProgress::Sparse
-                },
-                verbose,
-                timings,
-            },
-        )?,
         Command::CompareRenderPage { .. }
         | Command::CompareRenderPages { .. }
         | Command::CompareRenderPageLayer { .. }
         | Command::ComparePpm { .. } => unreachable!("compare command already handled"),
-        Command::DumpBitonal {
-            number,
-            output_dir,
-            file,
-        } => run_dump_bitonal(&file, number, &output_dir)?,
-        Command::DumpImageLayers {
-            number,
-            output_dir,
-            file,
-        } => run_dump_image_layers(&file, number, &output_dir)?,
+        Command::RenderPlan { .. }
+        | Command::RenderPage { .. }
+        | Command::RenderPageLayer { .. }
+        | Command::RenderPagePdf { .. }
+        | Command::RenderPdf { .. }
+        | Command::DumpBitonal { .. }
+        | Command::DumpImageLayers { .. } => unreachable!("render command already handled"),
         Command::InspectIw44Pixel {
             number,
             mode,
@@ -324,29 +277,19 @@ fn run_command(command: Command) -> anyhow::Result<()> {
             &file,
             number,
             mode,
-            &Iw44PixelInspectOptions {
+            &iw44_pixel_inspect_options(
                 x,
                 y,
                 radius,
-                coefficient_limit: coefficients,
                 coefficient_indices,
-                traces: {
-                    let mut traces = Vec::with_capacity(4);
-                    if trace_coefficients {
-                        traces.push(Iw44PixelTrace::Coefficients);
-                    }
-                    if trace_slices {
-                        traces.push(Iw44PixelTrace::Slices);
-                    }
-                    if trace_events {
-                        traces.push(Iw44PixelTrace::Events);
-                    }
-                    if trace_reconstruction {
-                        traces.push(Iw44PixelTrace::Reconstruction);
-                    }
-                    traces
-                },
-            },
+                coefficients,
+                [
+                    (trace_coefficients, Iw44PixelTrace::Coefficients),
+                    (trace_slices, Iw44PixelTrace::Slices),
+                    (trace_events, Iw44PixelTrace::Events),
+                    (trace_reconstruction, Iw44PixelTrace::Reconstruction),
+                ],
+            ),
         )?,
         Command::Text {
             number,
@@ -363,6 +306,92 @@ fn run_command(command: Command) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_render_command(command: &Command) -> anyhow::Result<bool> {
+    match command {
+        Command::RenderPlan { number, file } => run_render_plan(file, *number)?,
+        Command::RenderPage {
+            number,
+            output,
+            file,
+        } => run_render_page(file, *number, output)?,
+        Command::RenderPageLayer {
+            number,
+            mode,
+            output,
+            file,
+        } => run_render_page_layer(file, *number, *mode, output)?,
+        Command::RenderPagePdf {
+            number,
+            output,
+            file,
+        } => run_render_page_pdf(file, *number, output)?,
+        Command::RenderPdf {
+            output,
+            from_page,
+            to_page,
+            progress,
+            quiet,
+            verbose,
+            timings,
+            file,
+        } => run_render_pdf(
+            file,
+            output,
+            *from_page,
+            *to_page,
+            RenderPdfOptions {
+                progress: render_pdf_progress(*quiet, *progress),
+                verbose: *verbose,
+                timings: *timings,
+            },
+        )?,
+        Command::DumpBitonal {
+            number,
+            output_dir,
+            file,
+        } => run_dump_bitonal(file, *number, output_dir)?,
+        Command::DumpImageLayers {
+            number,
+            output_dir,
+            file,
+        } => run_dump_image_layers(file, *number, output_dir)?,
+        _ => return Ok(false),
+    }
+
+    Ok(true)
+}
+
+const fn render_pdf_progress(quiet: bool, progress: bool) -> RenderPdfProgress {
+    if quiet {
+        RenderPdfProgress::Quiet
+    } else if progress {
+        RenderPdfProgress::PerPage
+    } else {
+        RenderPdfProgress::Sparse
+    }
+}
+
+fn iw44_pixel_inspect_options(
+    x: u32,
+    y: u32,
+    radius: u8,
+    coefficient_indices: Vec<usize>,
+    coefficient_limit: usize,
+    trace_flags: [(bool, Iw44PixelTrace); 4],
+) -> Iw44PixelInspectOptions {
+    Iw44PixelInspectOptions {
+        x,
+        y,
+        radius,
+        coefficient_limit,
+        coefficient_indices,
+        traces: trace_flags
+            .into_iter()
+            .filter_map(|(enabled, trace)| enabled.then_some(trace))
+            .collect(),
+    }
 }
 
 fn run_compare_command(command: &Command) -> anyhow::Result<bool> {
