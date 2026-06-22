@@ -1,10 +1,14 @@
 use crate::{
-    Bookmark, BzzError, DjvuRenderError, Document, PageRenderMode, ParseError, RenderError,
-    TextError, TextZone, TextZoneKind, decode_dirm_tail, extract_document_bookmarks,
-    extract_document_text_zone_pages, parse_dirm_tail,
+    Bookmark, BzzError, DjvuRenderError, Document, Jb2Dictionary, Jb2Error, Jb2PartialImage,
+    ParseError, RenderError, TextError, TextZone, TextZoneKind, decode_dirm_tail,
+    decode_jb2_dictionary, extract_document_bookmarks, extract_document_text_zone_pages,
+    parse_dirm_tail,
     render::{PageBitmap, PartialPageRender, PixelFormat},
+    render_jb2_image, render_jb2_image_with_dictionary,
 };
 mod ccitt;
+
+type Jb2DictionaryCache = BTreeMap<(usize, usize), Jb2Dictionary>;
 
 use std::{
     cell::RefCell,
@@ -79,13 +83,63 @@ pub enum DjvuPdfTimingStage {
     PagePlan,
     DirectBitonal,
     FallbackRender,
+    Jb2Decode,
+    Iw44Decode,
+    Iw44Composite,
+    MaskComposite,
+    ImageBytes,
+    CcittEncode,
+    PdfObjectWrite,
     PdfWrite,
+    PageTotal,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DjvuPdfPageKind {
+    DirectBitonal,
+    FallbackRgb,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct DjvuPdfTimingEvent {
     pub stage: DjvuPdfTimingStage,
     pub duration: Duration,
+    pub page_number: Option<usize>,
+    pub page_kind: Option<DjvuPdfPageKind>,
+}
+
+impl DjvuPdfTimingEvent {
+    const fn aggregate(stage: DjvuPdfTimingStage, duration: Duration) -> Self {
+        Self {
+            stage,
+            duration,
+            page_number: None,
+            page_kind: None,
+        }
+    }
+
+    const fn page(stage: DjvuPdfTimingStage, page_number: usize, duration: Duration) -> Self {
+        Self {
+            stage,
+            duration,
+            page_number: Some(page_number),
+            page_kind: None,
+        }
+    }
+
+    const fn page_kind(
+        stage: DjvuPdfTimingStage,
+        page_number: usize,
+        page_kind: DjvuPdfPageKind,
+        duration: Duration,
+    ) -> Self {
+        Self {
+            stage,
+            duration,
+            page_number: Some(page_number),
+            page_kind: Some(page_kind),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -349,10 +403,10 @@ where
     if let Some(finish_start) = finish_start
         && let Some(timing) = timing
     {
-        timing(DjvuPdfTimingEvent {
-            stage: DjvuPdfTimingStage::PdfWrite,
-            duration: finish_start.elapsed(),
-        });
+        timing(DjvuPdfTimingEvent::aggregate(
+            DjvuPdfTimingStage::PdfWrite,
+            finish_start.elapsed(),
+        ));
     }
 
     result
@@ -571,15 +625,35 @@ where
     E: From<PdfError>,
 {
     let image_start = timing.is_some().then(Instant::now);
+    let encode_start = timing.is_some().then(Instant::now);
     let image_stream = page_image.image_stream_object();
+    if let Some(encode_start) = encode_start
+        && let Some(timing) = timing.as_deref_mut()
+    {
+        let stage = if page_image.is_bitonal_mask() {
+            DjvuPdfTimingStage::CcittEncode
+        } else {
+            DjvuPdfTimingStage::ImageBytes
+        };
+        timing(DjvuPdfTimingEvent::aggregate(stage, encode_start.elapsed()));
+    }
+    let write_start = timing.is_some().then(Instant::now);
     pdf.write_object(image_id, &image_stream).map_err(E::from)?;
+    if let Some(write_start) = write_start
+        && let Some(timing) = timing.as_deref_mut()
+    {
+        timing(DjvuPdfTimingEvent::aggregate(
+            DjvuPdfTimingStage::PdfObjectWrite,
+            write_start.elapsed(),
+        ));
+    }
     if let Some(image_start) = image_start
         && let Some(timing) = timing.as_deref_mut()
     {
-        timing(DjvuPdfTimingEvent {
-            stage: DjvuPdfTimingStage::PdfWrite,
-            duration: image_start.elapsed(),
-        });
+        timing(DjvuPdfTimingEvent::aggregate(
+            DjvuPdfTimingStage::PdfWrite,
+            image_start.elapsed(),
+        ));
     }
 
     Ok(())
@@ -770,6 +844,7 @@ pub fn render_document_pdf_to_writer_with_events_and_timings<W: Write>(
     record_pdf_timing(&timing, DjvuPdfTimingStage::TextExtraction, text_start);
     let selected_page_count = end_page - from_page + 1;
     let mut pages = document.pages(bytes).enumerate();
+    let mut bitonal_dictionary_cache = Jb2DictionaryCache::new();
 
     let page_images = std::iter::from_fn(|| {
         for (index, page) in pages.by_ref() {
@@ -786,29 +861,20 @@ pub fn render_document_pdf_to_writer_with_events_and_timings<W: Write>(
                 end_page,
             });
             let image = (|| {
+                let page_total_start = pdf_timing_start(&timing);
                 let page = page?;
                 let plan_start = pdf_timing_start(&timing);
                 let plan = document.page_render_plan(bytes, &page, &tail_entries)?;
                 record_pdf_timing(&timing, DjvuPdfTimingStage::PagePlan, plan_start);
-                let direct_start = pdf_timing_start(&timing);
-                if let Some(image) = direct_bitonal_pdf_page_image(bytes, &plan)? {
-                    record_pdf_timing(&timing, DjvuPdfTimingStage::DirectBitonal, direct_start);
-                    event(DjvuPdfRenderEvent::PageImagePrepared {
-                        page_number,
-                        image: &image,
-                    });
-                    return Ok(image);
-                }
-
-                let render_start = pdf_timing_start(&timing);
-                let render = plan.render_bitmap_with_mode(bytes, PageRenderMode::Full)?;
-                record_pdf_timing(&timing, DjvuPdfTimingStage::FallbackRender, render_start);
-                event(DjvuPdfRenderEvent::PageRendered {
+                pdf_page_image_from_plan(
+                    bytes,
+                    &plan,
                     page_number,
-                    render: &render,
-                });
-
-                Ok(PdfPageImage::from_render(&render))
+                    page_total_start,
+                    &timing,
+                    &mut bitonal_dictionary_cache,
+                    &mut event,
+                )
             })();
 
             return Some(image);
@@ -848,11 +914,117 @@ fn record_pdf_timing(
     if let Some(start) = start
         && let Some(timing) = timing.borrow_mut().as_deref_mut()
     {
-        timing(DjvuPdfTimingEvent {
-            stage,
-            duration: start.elapsed(),
-        });
+        timing(DjvuPdfTimingEvent::aggregate(stage, start.elapsed()));
     }
+}
+
+fn record_pdf_page_timing(
+    timing: &RefCell<Option<&mut dyn FnMut(DjvuPdfTimingEvent)>>,
+    stage: DjvuPdfTimingStage,
+    page_number: usize,
+    start: Option<Instant>,
+) {
+    if let Some(start) = start
+        && let Some(timing) = timing.borrow_mut().as_deref_mut()
+    {
+        timing(DjvuPdfTimingEvent::page(
+            stage,
+            page_number,
+            start.elapsed(),
+        ));
+    }
+}
+
+fn record_pdf_page_kind_timing(
+    timing: &RefCell<Option<&mut dyn FnMut(DjvuPdfTimingEvent)>>,
+    stage: DjvuPdfTimingStage,
+    page_number: usize,
+    page_kind: DjvuPdfPageKind,
+    start: Option<Instant>,
+) {
+    if let Some(start) = start
+        && let Some(timing) = timing.borrow_mut().as_deref_mut()
+    {
+        timing(DjvuPdfTimingEvent::page_kind(
+            stage,
+            page_number,
+            page_kind,
+            start.elapsed(),
+        ));
+    }
+}
+
+fn pdf_page_image_from_plan(
+    bytes: &[u8],
+    plan: &crate::PageRenderPlan<'_>,
+    page_number: usize,
+    page_total_start: Option<Instant>,
+    timing: &RefCell<Option<&mut dyn FnMut(DjvuPdfTimingEvent)>>,
+    bitonal_dictionary_cache: &mut Jb2DictionaryCache,
+    event: &mut impl FnMut(DjvuPdfRenderEvent<'_>),
+) -> DjvuPdfResult<PdfPageImage> {
+    let direct_start = pdf_timing_start(timing);
+    if let Some(image) =
+        direct_bitonal_pdf_page_image(bytes, plan, page_number, timing, bitonal_dictionary_cache)?
+    {
+        record_pdf_page_kind_timing(
+            timing,
+            DjvuPdfTimingStage::DirectBitonal,
+            page_number,
+            DjvuPdfPageKind::DirectBitonal,
+            direct_start,
+        );
+        record_pdf_page_kind_timing(
+            timing,
+            DjvuPdfTimingStage::PageTotal,
+            page_number,
+            DjvuPdfPageKind::DirectBitonal,
+            page_total_start,
+        );
+        event(DjvuPdfRenderEvent::PageImagePrepared {
+            page_number,
+            image: &image,
+        });
+        return Ok(image);
+    }
+
+    let render_start = pdf_timing_start(timing);
+    let render = render_full_page_with_pdf_timings(
+        bytes,
+        plan,
+        page_number,
+        timing,
+        bitonal_dictionary_cache,
+    )?;
+    record_pdf_page_kind_timing(
+        timing,
+        DjvuPdfTimingStage::FallbackRender,
+        page_number,
+        DjvuPdfPageKind::FallbackRgb,
+        render_start,
+    );
+    event(DjvuPdfRenderEvent::PageRendered {
+        page_number,
+        render: &render,
+    });
+
+    let image_start = pdf_timing_start(timing);
+    let image = PdfPageImage::from_render(&render);
+    record_pdf_page_timing(
+        timing,
+        DjvuPdfTimingStage::ImageBytes,
+        page_number,
+        image_start,
+    );
+    record_pdf_page_kind_timing(
+        timing,
+        DjvuPdfTimingStage::PageTotal,
+        page_number,
+        DjvuPdfPageKind::FallbackRgb,
+        page_total_start,
+    );
+
+    Ok(image)
 }
 
 fn checked_document_pdf_page_range(
@@ -889,12 +1061,23 @@ fn checked_document_pdf_page_range(
 fn direct_bitonal_pdf_page_image(
     bytes: &[u8],
     plan: &crate::PageRenderPlan<'_>,
+    page_number: usize,
+    timing: &RefCell<Option<&mut dyn FnMut(DjvuPdfTimingEvent)>>,
+    bitonal_dictionary_cache: &mut Jb2DictionaryCache,
 ) -> Result<Option<PdfPageImage>, RenderError> {
     if !plan.background_layers.is_empty() || !plan.foreground_layers.is_empty() {
         return Ok(None);
     }
 
-    let masks = plan.bitonal_masks(bytes).map_err(RenderError::from)?;
+    let jb2_start = pdf_timing_start(timing);
+    let masks = bitonal_masks_with_cache(plan, bytes, bitonal_dictionary_cache)
+        .map_err(RenderError::from)?;
+    record_pdf_page_timing(
+        timing,
+        DjvuPdfTimingStage::Jb2Decode,
+        page_number,
+        jb2_start,
+    );
     let [(.., partial)] = masks.as_slice() else {
         return Ok(None);
     };
@@ -904,12 +1087,147 @@ fn direct_bitonal_pdf_page_image(
         return Ok(None);
     }
 
+    let image_start = pdf_timing_start(timing);
+    let mask = partial.mask.to_image_mask_bytes();
+    record_pdf_page_timing(
+        timing,
+        DjvuPdfTimingStage::ImageBytes,
+        page_number,
+        image_start,
+    );
+
     Ok(Some(PdfPageImage::BitonalMask {
         width: partial.mask.width,
         height: partial.mask.height,
         dpi: plan.info.dpi,
-        mask: partial.mask.to_image_mask_bytes(),
+        mask,
     }))
+}
+
+fn bitonal_masks_with_cache(
+    plan: &crate::PageRenderPlan<'_>,
+    bytes: &[u8],
+    bitonal_dictionary_cache: &mut Jb2DictionaryCache,
+) -> Result<Vec<(usize, Jb2PartialImage)>, Jb2Error> {
+    let dictionary = bitonal_dictionary_with_cache(plan, bytes, bitonal_dictionary_cache)?;
+    plan.bitonal_image_payloads(bytes)
+        .into_iter()
+        .map(|payload| {
+            let image = dictionary.map_or_else(
+                || render_jb2_image(payload.bytes),
+                |dictionary| render_jb2_image_with_dictionary(payload.bytes, dictionary),
+            )?;
+            Ok((payload.index, image))
+        })
+        .collect()
+}
+
+fn bitonal_dictionary_with_cache<'cache>(
+    plan: &crate::PageRenderPlan<'_>,
+    bytes: &[u8],
+    bitonal_dictionary_cache: &'cache mut Jb2DictionaryCache,
+) -> Result<Option<&'cache Jb2Dictionary>, Jb2Error> {
+    let mut last_key = None;
+    for payload in plan.bitonal_dictionary_payloads(bytes) {
+        let key = (payload.bytes.as_ptr() as usize, payload.bytes.len());
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            bitonal_dictionary_cache.entry(key)
+        {
+            entry.insert(decode_jb2_dictionary(payload.bytes)?);
+        }
+        last_key = Some(key);
+    }
+
+    Ok(last_key.and_then(|key| bitonal_dictionary_cache.get(&key)))
+}
+
+fn render_full_page_with_pdf_timings(
+    bytes: &[u8],
+    plan: &crate::PageRenderPlan<'_>,
+    page_number: usize,
+    timing: &RefCell<Option<&mut dyn FnMut(DjvuPdfTimingEvent)>>,
+    bitonal_dictionary_cache: &mut Jb2DictionaryCache,
+) -> Result<PartialPageRender, RenderError> {
+    let mut iw44_layers = Vec::with_capacity(2);
+    let mut bitmap = plan.render_base_bitmap();
+
+    let background_start = pdf_timing_start(timing);
+    let background = plan.background_iw44_layer(bytes)?;
+    record_pdf_page_timing(
+        timing,
+        DjvuPdfTimingStage::Iw44Decode,
+        page_number,
+        background_start,
+    );
+    if let Some(background) = background {
+        let composite_start = pdf_timing_start(timing);
+        if !bitmap.paint_iw44_rgb_layer(&background.image, &background.geometry.mapping) {
+            return Err(RenderError::new(format!(
+                "background IW44 layer dimensions {}x{} do not map to page {}x{}",
+                background.image.width, background.image.height, bitmap.width, bitmap.height
+            )));
+        }
+        record_pdf_page_timing(
+            timing,
+            DjvuPdfTimingStage::Iw44Composite,
+            page_number,
+            composite_start,
+        );
+        iw44_layers.push(background);
+    }
+
+    let foreground_start = pdf_timing_start(timing);
+    let foreground = plan.foreground_iw44_layer(bytes)?;
+    record_pdf_page_timing(
+        timing,
+        DjvuPdfTimingStage::Iw44Decode,
+        page_number,
+        foreground_start,
+    );
+
+    let jb2_start = pdf_timing_start(timing);
+    let bitonal_masks = bitonal_masks_with_cache(plan, bytes, bitonal_dictionary_cache)?;
+    record_pdf_page_timing(
+        timing,
+        DjvuPdfTimingStage::Jb2Decode,
+        page_number,
+        jb2_start,
+    );
+
+    for (chunk_index, partial) in &bitonal_masks {
+        let composite_start = pdf_timing_start(timing);
+        let painted = if let Some(foreground) = &foreground {
+            bitmap.paint_iw44_rgb_layer_through_mask(
+                &foreground.image,
+                &foreground.geometry.mapping,
+                &partial.mask,
+            )
+        } else {
+            bitmap.paint_bitonal_mask(&partial.mask, [0, 0, 0])
+        };
+        record_pdf_page_timing(
+            timing,
+            DjvuPdfTimingStage::MaskComposite,
+            page_number,
+            composite_start,
+        );
+
+        if !painted {
+            return Err(RenderError::new(format!(
+                "bitonal image #{chunk_index} dimensions {}x{} do not match page {}x{}",
+                partial.mask.width, partial.mask.height, bitmap.width, bitmap.height
+            )));
+        }
+    }
+    if let Some(foreground) = foreground {
+        iw44_layers.push(foreground);
+    }
+
+    Ok(PartialPageRender {
+        bitmap,
+        iw44_layers,
+        bitonal_masks,
+    })
 }
 
 fn pdf_text_pages_from_djvu(

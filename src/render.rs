@@ -180,16 +180,13 @@ impl BitonalBitmap {
         }
 
         let mut bytes = Vec::with_capacity(row_bytes.saturating_mul(self.height as usize));
-
         for y in 0..self.height {
-            let mut row = vec![0; row_bytes];
-            for x in 0..self.width {
-                if self.bit(x, y).unwrap_or(false) {
-                    let x = x as usize;
-                    row[x / 8] |= 0x80 >> (x % 8);
-                }
-            }
-            bytes.extend_from_slice(&row);
+            append_row_aligned_bits(
+                &self.bits,
+                (y as usize).saturating_mul(self.width as usize),
+                self.width as usize,
+                &mut bytes,
+            );
         }
 
         bytes
@@ -221,6 +218,34 @@ impl BitonalBitmap {
         let y = usize::try_from(y).ok()?;
         y.checked_mul(width)?.checked_add(x)
     }
+}
+
+fn append_row_aligned_bits(source: &[u8], bit_offset: usize, width: usize, output: &mut Vec<u8>) {
+    let row_bytes = width.div_ceil(8);
+    for byte_index in 0..row_bytes {
+        output.push(row_aligned_byte(source, bit_offset, width, byte_index));
+    }
+}
+
+fn row_aligned_byte(source: &[u8], bit_offset: usize, width: usize, byte_index: usize) -> u8 {
+    let remaining = width.saturating_sub(byte_index * 8);
+    let mut byte = packed_byte_at(source, bit_offset + (byte_index * 8));
+    if remaining < 8 {
+        byte &= 0xff << (8 - remaining);
+    }
+    byte
+}
+
+fn packed_byte_at(source: &[u8], bit_offset: usize) -> u8 {
+    let byte_index = bit_offset / 8;
+    let shift = bit_offset % 8;
+    let current = source.get(byte_index).copied().unwrap_or(0);
+    if shift == 0 {
+        return current;
+    }
+
+    let next = source.get(byte_index + 1).copied().unwrap_or(0);
+    (current << shift) | (next >> (8 - shift))
 }
 
 impl PageBitmap {
@@ -278,10 +303,27 @@ impl PageBitmap {
             return false;
         }
 
-        for y in 0..mask.height {
-            for x in 0..mask.width {
-                if mask.bit(x, y).unwrap_or(false) {
-                    self.set_rgb(x, y, color);
+        let width = self.width as usize;
+        let row_bytes = width.div_ceil(8);
+        for y in 0..self.height as usize {
+            let mask_row_bit = y.saturating_mul(width);
+            let bitmap_row_offset = y.saturating_mul(width).saturating_mul(3);
+            for byte_index in 0..row_bytes {
+                let mask_byte = row_aligned_byte(&mask.bits, mask_row_bit, width, byte_index);
+                if mask_byte == 0 {
+                    continue;
+                }
+
+                for bit in 0..8 {
+                    if mask_byte & (0x80 >> bit) == 0 {
+                        continue;
+                    }
+                    let x = (byte_index * 8) + bit;
+                    if x >= width {
+                        break;
+                    }
+                    let offset = bitmap_row_offset + (x * 3);
+                    self.pixels[offset..offset + 3].copy_from_slice(&color);
                 }
             }
         }
@@ -298,9 +340,45 @@ impl PageBitmap {
             return false;
         }
 
+        if mapping.subsample != 1 {
+            return self.paint_scaled_iw44_rgb_layer_with_row_buffer(image, mapping);
+        }
+
+        let width = self.width as usize;
         for y in 0..self.height {
+            let row_offset = (y as usize).saturating_mul(width).saturating_mul(3);
             for x in 0..self.width {
-                self.set_rgb(x, y, iw44_background_pixel(image, mapping, x, y));
+                let offset = row_offset + (x as usize * 3);
+                self.pixels[offset..offset + 3]
+                    .copy_from_slice(&iw44_background_pixel(image, mapping, x, y));
+            }
+        }
+
+        true
+    }
+
+    fn paint_scaled_iw44_rgb_layer_with_row_buffer(
+        &mut self,
+        image: &Iw44RgbImage,
+        mapping: &Iw44PageMapping,
+    ) -> bool {
+        let Ok(width) = usize::try_from(self.width) else {
+            return false;
+        };
+        let horizontal_samples = iw44_horizontal_axis_samples(image.width, mapping, self.width);
+        let mut row_buffer = vec![0; image.width.saturating_mul(3)];
+
+        for y in 0..self.height {
+            let vertical_sample = iw44_vertical_axis_sample(image.height, mapping, y);
+            fill_iw44_vertical_row_buffer(image, vertical_sample, &mut row_buffer);
+            let row_offset = (y as usize).saturating_mul(width).saturating_mul(3);
+            for (x, horizontal_sample) in horizontal_samples.iter().copied().enumerate() {
+                let offset = row_offset + (x * 3);
+                write_iw44_horizontal_sample(
+                    &mut self.pixels[offset..offset + 3],
+                    &row_buffer,
+                    horizontal_sample,
+                );
             }
         }
 
@@ -320,6 +398,8 @@ impl PageBitmap {
             return false;
         }
 
+        let width = self.width as usize;
+        let row_bytes = width.div_ceil(8);
         for y in 0..self.height {
             let source_y = iw44_source_coordinate(
                 y,
@@ -327,22 +407,37 @@ impl PageBitmap {
                 mapping.subsample,
                 image.height,
             );
-            for x in 0..self.width {
-                if !mask.bit(x, y).unwrap_or(false) {
+            let y = y as usize;
+            let mask_row_bit = y.saturating_mul(width);
+            let bitmap_row_offset = y.saturating_mul(width).saturating_mul(3);
+            for byte_index in 0..row_bytes {
+                let mask_byte = row_aligned_byte(&mask.bits, mask_row_bit, width, byte_index);
+                if mask_byte == 0 {
                     continue;
                 }
 
-                let source_x = iw44_source_coordinate(x, 0, mapping.subsample, image.width);
-                let source_offset = (source_y * image.width + source_x) * 3;
-                self.set_rgb(
-                    x,
-                    y,
-                    [
+                for bit in 0..8 {
+                    if mask_byte & (0x80 >> bit) == 0 {
+                        continue;
+                    }
+                    let x = (byte_index * 8) + bit;
+                    if x >= width {
+                        break;
+                    }
+
+                    let Ok(source_x_input) = u32::try_from(x) else {
+                        return false;
+                    };
+                    let source_x =
+                        iw44_source_coordinate(source_x_input, 0, mapping.subsample, image.width);
+                    let source_offset = (source_y * image.width + source_x) * 3;
+                    let bitmap_offset = bitmap_row_offset + (x * 3);
+                    self.pixels[bitmap_offset..bitmap_offset + 3].copy_from_slice(&[
                         image.pixels[source_offset],
                         image.pixels[source_offset + 1],
                         image.pixels[source_offset + 2],
-                    ],
-                );
+                    ]);
+                }
             }
         }
 
@@ -580,6 +675,93 @@ fn iw44_scaled_pixel(image: &Iw44RgbImage, mapping: &Iw44PageMapping, x: u32, y:
     }
 
     pixel
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct Iw44AxisSample {
+    first: usize,
+    second: usize,
+    fraction: u16,
+}
+
+fn iw44_horizontal_axis_samples(
+    input_width: usize,
+    mapping: &Iw44PageMapping,
+    output_width: u32,
+) -> Vec<Iw44AxisSample> {
+    (0..output_width)
+        .map(|x| {
+            iw44_axis_sample(
+                iw44_scaler_coordinate(input_width, mapping.subsample, x),
+                input_width,
+            )
+        })
+        .collect()
+}
+
+fn iw44_vertical_axis_sample(
+    input_height: usize,
+    mapping: &Iw44PageMapping,
+    output_y: u32,
+) -> Iw44AxisSample {
+    iw44_axis_sample(
+        iw44_top_down_scaler_coordinate(input_height, mapping, output_y),
+        input_height,
+    )
+}
+
+fn iw44_axis_sample(fixed_coordinate: i32, limit: usize) -> Iw44AxisSample {
+    let (first, fraction) = iw44_scaler_index_and_fraction(fixed_coordinate);
+    Iw44AxisSample {
+        first: clamp_iw44_sample_index(first, limit),
+        second: clamp_iw44_sample_index(first + 1, limit),
+        fraction,
+    }
+}
+
+fn clamp_iw44_sample_index(index: i32, limit: usize) -> usize {
+    usize::try_from(index)
+        .unwrap_or(0)
+        .min(limit.saturating_sub(1))
+}
+
+fn fill_iw44_vertical_row_buffer(
+    image: &Iw44RgbImage,
+    vertical_sample: Iw44AxisSample,
+    row_buffer: &mut [u8],
+) {
+    let top_offset = vertical_sample.first * image.width * 3;
+    let bottom_offset = vertical_sample.second * image.width * 3;
+    for x in 0..image.width {
+        let source_offset = x * 3;
+        let output_offset = x * 3;
+        for channel in 0..3 {
+            let value = iw44_interpolate_fixed(
+                u16::from(image.pixels[top_offset + source_offset + channel]),
+                u16::from(image.pixels[bottom_offset + source_offset + channel]),
+                vertical_sample.fraction,
+            );
+            row_buffer[output_offset + channel] =
+                u8::try_from(value).expect("weighted RGB value should fit u8");
+        }
+    }
+}
+
+fn write_iw44_horizontal_sample(
+    output: &mut [u8],
+    row_buffer: &[u8],
+    horizontal_sample: Iw44AxisSample,
+) {
+    let left_offset = horizontal_sample.first * 3;
+    let right_offset = horizontal_sample.second * 3;
+    for channel in 0..3 {
+        let value = iw44_interpolate_fixed(
+            u16::from(row_buffer[left_offset + channel]),
+            u16::from(row_buffer[right_offset + channel]),
+            horizontal_sample.fraction,
+        );
+        output[channel] = u8::try_from(value).expect("weighted RGB value should fit u8");
+    }
 }
 
 fn iw44_scaler_coordinate(input_size: usize, subsample: u32, output_coordinate: u32) -> i32 {

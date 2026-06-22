@@ -9,7 +9,7 @@ use djvulpes::{
     parse_text_payload, parse_text_zones, read_page_details,
     render_document_pdf_to_writer_with_events_and_timings, render_document_pdf_with_events,
 };
-use djvulpes::{DjvuPdfTimingEvent, DjvuPdfTimingStage};
+use djvulpes::{DjvuPdfPageKind, DjvuPdfTimingEvent, DjvuPdfTimingStage};
 use djvulpes::{decode_bzz, decode_dirm_tail};
 use std::fmt::Write as _;
 use std::fs;
@@ -482,56 +482,221 @@ pub fn run_render_pdf(
 
 #[derive(Debug, Default)]
 struct PdfTimingSummary {
-    setup: Duration,
-    text_extraction: Duration,
-    page_plan: Duration,
-    direct_bitonal: Duration,
-    fallback_render: Duration,
-    pdf_write: Duration,
+    stages: Vec<(DjvuPdfTimingStage, Duration)>,
+    pages: Vec<PdfPageTiming>,
+    direct_bitonal_pages: usize,
+    fallback_rgb_pages: usize,
 }
 
 impl PdfTimingSummary {
     fn record(&mut self, event: DjvuPdfTimingEvent) {
-        match event.stage {
-            DjvuPdfTimingStage::Setup => self.setup += event.duration,
-            DjvuPdfTimingStage::TextExtraction => self.text_extraction += event.duration,
-            DjvuPdfTimingStage::PagePlan => self.page_plan += event.duration,
-            DjvuPdfTimingStage::DirectBitonal => self.direct_bitonal += event.duration,
-            DjvuPdfTimingStage::FallbackRender => self.fallback_render += event.duration,
-            DjvuPdfTimingStage::PdfWrite => self.pdf_write += event.duration,
+        *self.stage_mut(event.stage) += event.duration;
+        if let Some(page_number) = event.page_number {
+            let page = self.page_mut(page_number);
+            page.total += event.duration;
+            *page.stage_mut(event.stage) += event.duration;
+            if let Some(page_kind) = event.page_kind {
+                let first_kind = page.kind.is_none();
+                page.kind = Some(page_kind);
+                if first_kind {
+                    match page_kind {
+                        DjvuPdfPageKind::DirectBitonal => self.direct_bitonal_pages += 1,
+                        DjvuPdfPageKind::FallbackRgb => self.fallback_rgb_pages += 1,
+                    }
+                }
+            }
         }
+    }
+
+    fn stage_mut(&mut self, stage: DjvuPdfTimingStage) -> &mut Duration {
+        if let Some(index) = self
+            .stages
+            .iter()
+            .position(|(candidate, _)| *candidate == stage)
+        {
+            return &mut self.stages[index].1;
+        }
+        self.stages.push((stage, Duration::ZERO));
+        &mut self.stages.last_mut().expect("stage was just pushed").1
+    }
+
+    fn page_mut(&mut self, page_number: usize) -> &mut PdfPageTiming {
+        if let Some(index) = self
+            .pages
+            .iter()
+            .position(|page| page.page_number == page_number)
+        {
+            return &mut self.pages[index];
+        }
+        self.pages.push(PdfPageTiming {
+            page_number,
+            ..PdfPageTiming::default()
+        });
+        self.pages.last_mut().expect("page was just pushed")
+    }
+
+    fn stage(&self, stage: DjvuPdfTimingStage) -> Duration {
+        self.stages
+            .iter()
+            .find_map(|(candidate, duration)| (*candidate == stage).then_some(*duration))
+            .unwrap_or(Duration::ZERO)
     }
 }
 
 impl std::fmt::Display for PdfTimingSummary {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(formatter, "timings:")?;
-        writeln!(formatter, "  setup: {}", format_duration(self.setup))?;
+        write_pdf_timing_stage_lines(formatter, self)?;
         writeln!(
             formatter,
-            "  text extraction: {}",
-            format_duration(self.text_extraction)
+            "  page kinds: {} direct bitonal, {} fallback RGB",
+            self.direct_bitonal_pages, self.fallback_rgb_pages
         )?;
+        write_pdf_timing_page_lines(formatter, self)?;
+
+        Ok(())
+    }
+}
+
+fn write_pdf_timing_stage_lines(
+    formatter: &mut std::fmt::Formatter<'_>,
+    summary: &PdfTimingSummary,
+) -> std::fmt::Result {
+    for (label, stage) in [
+        ("setup", DjvuPdfTimingStage::Setup),
+        ("text extraction", DjvuPdfTimingStage::TextExtraction),
+        ("page planning", DjvuPdfTimingStage::PagePlan),
+        ("direct bitonal", DjvuPdfTimingStage::DirectBitonal),
+        ("fallback render", DjvuPdfTimingStage::FallbackRender),
+        ("JB2 decode", DjvuPdfTimingStage::Jb2Decode),
+        ("IW44 decode", DjvuPdfTimingStage::Iw44Decode),
+        ("IW44 composite", DjvuPdfTimingStage::Iw44Composite),
+        ("mask composite", DjvuPdfTimingStage::MaskComposite),
+        ("image bytes", DjvuPdfTimingStage::ImageBytes),
+        ("CCITT encode", DjvuPdfTimingStage::CcittEncode),
+        ("PDF object write", DjvuPdfTimingStage::PdfObjectWrite),
+        ("pdf write/encode", DjvuPdfTimingStage::PdfWrite),
+    ] {
         writeln!(
             formatter,
-            "  page planning: {}",
-            format_duration(self.page_plan)
+            "  {label}: {}",
+            format_duration(summary.stage(stage))
         )?;
+    }
+
+    Ok(())
+}
+
+fn write_pdf_timing_page_lines(
+    formatter: &mut std::fmt::Formatter<'_>,
+    summary: &PdfTimingSummary,
+) -> std::fmt::Result {
+    if summary.pages.is_empty() {
+        return Ok(());
+    }
+
+    let page_count = summary.pages.len();
+    let page_total: Duration = summary
+        .pages
+        .iter()
+        .map(|page| page.stage(DjvuPdfTimingStage::PageTotal))
+        .sum();
+    writeln!(
+        formatter,
+        "  per-page average: {}",
+        format_duration(page_total / u32::try_from(page_count).unwrap_or(u32::MAX))
+    )?;
+    writeln!(formatter, "  slowest pages:")?;
+    let mut pages = summary.pages.clone();
+    pages.sort_by_key(|page| std::cmp::Reverse(page.stage(DjvuPdfTimingStage::PageTotal)));
+    for page in pages.iter().take(10) {
         writeln!(
             formatter,
-            "  direct bitonal: {}",
-            format_duration(self.direct_bitonal)
+            "    page {}: {} ({}; top: {})",
+            page.page_number,
+            format_duration(page.stage(DjvuPdfTimingStage::PageTotal)),
+            page.kind.map_or("unknown", format_pdf_page_kind),
+            page.dominant_stage().map_or_else(
+                || "unknown".to_string(),
+                |(stage, duration)| format!(
+                    "{} {}",
+                    format_pdf_timing_stage(stage),
+                    format_duration(duration)
+                )
+            )
         )?;
-        writeln!(
-            formatter,
-            "  fallback render: {}",
-            format_duration(self.fallback_render)
-        )?;
-        writeln!(
-            formatter,
-            "  pdf write/encode: {}",
-            format_duration(self.pdf_write)
-        )
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct PdfPageTiming {
+    page_number: usize,
+    kind: Option<DjvuPdfPageKind>,
+    total: Duration,
+    stages: Vec<(DjvuPdfTimingStage, Duration)>,
+}
+
+impl PdfPageTiming {
+    fn stage_mut(&mut self, stage: DjvuPdfTimingStage) -> &mut Duration {
+        if let Some(index) = self
+            .stages
+            .iter()
+            .position(|(candidate, _)| *candidate == stage)
+        {
+            return &mut self.stages[index].1;
+        }
+        self.stages.push((stage, Duration::ZERO));
+        &mut self.stages.last_mut().expect("stage was just pushed").1
+    }
+
+    fn stage(&self, stage: DjvuPdfTimingStage) -> Duration {
+        self.stages
+            .iter()
+            .find_map(|(candidate, duration)| (*candidate == stage).then_some(*duration))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn dominant_stage(&self) -> Option<(DjvuPdfTimingStage, Duration)> {
+        self.stages
+            .iter()
+            .filter(|(stage, _)| {
+                !matches!(
+                    stage,
+                    DjvuPdfTimingStage::PageTotal
+                        | DjvuPdfTimingStage::DirectBitonal
+                        | DjvuPdfTimingStage::FallbackRender
+                )
+            })
+            .max_by_key(|(_, duration)| *duration)
+            .copied()
+    }
+}
+
+const fn format_pdf_page_kind(kind: DjvuPdfPageKind) -> &'static str {
+    match kind {
+        DjvuPdfPageKind::DirectBitonal => "direct bitonal",
+        DjvuPdfPageKind::FallbackRgb => "fallback RGB",
+    }
+}
+
+const fn format_pdf_timing_stage(stage: DjvuPdfTimingStage) -> &'static str {
+    match stage {
+        DjvuPdfTimingStage::Setup => "setup",
+        DjvuPdfTimingStage::TextExtraction => "text extraction",
+        DjvuPdfTimingStage::PagePlan => "page planning",
+        DjvuPdfTimingStage::DirectBitonal => "direct bitonal",
+        DjvuPdfTimingStage::FallbackRender => "fallback render",
+        DjvuPdfTimingStage::Jb2Decode => "JB2 decode",
+        DjvuPdfTimingStage::Iw44Decode => "IW44 decode",
+        DjvuPdfTimingStage::Iw44Composite => "IW44 composite",
+        DjvuPdfTimingStage::MaskComposite => "mask composite",
+        DjvuPdfTimingStage::ImageBytes => "image bytes",
+        DjvuPdfTimingStage::CcittEncode => "CCITT encode",
+        DjvuPdfTimingStage::PdfObjectWrite => "PDF object write",
+        DjvuPdfTimingStage::PdfWrite => "pdf write/encode",
+        DjvuPdfTimingStage::PageTotal => "page total",
     }
 }
 

@@ -52,9 +52,9 @@ pub use jb2::{
 pub use navm::{Bookmark, extract_document_bookmarks, parse_navm_bookmarks};
 pub use page::{PageChunk, PageChunkKind, PageChunkPayload, PageDetails, read_page_details};
 pub use pdf::{
-    DjvuPdfError, DjvuPdfRenderEvent, DjvuPdfResult, DjvuPdfTimingEvent, DjvuPdfTimingStage,
-    PdfError, PdfPageImage, PdfResult, render_document_pdf, render_document_pdf_to_writer,
-    render_document_pdf_to_writer_with_events,
+    DjvuPdfError, DjvuPdfPageKind, DjvuPdfRenderEvent, DjvuPdfResult, DjvuPdfTimingEvent,
+    DjvuPdfTimingStage, PdfError, PdfPageImage, PdfResult, render_document_pdf,
+    render_document_pdf_to_writer, render_document_pdf_to_writer_with_events,
     render_document_pdf_to_writer_with_events_and_timings, render_document_pdf_with_events,
     write_bitmap_pdf, write_page_image_pdf, write_page_image_pdf_iter,
     write_page_image_pdf_iter_to_writer, write_rendered_pages_pdf_iter,

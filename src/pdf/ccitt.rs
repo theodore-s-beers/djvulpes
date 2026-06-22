@@ -4,15 +4,16 @@ pub(super) fn group4_encode(width: u32, height: u32, bytes: &[u8]) -> Vec<u8> {
     let row_bytes = width.div_ceil(8);
     let mut writer = CcittBitWriter::default();
     let mut reference_changes = Vec::new();
+    let mut current_changes = Vec::new();
 
     for row_index in 0..height {
         let row_start = row_index
             .checked_mul(row_bytes)
             .expect("validated bitonal row offset should not overflow");
         let row = &bytes[row_start..row_start + row_bytes];
-        let current_changes = ccitt_row_changes(row, width);
+        ccitt_row_changes(row, width, &mut current_changes);
         ccitt_group4_encode_row(width, &current_changes, &reference_changes, &mut writer);
-        reference_changes = current_changes;
+        std::mem::swap(&mut reference_changes, &mut current_changes);
     }
 
     writer.write_code(0b0000_0000_0001, 12);
@@ -20,19 +21,42 @@ pub(super) fn group4_encode(width: u32, height: u32, bytes: &[u8]) -> Vec<u8> {
     writer.finish()
 }
 
-fn ccitt_row_changes(row: &[u8], width: usize) -> Vec<usize> {
-    let mut changes = Vec::new();
+fn ccitt_row_changes(row: &[u8], width: usize, changes: &mut Vec<usize>) {
+    changes.clear();
     let mut previous = false;
 
-    for x in 0..width {
-        let current = row[x / 8] & (0x80 >> (x % 8)) != 0;
-        if current != previous {
-            changes.push(x);
-            previous = current;
+    for (byte_index, byte) in row.iter().copied().enumerate() {
+        let x = byte_index * 8;
+        if x >= width {
+            break;
+        }
+        let bits = (width - x).min(8);
+        let full_mask = 0xff << (8 - bits);
+        let byte = byte & full_mask;
+
+        if byte == 0 {
+            if previous {
+                changes.push(x);
+                previous = false;
+            }
+            continue;
+        }
+        if byte == full_mask {
+            if !previous {
+                changes.push(x);
+                previous = true;
+            }
+            continue;
+        }
+
+        for bit in 0..bits {
+            let current = byte & (0x80 >> bit) != 0;
+            if current != previous {
+                changes.push(x + bit);
+                previous = current;
+            }
         }
     }
-
-    changes
 }
 
 fn ccitt_group4_encode_row(
