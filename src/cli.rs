@@ -90,6 +90,12 @@ enum Command {
         from_page: usize,
         #[arg(long)]
         to_page: Option<usize>,
+        #[arg(long)]
+        progress: bool,
+        #[arg(long)]
+        quiet: bool,
+        #[arg(long)]
+        verbose: bool,
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
@@ -262,8 +268,11 @@ fn run_command(command: Command) -> anyhow::Result<()> {
             output,
             from_page,
             to_page,
+            progress,
+            quiet,
+            verbose,
             file,
-        } => run_render_pdf(&file, &output, from_page, to_page)?,
+        } => run_render_pdf(&file, &output, from_page, to_page, progress, quiet, verbose)?,
         Command::CompareRenderPage { .. }
         | Command::CompareRenderPages { .. }
         | Command::CompareRenderPageLayer { .. }

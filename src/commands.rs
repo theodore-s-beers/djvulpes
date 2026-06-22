@@ -8,7 +8,7 @@ use djvulpes::{
     PartialPageRender, PdfPageImage, RenderCompareLimits, TextZone, bitmap_diff_failures,
     bitmap_diff_region_summary, bitmap_diff_tile_summaries, parse_chunks, parse_dirm_tail,
     parse_form_at, parse_text_payload, parse_text_zones, read_page_details,
-    render_document_pdf_with_events,
+    render_document_pdf_to_writer_with_events, render_document_pdf_with_events,
 };
 use djvulpes::{decode_bzz, decode_dirm_tail};
 use std::fmt::Write as _;
@@ -413,48 +413,101 @@ pub fn run_render_pdf(
     output: &Path,
     from_page: usize,
     to_page: Option<usize>,
+    progress: bool,
+    quiet: bool,
+    verbose: bool,
 ) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
     let mut render_count = 0usize;
     let mut summaries = Vec::new();
-    let pdf = render_document_pdf_with_events(&bytes, from_page, to_page, |event| match event {
-        djvulpes::DjvuPdfRenderEvent::PageStarted {
-            page_number,
-            end_page,
-        } => {
-            eprintln!("rendering page {page_number} of {end_page}");
-        }
-        djvulpes::DjvuPdfRenderEvent::PageRendered {
-            page_number,
-            render,
-        } => {
-            eprintln!("rendered page {page_number}");
-            render_count += 1;
-            summaries.push(render_pdf_page_summary(page_number, render));
-        }
-        djvulpes::DjvuPdfRenderEvent::PageImagePrepared { page_number, image } => {
-            eprintln!("prepared page {page_number}");
-            render_count += 1;
-            summaries.push(pdf_page_image_summary(page_number, image));
-        }
-    })?;
-
-    fs::write(output, pdf).with_context(|| format!("failed to write {}", output.display()))?;
-
-    println!("file: {}", path.display());
-    println!("pages: {render_count}");
-    println!(
-        "range: {}..{}",
-        from_page,
-        to_page.map_or_else(|| "end".to_string(), |page| page.to_string())
+    let selected_page_count = to_page.map_or_else(
+        || None,
+        |to_page| to_page.checked_sub(from_page).map(|offset| offset + 1),
     );
-    println!("format: PDF");
-    println!("output: {}", output.display());
+    let mut output_file = fs::File::create(output)
+        .with_context(|| format!("failed to create {}", output.display()))?;
+    render_document_pdf_to_writer_with_events(
+        &mut output_file,
+        &bytes,
+        from_page,
+        to_page,
+        |event| match event {
+            djvulpes::DjvuPdfRenderEvent::PageStarted {
+                page_number,
+                end_page,
+            } => {
+                if progress {
+                    eprintln!("rendering page {page_number} of {end_page}");
+                }
+            }
+            djvulpes::DjvuPdfRenderEvent::PageRendered {
+                page_number,
+                render,
+            } => {
+                if progress {
+                    eprintln!("rendered page {page_number}");
+                }
+                render_count += 1;
+                print_render_pdf_sparse_progress(
+                    render_count,
+                    selected_page_count,
+                    page_number,
+                    quiet,
+                    progress,
+                );
+                if verbose {
+                    summaries.push(render_pdf_page_summary(page_number, render));
+                }
+            }
+            djvulpes::DjvuPdfRenderEvent::PageImagePrepared { page_number, image } => {
+                if progress {
+                    eprintln!("prepared page {page_number}");
+                }
+                render_count += 1;
+                print_render_pdf_sparse_progress(
+                    render_count,
+                    selected_page_count,
+                    page_number,
+                    quiet,
+                    progress,
+                );
+                if verbose {
+                    summaries.push(pdf_page_image_summary(page_number, image));
+                }
+            }
+        },
+    )?;
+
+    println!("wrote {} pages to {}", render_count, output.display());
+    if verbose {
+        println!("file: {}", path.display());
+        println!(
+            "range: {}..{}",
+            from_page,
+            to_page.map_or_else(|| "end".to_string(), |page| page.to_string())
+        );
+        println!("format: PDF");
+    }
     for summary in summaries {
         print!("{summary}");
     }
 
     Ok(())
+}
+
+fn print_render_pdf_sparse_progress(
+    render_count: usize,
+    selected_page_count: Option<usize>,
+    page_number: usize,
+    quiet: bool,
+    per_page_progress: bool,
+) {
+    if quiet || per_page_progress {
+        return;
+    }
+    if render_count.is_multiple_of(50) || selected_page_count == Some(render_count) {
+        eprintln!("processed {render_count} pages; latest page {page_number}");
+    }
 }
 
 pub fn run_compare_render_page(
@@ -3547,8 +3600,16 @@ mod tests {
         let output =
             std::env::temp_dir().join(format!("djvulpes-page-961-{}.pdf", std::process::id()));
 
-        run_render_pdf(Path::new("Rypka-HIL.djvu"), &output, 961, Some(961))
-            .expect("render-pdf should write page 961");
+        run_render_pdf(
+            Path::new("Rypka-HIL.djvu"),
+            &output,
+            961,
+            Some(961),
+            false,
+            true,
+            false,
+        )
+        .expect("render-pdf should write page 961");
         let pdf = fs::read(&output).expect("rendered PDF should be readable");
         let _ = fs::remove_file(&output);
         let text = String::from_utf8_lossy(&pdf);
@@ -3566,8 +3627,16 @@ mod tests {
         let output =
             std::env::temp_dir().join(format!("djvulpes-page-68-{}.pdf", std::process::id()));
 
-        run_render_pdf(Path::new("Rypka-HIL.djvu"), &output, 68, Some(68))
-            .expect("render-pdf should write page 68");
+        run_render_pdf(
+            Path::new("Rypka-HIL.djvu"),
+            &output,
+            68,
+            Some(68),
+            false,
+            true,
+            false,
+        )
+        .expect("render-pdf should write page 68");
         let pdf = fs::read(&output).expect("rendered PDF should be readable");
         let _ = fs::remove_file(&output);
         let text = String::from_utf8_lossy(&pdf);

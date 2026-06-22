@@ -5,8 +5,9 @@
 //! [`PageRenderMode`] to select full-page, background, foreground, or mask
 //! compositor output.
 //!
-//! The high-level PDF entry points are [`render_document_pdf`] and
-//! [`render_document_pdf_with_events`]. They use the same in-house BZZ/ZP, JB2,
+//! The high-level PDF entry points are [`render_document_pdf`],
+//! [`render_document_pdf_with_events`], and the writer-based
+//! [`render_document_pdf_to_writer`]. They use the same in-house BZZ/ZP, JB2,
 //! IW44, text, outline, and compositing paths as the bitmap render APIs.
 
 #![forbid(unsafe_code)]
@@ -52,8 +53,9 @@ pub use navm::{Bookmark, extract_document_bookmarks, parse_navm_bookmarks};
 pub use page::{PageChunk, PageChunkKind, PageChunkPayload, PageDetails, read_page_details};
 pub use pdf::{
     DjvuPdfError, DjvuPdfRenderEvent, DjvuPdfResult, PdfError, PdfPageImage, PdfResult,
-    render_document_pdf, render_document_pdf_with_events, write_bitmap_pdf, write_page_image_pdf,
-    write_page_image_pdf_iter, write_rendered_pages_pdf_iter,
+    render_document_pdf, render_document_pdf_to_writer, render_document_pdf_to_writer_with_events,
+    render_document_pdf_with_events, write_bitmap_pdf, write_page_image_pdf,
+    write_page_image_pdf_iter, write_page_image_pdf_iter_to_writer, write_rendered_pages_pdf_iter,
 };
 pub use render::{
     BitonalBitmap, BitonalImageHeader, DjvuPageRenderEvent, DjvuRenderError, DjvuRenderResult,

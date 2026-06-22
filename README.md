@@ -38,7 +38,7 @@ Available subcommands:
 - `render-page <number> <output.ppm>` renders supported page layers to binary RGB PPM/P6.
 - `render-page-layer <number> <full|background|foreground|mask> <output.ppm>` renders one compositor mode to binary RGB PPM/P6.
 - `render-page-pdf <number> <output.pdf>` renders one page into a PDF using the same image embedding choices as `render-pdf`.
-- `render-pdf <output.pdf>` renders every supported page into one PDF. Use `--from-page` and `--to-page` to render a page range. Bitonal-only pages are embedded as 1-bit grayscale images; color/IW44 pages are embedded as RGB images. In-range `NAVM` outline entries are preserved as PDF bookmarks, and hidden text lines are embedded as invisible PDF text spans with Unicode `/ActualText`.
+- `render-pdf <output.pdf>` renders every supported page into one PDF, printing sparse status every 50 pages by default. Use `--from-page` and `--to-page` to render a page range, `--progress` for per-page status, `--quiet` for only the final summary, and `--verbose` for detailed per-page summaries. Bitonal-only pages are embedded as 1-bit grayscale images; color/IW44 pages are embedded as RGB images. In-range `NAVM` outline entries are preserved as PDF bookmarks, and hidden text lines are embedded as invisible PDF text spans with Unicode `/ActualText`.
 - `compare-ppm <actual.ppm> <expected.ppm>` compares two binary RGB PPM/P6 images using the same diff summary and tolerance flags as the render comparison commands.
 - `compare-render-page <number> <oracle.ppm>` renders a page and compares it with a binary RGB PPM/P6 oracle.
 - `compare-render-pages <oracle-dir>` compares a page range against `page-<number>.ppm` files in an oracle directory. Use `--mode full|background|foreground|mask` to validate one compositor mode across the range.
@@ -58,6 +58,7 @@ The reusable render path is exposed through:
 - `render_document_pages_with_events(...)` for page-range rendering with start/rendered callbacks.
 - `render_document_pdf(bytes, from_page, to_page)` for direct DjVu-to-PDF conversion with bookmarks and a searchable text layer when the source document provides them.
 - `render_document_pdf_with_events(...)` for PDF conversion with page-level callbacks.
+- `render_document_pdf_to_writer(...)` and `render_document_pdf_to_writer_with_events(...)` for streaming PDF conversion to an existing writer.
 - `extract_document_text(bytes, from_page, to_page)` for raw hidden-text extraction with `djvutxt`-compatible page separators.
 - `extract_document_text_pages(bytes, from_page, to_page)` for per-page hidden-text extraction that preserves empty pages.
 - `extract_document_text_zone_pages(bytes, from_page, to_page)` for per-page hidden text plus parsed zone trees.

@@ -7,6 +7,7 @@ use crate::{
 use std::{
     collections::BTreeMap,
     fmt::{self, Write as _},
+    io::{self, Cursor, Write},
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -131,6 +132,12 @@ impl fmt::Display for PdfError {
 
 impl std::error::Error for PdfError {}
 
+impl From<io::Error> for PdfError {
+    fn from(error: io::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
 /// Writes a PDF containing one full-page RGB image per bitmap.
 ///
 /// # Errors
@@ -182,6 +189,36 @@ where
     write_page_image_pdf_iter_with_bookmarks_and_text(page_count, pages, &[], None)
 }
 
+/// Writes a PDF from an iterator of full-page images to an existing writer.
+///
+/// This is the streaming form of [`write_page_image_pdf_iter`]. It writes image
+/// and page objects as each page is produced, retaining only cross-reference
+/// offsets and caller-provided text/outline metadata.
+///
+/// # Errors
+///
+/// Returns an error if `page_count` is zero, if the iterator yields a different
+/// number of pages, if any page image buffer length does not match its
+/// dimensions, or if writing to `writer` fails.
+pub fn write_page_image_pdf_iter_to_writer<W, I, E>(
+    writer: W,
+    page_count: usize,
+    pages: I,
+) -> Result<(), E>
+where
+    W: Write,
+    I: IntoIterator<Item = Result<PdfPageImage, E>>,
+    E: From<PdfError>,
+{
+    write_page_image_pdf_iter_with_bookmarks_and_text_to_writer(
+        writer,
+        page_count,
+        pages,
+        &[],
+        None,
+    )
+}
+
 fn write_page_image_pdf_iter_with_bookmarks<I, E>(
     page_count: usize,
     pages: I,
@@ -194,10 +231,6 @@ where
     write_page_image_pdf_iter_with_bookmarks_and_text(page_count, pages, bookmarks, None)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "PDF object numbering and serialization are kept together for consistency"
-)]
 fn write_page_image_pdf_iter_with_bookmarks_and_text<I, E>(
     page_count: usize,
     pages: I,
@@ -205,6 +238,30 @@ fn write_page_image_pdf_iter_with_bookmarks_and_text<I, E>(
     text_pages: Option<&[PdfTextPage]>,
 ) -> Result<Vec<u8>, E>
 where
+    I: IntoIterator<Item = Result<PdfPageImage, E>>,
+    E: From<PdfError>,
+{
+    let mut pdf = Cursor::new(Vec::new());
+    write_page_image_pdf_iter_with_bookmarks_and_text_to_writer(
+        &mut pdf, page_count, pages, bookmarks, text_pages,
+    )?;
+
+    Ok(pdf.into_inner())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "PDF object numbering and serialization are kept together for consistency"
+)]
+fn write_page_image_pdf_iter_with_bookmarks_and_text_to_writer<W, I, E>(
+    writer: W,
+    page_count: usize,
+    pages: I,
+    bookmarks: &[PdfBookmark],
+    text_pages: Option<&[PdfTextPage]>,
+) -> Result<(), E>
+where
+    W: Write,
     I: IntoIterator<Item = Result<PdfPageImage, E>>,
     E: From<PdfError>,
 {
@@ -254,8 +311,7 @@ where
     } else {
         first_image_id + page_count - 1
     };
-    let mut pdf = b"%PDF-1.4\n%\xff\xff\xff\xff\n".to_vec();
-    let mut offsets = vec![0usize; max_object_id + 1];
+    let mut pdf = PdfObjectWriter::new(writer, max_object_id).map_err(E::from)?;
 
     let catalog = if has_outline {
         format!(
@@ -264,18 +320,18 @@ where
     } else {
         format!("<< /Type /Catalog /Pages {pages_id} 0 R >>")
     };
-    append_pdf_object(&mut pdf, &mut offsets, catalog_id, catalog.as_bytes());
+    pdf.write_object(catalog_id, catalog.as_bytes())
+        .map_err(E::from)?;
 
     let kids = (0..page_count)
         .map(|index| format!("{} 0 R", first_page_id + index))
         .collect::<Vec<_>>()
         .join(" ");
-    append_pdf_object(
-        &mut pdf,
-        &mut offsets,
+    pdf.write_object(
         pages_id,
         format!("<< /Type /Pages /Count {page_count} /Kids [{kids}] >>").as_bytes(),
-    );
+    )
+    .map_err(E::from)?;
 
     let mut actual_page_count = 0usize;
     for (index, page_image) in pages.into_iter().enumerate() {
@@ -302,7 +358,8 @@ where
         let page = format!(
             "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {width_points} {height_points}] /Resources << /XObject << /{image_name} {image_id} 0 R >>{font_resource} >> /Contents {content_id} 0 R >>"
         );
-        append_pdf_object(&mut pdf, &mut offsets, page_object_id, page.as_bytes());
+        pdf.write_object(page_object_id, page.as_bytes())
+            .map_err(E::from)?;
 
         let mut content = if page_image.is_bitonal_mask() {
             format!(
@@ -318,10 +375,11 @@ where
             append_pdf_text_layer(&mut content, text_page, page_image.dpi(), text_encoding);
         }
         let content_stream = stream_object(&[], content.as_bytes());
-        append_pdf_object(&mut pdf, &mut offsets, content_id, &content_stream);
+        pdf.write_object(content_id, &content_stream)
+            .map_err(E::from)?;
 
         let image_stream = page_image.image_stream_object();
-        append_pdf_object(&mut pdf, &mut offsets, image_id, &image_stream);
+        pdf.write_object(image_id, &image_stream).map_err(E::from)?;
     }
 
     if actual_page_count != page_count {
@@ -332,15 +390,14 @@ where
     }
 
     if has_text_layer {
-        append_pdf_object(
-            &mut pdf,
-            &mut offsets,
+        pdf.write_object(
             font_id,
             format!(
                 "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /ToUnicode {to_unicode_id} 0 R >>"
             )
             .as_bytes(),
-        );
+        )
+        .map_err(E::from)?;
         let to_unicode_stream = stream_object(
             &[],
             pdf_to_unicode_cmap(
@@ -350,20 +407,21 @@ where
             )
             .as_bytes(),
         );
-        append_pdf_object(&mut pdf, &mut offsets, to_unicode_id, &to_unicode_stream);
+        pdf.write_object(to_unicode_id, &to_unicode_stream)
+            .map_err(E::from)?;
     }
 
     if has_outline {
-        append_pdf_outlines(
+        write_pdf_outlines(
             &mut pdf,
-            &mut offsets,
             outline_root_id,
             first_page_id,
             &numbered_bookmarks,
-        );
+        )
+        .map_err(E::from)?;
     }
 
-    Ok(finish_pdf(pdf, &offsets, catalog_id))
+    pdf.finish(catalog_id).map_err(E::from)
 }
 
 /// Writes a PDF from an iterator of rendered pages.
@@ -418,7 +476,29 @@ pub fn render_document_pdf(
     from_page: usize,
     to_page: Option<usize>,
 ) -> DjvuPdfResult<Vec<u8>> {
-    render_document_pdf_with_events(bytes, from_page, to_page, |_| {})
+    let mut pdf = Cursor::new(Vec::new());
+    render_document_pdf_to_writer(&mut pdf, bytes, from_page, to_page)?;
+
+    Ok(pdf.into_inner())
+}
+
+/// Renders a `DjVu` document byte slice to a PDF writer.
+///
+/// Page numbers are 1-based. If `to_page` is `None`, rendering continues
+/// through the final page.
+///
+/// # Errors
+///
+/// Returns an error if the document cannot be parsed, its bundled directory
+/// cannot be decoded, the page range is invalid, a selected page cannot be
+/// rendered, the resulting PDF cannot be serialized, or writing fails.
+pub fn render_document_pdf_to_writer<W: Write>(
+    writer: W,
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+) -> DjvuPdfResult<()> {
+    render_document_pdf_to_writer_with_events(writer, bytes, from_page, to_page, |_| {})
 }
 
 /// Renders a `DjVu` document byte slice to a PDF, reporting page-level events.
@@ -439,6 +519,33 @@ pub fn render_document_pdf_with_events(
     to_page: Option<usize>,
     mut event: impl FnMut(DjvuPdfRenderEvent<'_>),
 ) -> DjvuPdfResult<Vec<u8>> {
+    let mut pdf = Cursor::new(Vec::new());
+    render_document_pdf_to_writer_with_events(&mut pdf, bytes, from_page, to_page, |event_item| {
+        event(event_item);
+    })?;
+
+    Ok(pdf.into_inner())
+}
+
+/// Renders a `DjVu` document byte slice to a PDF writer, reporting page-level events.
+///
+/// The event callback is invoked before each selected page is prepared. Pages
+/// that can be embedded directly as 1-bit images emit `PageImagePrepared`.
+/// Fallback pages emit `PageRendered` after compositor output is available. Any
+/// borrowed event payload is valid only for the duration of the callback.
+///
+/// # Errors
+///
+/// Returns an error if the document cannot be parsed, its bundled directory
+/// cannot be decoded, the page range is invalid, a selected page cannot be
+/// rendered, the resulting PDF cannot be serialized, or writing fails.
+pub fn render_document_pdf_to_writer_with_events<W: Write>(
+    writer: W,
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+    mut event: impl FnMut(DjvuPdfRenderEvent<'_>),
+) -> DjvuPdfResult<()> {
     let document = Document::parse(bytes)?;
     let decoded_tail;
     let tail_entries = if let Some(dirm) = &document.directory {
@@ -453,49 +560,53 @@ pub fn render_document_pdf_with_events(
         pdf_bookmarks_from_djvu(&bookmarks, from_page, end_page)
     });
     let text_pages = pdf_text_pages_from_djvu(bytes, from_page, Some(end_page))?;
-    let mut page_images = Vec::new();
+    let selected_page_count = end_page - from_page + 1;
+    let mut pages = document.pages(bytes).enumerate();
 
-    for (index, page) in document.pages(bytes).enumerate() {
-        let page_number = index + 1;
-        if page_number < from_page || page_number > end_page {
-            continue;
-        }
+    let page_images = std::iter::from_fn(|| {
+        for (index, page) in pages.by_ref() {
+            let page_number = index + 1;
+            if page_number < from_page {
+                continue;
+            }
+            if page_number > end_page {
+                return None;
+            }
 
-        event(DjvuPdfRenderEvent::PageStarted {
-            page_number,
-            end_page,
-        });
-        let page = page?;
-        let plan = document.page_render_plan(bytes, &page, &tail_entries)?;
-        if let Some(image) = direct_bitonal_pdf_page_image(bytes, &plan)? {
-            event(DjvuPdfRenderEvent::PageImagePrepared {
+            event(DjvuPdfRenderEvent::PageStarted {
                 page_number,
-                image: &image,
+                end_page,
             });
-            page_images.push(image);
-            continue;
+            let image = (|| {
+                let page = page?;
+                let plan = document.page_render_plan(bytes, &page, &tail_entries)?;
+                if let Some(image) = direct_bitonal_pdf_page_image(bytes, &plan)? {
+                    event(DjvuPdfRenderEvent::PageImagePrepared {
+                        page_number,
+                        image: &image,
+                    });
+                    return Ok(image);
+                }
+
+                let render = plan.render_bitmap_with_mode(bytes, PageRenderMode::Full)?;
+                event(DjvuPdfRenderEvent::PageRendered {
+                    page_number,
+                    render: &render,
+                });
+
+                Ok(PdfPageImage::from_render(&render))
+            })();
+
+            return Some(image);
         }
 
-        let render = plan.render_bitmap_with_mode(bytes, PageRenderMode::Full)?;
-        event(DjvuPdfRenderEvent::PageRendered {
-            page_number,
-            render: &render,
-        });
-        page_images.push(PdfPageImage::from_render(&render));
-    }
+        None
+    });
 
-    if page_images.is_empty() {
-        return Err(DjvuPdfError::PageOutOfRange {
-            page: from_page,
-            page_count,
-        });
-    }
-
-    write_page_image_pdf_iter_with_bookmarks_and_text(
-        page_images.len(),
-        page_images
-            .into_iter()
-            .map(Ok::<PdfPageImage, DjvuPdfError>),
+    write_page_image_pdf_iter_with_bookmarks_and_text_to_writer(
+        writer,
+        selected_page_count,
+        page_images,
         &bookmarks,
         Some(&text_pages),
     )
@@ -737,13 +848,12 @@ fn number_pdf_bookmarks(
         .collect()
 }
 
-fn append_pdf_outlines(
-    pdf: &mut Vec<u8>,
-    offsets: &mut [usize],
+fn write_pdf_outlines<W: Write>(
+    pdf: &mut PdfObjectWriter<W>,
     root_id: usize,
     first_page_id: usize,
     bookmarks: &[NumberedPdfBookmark],
-) {
+) -> PdfResult<()> {
     let first_id = bookmarks
         .first()
         .expect("outline root should have at least one bookmark")
@@ -753,23 +863,20 @@ fn append_pdf_outlines(
         .expect("outline root should have at least one bookmark")
         .id;
     let count = count_numbered_pdf_bookmarks(bookmarks);
-    append_pdf_object(
-        pdf,
-        offsets,
+    pdf.write_object(
         root_id,
         format!("<< /Type /Outlines /First {first_id} 0 R /Last {last_id} 0 R /Count {count} >>")
             .as_bytes(),
-    );
-    append_pdf_outline_items(pdf, offsets, root_id, first_page_id, bookmarks);
+    )?;
+    write_pdf_outline_items(pdf, root_id, first_page_id, bookmarks)
 }
 
-fn append_pdf_outline_items(
-    pdf: &mut Vec<u8>,
-    offsets: &mut [usize],
+fn write_pdf_outline_items<W: Write>(
+    pdf: &mut PdfObjectWriter<W>,
     parent_id: usize,
     first_page_id: usize,
     bookmarks: &[NumberedPdfBookmark],
-) {
+) -> PdfResult<()> {
     for (index, bookmark) in bookmarks.iter().enumerate() {
         let mut dictionary = format!(
             "<< /Title {} /Parent {parent_id} 0 R /Dest [{} 0 R /Fit]",
@@ -798,9 +905,11 @@ fn append_pdf_outline_items(
             .expect("writing to string should not fail");
         }
         dictionary.push_str(" >>");
-        append_pdf_object(pdf, offsets, bookmark.id, dictionary.as_bytes());
-        append_pdf_outline_items(pdf, offsets, bookmark.id, first_page_id, &bookmark.children);
+        pdf.write_object(bookmark.id, dictionary.as_bytes())?;
+        write_pdf_outline_items(pdf, bookmark.id, first_page_id, &bookmark.children)?;
     }
+
+    Ok(())
 }
 
 fn count_numbered_pdf_bookmarks(bookmarks: &[NumberedPdfBookmark]) -> usize {
@@ -2444,29 +2553,60 @@ const fn repeated_run_len(bytes: &[u8], start: usize) -> usize {
     len
 }
 
-fn append_pdf_object(pdf: &mut Vec<u8>, offsets: &mut [usize], id: usize, object: &[u8]) {
-    offsets[id] = pdf.len();
-    pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
-    pdf.extend_from_slice(object);
-    pdf.extend_from_slice(b"\nendobj\n");
+struct PdfObjectWriter<W> {
+    inner: W,
+    offsets: Vec<usize>,
+    position: usize,
 }
 
-fn finish_pdf(mut pdf: Vec<u8>, offsets: &[usize], root_id: usize) -> Vec<u8> {
-    let xref_start = pdf.len();
-    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
-    pdf.extend_from_slice(b"0000000000 65535 f \n");
-    for offset in offsets.iter().skip(1) {
-        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-    }
-    pdf.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {} /Root {root_id} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
-            offsets.len()
-        )
-        .as_bytes(),
-    );
+impl<W: Write> PdfObjectWriter<W> {
+    fn new(inner: W, max_object_id: usize) -> PdfResult<Self> {
+        let mut writer = Self {
+            inner,
+            offsets: vec![0; max_object_id + 1],
+            position: 0,
+        };
+        writer.write_all_counted(b"%PDF-1.4\n%\xff\xff\xff\xff\n")?;
 
-    pdf
+        Ok(writer)
+    }
+
+    fn write_object(&mut self, id: usize, object: &[u8]) -> PdfResult<()> {
+        let offset = self
+            .offsets
+            .get_mut(id)
+            .ok_or_else(|| PdfError::new(format!("PDF object id {id} exceeds xref size")))?;
+        *offset = self.position;
+        self.write_all_counted(format!("{id} 0 obj\n").as_bytes())?;
+        self.write_all_counted(object)?;
+        self.write_all_counted(b"\nendobj\n")
+    }
+
+    fn finish(mut self, root_id: usize) -> PdfResult<()> {
+        let xref_start = self.position;
+        self.write_all_counted(format!("xref\n0 {}\n", self.offsets.len()).as_bytes())?;
+        self.write_all_counted(b"0000000000 65535 f \n")?;
+        for offset in self.offsets.clone().iter().skip(1) {
+            self.write_all_counted(format!("{offset:010} 00000 n \n").as_bytes())?;
+        }
+        self.write_all_counted(
+            format!(
+                "trailer\n<< /Size {} /Root {root_id} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+                self.offsets.len()
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn write_all_counted(&mut self, bytes: &[u8]) -> PdfResult<()> {
+        self.inner.write_all(bytes)?;
+        self.position = self
+            .position
+            .checked_add(bytes.len())
+            .ok_or_else(|| PdfError::new("PDF byte offset overflow"))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
