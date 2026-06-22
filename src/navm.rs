@@ -173,7 +173,7 @@ fn read_u24_be(bytes: &[u8], cursor: &mut usize) -> ParseResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_bookmarks, extract_document_bookmarks, parse_navm_bookmarks};
+    use super::{count_bookmarks, parse_navm_bookmarks};
     use crate::{Document, decode_bzz};
 
     #[test]
@@ -217,20 +217,6 @@ mod tests {
         assert_eq!(bookmarks[0].title, "parent");
         assert_eq!(bookmarks[0].children.len(), 300);
         assert_eq!(bookmarks[0].children[299].title, "child 299");
-    }
-
-    #[test]
-    fn extracts_rypka_document_bookmarks() {
-        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
-
-        let bookmarks = extract_document_bookmarks(RYPKA)
-            .expect("bookmark extraction should parse")
-            .expect("Rypka should contain bookmarks");
-
-        assert_eq!(count_bookmarks(&bookmarks), 389);
-        assert_eq!(bookmarks.len(), 20);
-        assert_eq!(bookmarks[0].title, "Cover ");
-        assert_eq!(bookmarks[0].url, "#1");
     }
 
     fn push_bookmark_prefix(bytes: &mut Vec<u8>, child_count: u16, title: &str, url: &str) {

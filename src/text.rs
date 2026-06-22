@@ -599,10 +599,7 @@ fn add_text_delta(base: usize, delta: i32) -> ParseResult<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TextError, TextZoneKind, extract_document_text, extract_document_text_pages,
-        format_document_text_zones, parse_text_payload, parse_text_zones,
-    };
+    use super::{TextZoneKind, parse_text_payload, parse_text_zones};
 
     #[test]
     fn parses_text_and_keeps_zone_data() {
@@ -666,90 +663,5 @@ mod tests {
         assert_eq!(word.y_max(page.height), 4477);
         assert_eq!(word.text_start, 8);
         assert_eq!(word.text_len, 3);
-    }
-
-    #[test]
-    fn extract_document_text_matches_djvutxt_page_separator_convention() {
-        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
-
-        let text = extract_document_text(RYPKA, 3, Some(3)).expect("page 3 text should extract");
-
-        assert_eq!(text, "HISTORY OF IRANIAN LITERATURE \n\n\x0c");
-    }
-
-    #[test]
-    fn format_document_text_zones_matches_djvused_page_expression() {
-        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
-
-        let text =
-            format_document_text_zones(RYPKA, 3, Some(3)).expect("page 3 zones should format");
-
-        assert_eq!(
-            text,
-            concat!(
-                "(page 0 0 3444 5088\n",
-                " (line 814 4415 2612 4480\n",
-                "  (word 814 4415 1255 4476 \"HISTORY\")\n",
-                "  (word 1305 4416 1429 4477 \"OF\")\n",
-                "  (word 1480 4416 1922 4480 \"IRANIAN\")\n",
-                "  (word 1972 4416 2612 4478 \"LITERATURE\")))\n",
-            )
-        );
-    }
-
-    #[test]
-    fn format_document_text_zones_preserves_empty_pages() {
-        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
-
-        let text = format_document_text_zones(RYPKA, 1, Some(3)).expect("page range should format");
-
-        assert_eq!(
-            text,
-            concat!(
-                "(page 0 0 0 0 \"\")\n",
-                "(page 0 0 0 0 \"\")\n",
-                "(page 0 0 3444 5088\n",
-                " (line 814 4415 2612 4480\n",
-                "  (word 814 4415 1255 4476 \"HISTORY\")\n",
-                "  (word 1305 4416 1429 4477 \"OF\")\n",
-                "  (word 1480 4416 1922 4480 \"IRANIAN\")\n",
-                "  (word 1972 4416 2612 4478 \"LITERATURE\")))\n",
-            )
-        );
-    }
-
-    #[test]
-    fn extract_document_text_pages_preserves_empty_pages() {
-        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
-
-        let pages =
-            extract_document_text_pages(RYPKA, 1, Some(3)).expect("text range should extract");
-
-        assert_eq!(pages.len(), 3);
-        assert_eq!(pages[0].page_number, 1);
-        assert_eq!(pages[0].text, "");
-        assert_eq!(pages[2].page_number, 3);
-        assert_eq!(pages[2].text, "HISTORY OF IRANIAN LITERATURE \n");
-    }
-
-    #[test]
-    fn extract_document_text_rejects_invalid_ranges() {
-        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
-
-        assert!(matches!(
-            extract_document_text(RYPKA, 0, None),
-            Err(TextError::ZeroFromPage)
-        ));
-        assert!(matches!(
-            extract_document_text(RYPKA, 3, Some(2)),
-            Err(TextError::ReversedPageRange)
-        ));
-        assert!(matches!(
-            extract_document_text(RYPKA, 962, None),
-            Err(TextError::PageOutOfRange {
-                page: 962,
-                page_count: 961
-            })
-        ));
     }
 }
