@@ -7,7 +7,7 @@ use djvulpes::{
     PageChunkPayload, PageChunkSource, PageRenderMode, PageRenderPlan, ParseResult,
     PartialPageRender, PdfPageImage, TextZone, parse_chunks, parse_dirm_tail, parse_form_at,
     parse_text_payload, parse_text_zones, read_page_details,
-    render_document_pdf_to_writer_with_events_and_timings, render_document_pdf_with_events,
+    render_document_pdf_to_writer_with_events_and_timings,
 };
 use djvulpes::{DjvuPdfPageKind, DjvuPdfTimingEvent, DjvuPdfTimingStage};
 use djvulpes::{decode_bzz, decode_dirm_tail};
@@ -347,42 +347,6 @@ pub fn run_render_page_layer(
     print_bitmap_stats(&render.bitmap);
     print_partial_render_summary(&render.bitonal_masks);
     print_iw44_render_summary(&render.iw44_layers);
-
-    Ok(())
-}
-
-pub fn run_render_page_pdf(path: &Path, number: usize, output: &Path) -> anyhow::Result<()> {
-    let bytes = read_file(path)?;
-    let mut rendered = None;
-    let mut prepared_image = None;
-    let pdf = render_document_pdf_with_events(&bytes, number, Some(number), |event| match event {
-        djvulpes::DjvuPdfRenderEvent::PageImagePrepared { image, .. } => {
-            prepared_image = Some(image.clone());
-        }
-        djvulpes::DjvuPdfRenderEvent::PageRendered { render, .. } => {
-            rendered = Some(render.clone());
-        }
-        djvulpes::DjvuPdfRenderEvent::PageStarted { .. } => {}
-    })?;
-
-    fs::write(output, pdf).with_context(|| format!("failed to write {}", output.display()))?;
-
-    println!("file: {}", path.display());
-    println!("page: {number}");
-    if let Some(render) = rendered {
-        println!(
-            "rendered: {}x{} dpi={} format=PDF",
-            render.bitmap.width, render.bitmap.height, render.bitmap.dpi
-        );
-        print_bitmap_stats(&render.bitmap);
-        print_partial_render_summary(&render.bitonal_masks);
-        print_iw44_render_summary(&render.iw44_layers);
-    } else if let Some(image) = prepared_image {
-        print_pdf_page_image_summary(&image);
-    } else {
-        bail!("render-page-pdf did not prepare the requested page");
-    }
-    println!("output: {}", output.display());
 
     Ok(())
 }
@@ -745,12 +709,6 @@ fn pdf_page_image_summary(page_number: usize, image: &PdfPageImage) -> String {
     write_pdf_page_image_summary(&mut summary, image);
 
     summary
-}
-
-fn print_pdf_page_image_summary(image: &PdfPageImage) {
-    let mut summary = String::new();
-    write_pdf_page_image_summary(&mut summary, image);
-    print!("{summary}");
 }
 
 fn write_pdf_page_image_summary(summary: &mut String, image: &PdfPageImage) {
@@ -1819,50 +1777,6 @@ mod tests {
         ));
         assert!(text.contains("/BitsPerComponent 1"));
         assert!(!text.contains("/ColorSpace /DeviceRGB"));
-        assert!(pdf.ends_with(b"%%EOF\n"));
-    }
-
-    #[test]
-    fn run_render_page_pdf_writes_rypka_page_68_bitonal_mask_pdf() {
-        let output = std::env::temp_dir().join(format!(
-            "djvulpes-single-page-68-{}.pdf",
-            std::process::id()
-        ));
-
-        run_render_page_pdf(Path::new("Rypka-HIL.djvu"), 68, &output)
-            .expect("render-page-pdf should write page 68");
-        let pdf = fs::read(&output).expect("rendered PDF should be readable");
-        let _ = fs::remove_file(&output);
-        let text = String::from_utf8_lossy(&pdf);
-
-        assert!(text.starts_with("%PDF-1.4\n"));
-        assert!(text.contains("/Type /Pages /Count 1"));
-        assert!(text.contains(
-            "/Subtype /Image /Width 3423 /Height 5075 /ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]"
-        ));
-        assert!(text.contains("/BitsPerComponent 1"));
-        assert!(!text.contains("/ColorSpace /DeviceRGB"));
-        assert!(pdf.ends_with(b"%%EOF\n"));
-    }
-
-    #[test]
-    fn run_render_page_pdf_writes_rypka_page_961_rgb_pdf() {
-        let output = std::env::temp_dir().join(format!(
-            "djvulpes-single-page-961-{}.pdf",
-            std::process::id()
-        ));
-
-        run_render_page_pdf(Path::new("Rypka-HIL.djvu"), 961, &output)
-            .expect("render-page-pdf should write page 961");
-        let pdf = fs::read(&output).expect("rendered PDF should be readable");
-        let _ = fs::remove_file(&output);
-        let text = String::from_utf8_lossy(&pdf);
-
-        assert!(text.starts_with("%PDF-1.4\n"));
-        assert!(text.contains("/Type /Pages /Count 1"));
-        assert!(text.contains("/Subtype /Image /Width 3486 /Height 2783"));
-        assert!(text.contains("/ColorSpace /DeviceRGB /BitsPerComponent 8"));
-        assert!(!text.contains("/ImageMask true"));
         assert!(pdf.ends_with(b"%%EOF\n"));
     }
 

@@ -9,11 +9,12 @@ The current code parses document chunks, bundled document directories, page meta
 ```sh
 cargo run -- summary path/to/file.djvu
 cargo run -- pages path/to/file.djvu
-cargo run -- page 1 path/to/file.djvu
+cargo run -- pages --page 1 path/to/file.djvu
+cargo run -- forms path/to/file.djvu
+cargo run -- forms --offset 12345 path/to/file.djvu
 cargo run -- render-plan 1 path/to/file.djvu
 cargo run -- render-page 1 page.ppm path/to/file.djvu
 cargo run -- render-page-layer 1 background background.ppm path/to/file.djvu
-cargo run -- render-page-pdf 1 page.pdf path/to/file.djvu
 cargo run -- render-pdf document.pdf path/to/file.djvu
 cargo run -- render-pdf pages-1-5.pdf --from-page 1 --to-page 5 path/to/file.djvu
 cargo run -- compare-ppm actual.ppm expected.ppm
@@ -29,15 +30,12 @@ cargo run -- outline path/to/file.djvu
 Available subcommands:
 
 - `summary` prints top-level document and directory information.
-- `pages` lists pages with basic metadata.
-- `forms` lists forms referenced by the document directory.
-- `form <offset>` inspects a form at an absolute byte offset.
+- `pages` lists pages with basic metadata. Use `--page <number>` to inspect one page form.
+- `forms` lists forms referenced by the document directory. Use `--offset <byte-offset>` to inspect one form.
 - `dirm` inspects the bundled document directory.
-- `page <number>` inspects one page form.
 - `render-plan <number>` shows the renderer-facing page chunk plan.
 - `render-page <number> <output.ppm>` renders supported page layers to binary RGB PPM/P6.
 - `render-page-layer <number> <full|background|foreground|mask> <output.ppm>` renders one compositor mode to binary RGB PPM/P6.
-- `render-page-pdf <number> <output.pdf>` renders one page into a PDF using the same image embedding choices as `render-pdf`.
 - `render-pdf <output.pdf>` renders every supported page into one PDF, printing sparse status every 50 pages by default. Use `--from-page` and `--to-page` to render a page range, `--progress` for per-page status, `--quiet` for only the final summary, `--verbose` for detailed per-page summaries, and `--timings` for aggregate stage timings. Bitonal-only pages are embedded as 1-bit grayscale images; color/IW44 pages are embedded as RGB images. In-range `NAVM` outline entries are preserved as PDF bookmarks, and hidden text lines are embedded as invisible PDF text spans with Unicode `/ActualText`.
 - `compare-ppm <actual.ppm> <expected.ppm>` compares two binary RGB PPM/P6 images using the same diff summary and tolerance flags as the render comparison commands.
 - `compare-render-page <number> <oracle.ppm>` renders a page and compares it with a binary RGB PPM/P6 oracle.

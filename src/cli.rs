@@ -3,8 +3,7 @@ use crate::commands::{
     run_compare_render_page, run_compare_render_page_layer, run_compare_render_pages, run_dirm,
     run_dump_bitonal, run_dump_image_layers, run_extract_text, run_form, run_forms,
     run_inspect_iw44_pixel, run_outline, run_page, run_pages, run_render_page,
-    run_render_page_layer, run_render_page_pdf, run_render_pdf, run_render_plan, run_summary,
-    run_text,
+    run_render_page_layer, run_render_pdf, run_render_plan, run_summary, run_text,
 };
 use clap::{Parser, Subcommand};
 use djvulpes::{PageRenderMode, RenderCompareLimits};
@@ -28,16 +27,20 @@ struct Cli {
 enum Command {
     /// Print a high-level document summary.
     Summary { file: PathBuf },
-    /// List pages with basic page metadata.
-    Pages { file: PathBuf },
-    /// List forms referenced by the document directory.
-    Forms { file: PathBuf },
-    /// Inspect a FORM at an absolute byte offset.
-    Form { offset: usize, file: PathBuf },
+    /// List pages or inspect one page by 1-based page number.
+    Pages {
+        #[arg(long)]
+        page: Option<usize>,
+        file: PathBuf,
+    },
+    /// List forms or inspect one FORM at an absolute byte offset.
+    Forms {
+        #[arg(long)]
+        offset: Option<usize>,
+        file: PathBuf,
+    },
     /// Inspect the bundled document directory.
     Dirm { file: PathBuf },
-    /// Inspect one page by 1-based page number.
-    Page { number: usize, file: PathBuf },
     /// Show the renderer-facing chunk plan for one page.
     RenderPlan { number: usize, file: PathBuf },
     /// Render a page-sized RGB PPM image.
@@ -50,12 +53,6 @@ enum Command {
     RenderPageLayer {
         number: usize,
         mode: PageRenderMode,
-        output: PathBuf,
-        file: PathBuf,
-    },
-    /// Render a page-sized RGB PDF image.
-    RenderPagePdf {
-        number: usize,
         output: PathBuf,
         file: PathBuf,
     },
@@ -207,11 +204,15 @@ fn run_command(command: Command) -> anyhow::Result<()> {
 
     match command {
         Command::Summary { file } => run_summary(&file)?,
-        Command::Pages { file } => run_pages(&file)?,
-        Command::Forms { file } => run_forms(&file)?,
-        Command::Form { offset, file } => run_form(&file, offset)?,
+        Command::Pages { page, file } => match page {
+            Some(number) => run_page(&file, number)?,
+            None => run_pages(&file)?,
+        },
+        Command::Forms { offset, file } => match offset {
+            Some(offset) => run_form(&file, offset)?,
+            None => run_forms(&file)?,
+        },
         Command::Dirm { file } => run_dirm(&file)?,
-        Command::Page { number, file } => run_page(&file, number)?,
         Command::CompareRenderPage { .. }
         | Command::CompareRenderPages { .. }
         | Command::CompareRenderPageLayer { .. }
@@ -219,7 +220,6 @@ fn run_command(command: Command) -> anyhow::Result<()> {
         Command::RenderPlan { .. }
         | Command::RenderPage { .. }
         | Command::RenderPageLayer { .. }
-        | Command::RenderPagePdf { .. }
         | Command::RenderPdf { .. }
         | Command::DumpBitonal { .. }
         | Command::DumpImageLayers { .. } => unreachable!("render command already handled"),
@@ -285,11 +285,6 @@ fn run_render_command(command: &Command) -> anyhow::Result<bool> {
             output,
             file,
         } => run_render_page_layer(file, *number, *mode, output)?,
-        Command::RenderPagePdf {
-            number,
-            output,
-            file,
-        } => run_render_page_pdf(file, *number, output)?,
         Command::RenderPdf {
             output,
             from_page,
