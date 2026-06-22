@@ -447,6 +447,10 @@ impl BitonalBitmap {
     #[must_use]
     pub fn to_image_mask_bytes(&self) -> Vec<u8> {
         let row_bytes = (self.width as usize).div_ceil(8);
+        if self.width.is_multiple_of(8) {
+            return self.bits.clone();
+        }
+
         let mut bytes = Vec::with_capacity(row_bytes.saturating_mul(self.height as usize));
 
         for y in 0..self.height {

@@ -1342,16 +1342,16 @@ fn ccitt_group4_encode(width: u32, height: u32, bytes: &[u8]) -> Vec<u8> {
     let height = usize::try_from(height).expect("validated bitonal height should fit usize");
     let row_bytes = width.div_ceil(8);
     let mut writer = CcittBitWriter::default();
-    let mut reference = vec![false; width];
+    let mut reference_changes = Vec::new();
 
     for row_index in 0..height {
         let row_start = row_index
             .checked_mul(row_bytes)
             .expect("validated bitonal row offset should not overflow");
         let row = &bytes[row_start..row_start + row_bytes];
-        let current = ccitt_row_bits(row, width);
-        ccitt_group4_encode_row(&current, &reference, &mut writer);
-        reference = current;
+        let current_changes = ccitt_row_changes(row, width);
+        ccitt_group4_encode_row(width, &current_changes, &reference_changes, &mut writer);
+        reference_changes = current_changes;
     }
 
     writer.write_code(0b0000_0000_0001, 12);
@@ -1359,25 +1359,44 @@ fn ccitt_group4_encode(width: u32, height: u32, bytes: &[u8]) -> Vec<u8> {
     writer.finish()
 }
 
-fn ccitt_row_bits(row: &[u8], width: usize) -> Vec<bool> {
-    (0..width)
-        .map(|x| {
-            let byte = row[x / 8];
-            let mask = 0x80 >> (x % 8);
-            byte & mask != 0
-        })
-        .collect()
+fn ccitt_row_changes(row: &[u8], width: usize) -> Vec<usize> {
+    let mut changes = Vec::new();
+    let mut previous = false;
+
+    for x in 0..width {
+        let current = row[x / 8] & (0x80 >> (x % 8)) != 0;
+        if current != previous {
+            changes.push(x);
+            previous = current;
+        }
+    }
+
+    changes
 }
 
-fn ccitt_group4_encode_row(current: &[bool], reference: &[bool], writer: &mut CcittBitWriter) {
-    let width = current.len();
+fn ccitt_group4_encode_row(
+    width: usize,
+    current_changes: &[usize],
+    reference_changes: &[usize],
+    writer: &mut CcittBitWriter,
+) {
     let mut a0 = CcittPosition::BeforeLine;
     let mut color = false;
 
     while a0.run_start() < width {
-        let a1 = ccitt_next_change(current, a0.search_start(), color);
-        let b1 = ccitt_next_reference_change_to_color(reference, a0.search_start(), !color);
-        let b2 = ccitt_next_reference_change_to_color(reference, b1.saturating_add(1), color);
+        let a1 = ccitt_next_change(current_changes, a0.search_start(), width);
+        let b1 = ccitt_next_reference_change_to_color(
+            reference_changes,
+            a0.search_start(),
+            !color,
+            width,
+        );
+        let b2 = ccitt_next_reference_change_to_color(
+            reference_changes,
+            b1.saturating_add(1),
+            color,
+            width,
+        );
 
         if b2 < a1 {
             writer.write_code(0b0001, 4);
@@ -1404,7 +1423,7 @@ fn ccitt_group4_encode_row(current: &[bool], reference: &[bool], writer: &mut Cc
             continue;
         }
 
-        let a2 = ccitt_next_change(current, a1, !color);
+        let a2 = ccitt_next_change(current_changes, a1.saturating_add(1), width);
         writer.write_code(0b001, 3);
         let first_run = a1 - a0.run_start();
         let second_run = a2 - a1;
@@ -1414,23 +1433,27 @@ fn ccitt_group4_encode_row(current: &[bool], reference: &[bool], writer: &mut Cc
     }
 }
 
-fn ccitt_next_change(line: &[bool], start: usize, color: bool) -> usize {
-    line.iter()
-        .enumerate()
-        .skip(start)
-        .find_map(|(index, bit)| (*bit != color).then_some(index))
-        .unwrap_or(line.len())
+fn ccitt_next_change(changes: &[usize], start: usize, width: usize) -> usize {
+    let index = changes.partition_point(|change| *change < start);
+    changes.get(index).copied().unwrap_or(width)
 }
 
-fn ccitt_next_reference_change_to_color(line: &[bool], start: usize, target_color: bool) -> usize {
-    (start..line.len())
-        .find(|&index| {
-            let previous = if index == 0 { false } else { line[index - 1] };
-            let current = line[index];
+fn ccitt_next_reference_change_to_color(
+    changes: &[usize],
+    start: usize,
+    target_color: bool,
+    width: usize,
+) -> usize {
+    let mut index = changes.partition_point(|change| *change < start);
+    while let Some(&change) = changes.get(index) {
+        let color_after_change = index.is_multiple_of(2);
+        if color_after_change == target_color {
+            return change;
+        }
+        index += 1;
+    }
 
-            current != previous && current == target_color
-        })
-        .unwrap_or(line.len())
+    width
 }
 
 fn ccitt_write_run(writer: &mut CcittBitWriter, mut run: usize, black: bool) {
