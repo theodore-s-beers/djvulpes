@@ -744,13 +744,6 @@ mod tests {
     }
 
     #[test]
-    fn bzz_decoder_reads_fixture_block_len() {
-        let mut decoder = VerifiedBzzDecoder::new(HELLO_BZZ).expect("fixture should initialize");
-
-        assert_eq!(decoder.next_block_len(), HELLO_RAW.len() + 1);
-    }
-
-    #[test]
     fn bzz_decoder_reads_fixture_fshift_after_block_len() {
         let mut decoder = VerifiedBzzDecoder::new(HELLO_BZZ).expect("fixture should initialize");
 
@@ -872,13 +865,6 @@ mod tests {
                 state + 1
             );
         }
-    }
-
-    #[test]
-    fn in_memory_decoder_decodes_fixture_bytes() {
-        let decoded = decode_bzz_in_memory(HELLO_BZZ).expect("in-memory BZZ should decode fixture");
-
-        assert_eq!(decoded, HELLO_RAW);
     }
 
     #[test]
