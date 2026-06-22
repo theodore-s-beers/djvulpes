@@ -1245,10 +1245,6 @@ const fn iw44_coefficient(value: i32) -> i16 {
     value as i16
 }
 
-const fn iw44_sample(value: i32) -> i16 {
-    iw44_coefficient(value)
-}
-
 fn normalize_iw44_sample(value: i16) -> i32 {
     ((i32::from(value) + 32) >> 6).clamp(-128, 127)
 }
@@ -1428,7 +1424,7 @@ fn inverse_wavelet_line(line: &mut [i16]) {
         let adjacent = previous_one + next_one;
         let distant = previous_three + next_three;
         let value = i32::from(line[index]) - (((adjacent << 3) + adjacent - distant + 16) >> 5);
-        line[index] = iw44_sample(value);
+        line[index] = iw44_coefficient(value);
     }
 
     if last < 1 {
@@ -1452,7 +1448,7 @@ fn inverse_wavelet_line(line: &mut [i16]) {
         } else {
             i32::from(line[index]) + i32::from(line[index - 1])
         };
-        line[index] = iw44_sample(value);
+        line[index] = iw44_coefficient(value);
     }
 }
 
