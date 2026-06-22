@@ -1016,7 +1016,7 @@ fn render_plan_paints_iw44_background_before_bitonal_masks() {
     assert!(text.contains("/Type /Page"));
     assert!(text.contains("/MediaBox [0 0 561.6000 587.8800]"));
     assert!(text.contains("/Subtype /Image /Width 1560 /Height 1633"));
-    assert!(text.contains("/Length 7642440"));
+    assert!(text.contains("/Filter "));
     assert!(text.contains("xref\n0 6\n"));
     assert!(pdf.ends_with(b"%%EOF\n"));
 }

@@ -768,6 +768,19 @@ fn write_pdf_page_image_summary(summary: &mut String, image: &PdfPageImage) {
             )
             .expect("writing to string should not fail");
         }
+        PdfPageImage::Gray8 {
+            width,
+            height,
+            dpi,
+            pixels,
+        } => {
+            writeln!(
+                summary,
+                "prepared: {width}x{height} dpi={dpi} format=PDF/DeviceGray8 bytes={}",
+                pixels.len()
+            )
+            .expect("writing to string should not fail");
+        }
         PdfPageImage::BitonalMask {
             width,
             height,

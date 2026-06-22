@@ -10,6 +10,7 @@ mod ccitt;
 
 type Jb2DictionaryCache = BTreeMap<(usize, usize), Jb2Dictionary>;
 
+use flate2::{Compression, write::ZlibEncoder};
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -145,6 +146,12 @@ impl DjvuPdfTimingEvent {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum PdfPageImage {
     Rgb8 {
+        width: u32,
+        height: u32,
+        dpi: u16,
+        pixels: Vec<u8>,
+    },
+    Gray8 {
         width: u32,
         height: u32,
         dpi: u16,
@@ -1612,6 +1619,15 @@ impl PdfPageImage {
             }
         }
 
+        if let Some(pixels) = rgb_pixels_to_gray8(&render.bitmap.pixels) {
+            return Self::Gray8 {
+                width: render.bitmap.width,
+                height: render.bitmap.height,
+                dpi: render.bitmap.dpi,
+                pixels,
+            };
+        }
+
         Self::Rgb8 {
             width: render.bitmap.width,
             height: render.bitmap.height,
@@ -1622,19 +1638,25 @@ impl PdfPageImage {
 
     const fn width(&self) -> u32 {
         match self {
-            Self::Rgb8 { width, .. } | Self::BitonalMask { width, .. } => *width,
+            Self::Rgb8 { width, .. }
+            | Self::Gray8 { width, .. }
+            | Self::BitonalMask { width, .. } => *width,
         }
     }
 
     const fn height(&self) -> u32 {
         match self {
-            Self::Rgb8 { height, .. } | Self::BitonalMask { height, .. } => *height,
+            Self::Rgb8 { height, .. }
+            | Self::Gray8 { height, .. }
+            | Self::BitonalMask { height, .. } => *height,
         }
     }
 
     const fn dpi(&self) -> u16 {
         match self {
-            Self::Rgb8 { dpi, .. } | Self::BitonalMask { dpi, .. } => *dpi,
+            Self::Rgb8 { dpi, .. } | Self::Gray8 { dpi, .. } | Self::BitonalMask { dpi, .. } => {
+                *dpi
+            }
         }
     }
 
@@ -1652,6 +1674,17 @@ impl PdfPageImage {
             } => image_stream_object(
                 &format!(
                     "/Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /DeviceRGB /BitsPerComponent 8"
+                ),
+                pixels,
+            ),
+            Self::Gray8 {
+                width,
+                height,
+                pixels,
+                ..
+            } => image_stream_object(
+                &format!(
+                    "/Type /XObject /Subtype /Image /Width {width} /Height {height} /ColorSpace /DeviceGray /BitsPerComponent 8"
                 ),
                 pixels,
             ),
@@ -1702,6 +1735,20 @@ fn validate_page_image(page: &PdfPageImage) -> PdfResult<()> {
                 )));
             }
         }
+        PdfPageImage::Gray8 {
+            width,
+            height,
+            pixels,
+            ..
+        } => {
+            let expected_len = gray_len(*width, *height)?;
+            if pixels.len() != expected_len {
+                return Err(PdfError::new(format!(
+                    "grayscale page has {} bytes, expected {expected_len}",
+                    pixels.len()
+                )));
+            }
+        }
         PdfPageImage::BitonalMask {
             width,
             height,
@@ -1721,6 +1768,22 @@ fn validate_page_image(page: &PdfPageImage) -> PdfResult<()> {
     Ok(())
 }
 
+fn rgb_pixels_to_gray8(pixels: &[u8]) -> Option<Vec<u8>> {
+    let mut gray = Vec::with_capacity(pixels.len() / 3);
+    for pixel in pixels.chunks_exact(3) {
+        if pixel[0] != pixel[1] || pixel[1] != pixel[2] {
+            return None;
+        }
+        gray.push(pixel[0]);
+    }
+
+    pixels
+        .chunks_exact(3)
+        .remainder()
+        .is_empty()
+        .then_some(gray)
+}
+
 fn rgb_len(width: u32, height: u32) -> PdfResult<usize> {
     usize::try_from(width)
         .ok()
@@ -1730,6 +1793,17 @@ fn rgb_len(width: u32, height: u32) -> PdfResult<usize> {
                 .and_then(|height| width.checked_mul(height))
         })
         .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| PdfError::new("bitmap dimensions overflow"))
+}
+
+fn gray_len(width: u32, height: u32) -> PdfResult<usize> {
+    usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
         .ok_or_else(|| PdfError::new("bitmap dimensions overflow"))
 }
 
@@ -1768,13 +1842,25 @@ fn stream_object(dictionary: &[u8], stream: &[u8]) -> Vec<u8> {
 }
 
 fn image_stream_object(dictionary: &str, bytes: &[u8]) -> Vec<u8> {
-    let encoded = pdf_run_length_encode(bytes);
-    if encoded.len() < bytes.len() {
-        let dictionary = format!("{dictionary} /Filter /RunLengthDecode");
-        stream_object(dictionary.as_bytes(), &encoded)
-    } else {
-        stream_object(dictionary.as_bytes(), bytes)
+    let run_length = pdf_run_length_encode(bytes);
+    let flate = pdf_flate_encode(bytes);
+    let mut best = (bytes, "");
+    if run_length.len() < best.0.len() {
+        best = (&run_length, " /Filter /RunLengthDecode");
     }
+    if flate.len() < best.0.len() {
+        best = (&flate, " /Filter /FlateDecode");
+    }
+
+    stream_object(format!("{dictionary}{}", best.1).as_bytes(), best.0)
+}
+
+fn pdf_flate_encode(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(bytes)
+        .expect("zlib encoder should write to memory");
+    encoder.finish().expect("zlib encoder should finish")
 }
 
 fn ccitt_group4_image_stream_object(
@@ -1958,11 +2044,6 @@ mod tests {
 
     #[test]
     fn write_rendered_pages_pdf_iter_uses_render_image_embedding_choices() {
-        let rgb_render = PartialPageRender {
-            bitmap: PageBitmap::new_rgb8(1, 1, 72, [0, 0, 0]),
-            iw44_layers: Vec::new(),
-            bitonal_masks: Vec::new(),
-        };
         let white_bitonal_render = PartialPageRender {
             bitmap: PageBitmap::new_rgb8(8, 1, 72, [0xff, 0xff, 0xff]),
             iw44_layers: Vec::new(),
@@ -1970,18 +2051,37 @@ mod tests {
         };
 
         let pdf = write_rendered_pages_pdf_iter(
-            2,
-            [
-                Ok::<PartialPageRender, PdfError>(rgb_render),
-                Ok::<PartialPageRender, PdfError>(white_bitonal_render),
-            ],
+            1,
+            [Ok::<PartialPageRender, PdfError>(white_bitonal_render)],
         )
         .expect("rendered pages should serialize");
         let text = String::from_utf8_lossy(&pdf);
 
-        assert!(text.contains("/Type /Pages /Count 2 /Kids [3 0 R 4 0 R]"));
-        assert!(text.contains("/ColorSpace /DeviceRGB /BitsPerComponent 8"));
+        assert!(text.contains("/Type /Pages /Count 1 /Kids [3 0 R]"));
         assert!(text.contains("/ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]"));
+    }
+
+    #[test]
+    fn write_page_image_pdf_embeds_gray8_page_as_device_gray() {
+        let page = PdfPageImage::Gray8 {
+            width: 2,
+            height: 1,
+            dpi: 72,
+            pixels: vec![7, 8],
+        };
+
+        let pdf = write_page_image_pdf(&[page]).expect("PDF should serialize");
+        let text = String::from_utf8_lossy(&pdf);
+
+        assert!(text.contains("/ColorSpace /DeviceGray /BitsPerComponent 8"));
+        assert!(!text.contains("/ColorSpace /DeviceRGB /BitsPerComponent 8"));
+    }
+
+    #[test]
+    fn rgb_pixels_to_gray8_accepts_only_exact_gray_pixels() {
+        assert_eq!(rgb_pixels_to_gray8(&[7, 7, 7, 8, 8, 8]), Some(vec![7, 8]));
+        assert_eq!(rgb_pixels_to_gray8(&[7, 7, 8]), None);
+        assert_eq!(rgb_pixels_to_gray8(&[7, 7]), None);
     }
 
     #[test]

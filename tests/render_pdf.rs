@@ -37,6 +37,7 @@ fn render_document_pdf_with_events_renders_fixture_page_range() {
         DjvuPdfRenderEvent::PageImagePrepared { page_number, image } => {
             let (width, height) = match image {
                 PdfPageImage::Rgb8 { width, height, .. }
+                | PdfPageImage::Gray8 { width, height, .. }
                 | PdfPageImage::BitonalMask { width, height, .. } => (*width, *height),
             };
             events.push((page_number, page_number, "prepared", width, height));
