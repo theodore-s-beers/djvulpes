@@ -8,14 +8,31 @@ use djvulpes::{
     PartialPageRender, PdfPageImage, RenderCompareLimits, TextZone, bitmap_diff_failures,
     bitmap_diff_region_summary, bitmap_diff_tile_summaries, parse_chunks, parse_dirm_tail,
     parse_form_at, parse_text_payload, parse_text_zones, read_page_details,
-    render_document_pdf_to_writer_with_events, render_document_pdf_with_events,
+    render_document_pdf_to_writer_with_events_and_timings, render_document_pdf_with_events,
 };
+use djvulpes::{DjvuPdfTimingEvent, DjvuPdfTimingStage};
 use djvulpes::{decode_bzz, decode_dirm_tail};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 const JB2_PLAN_PREFIX_RECORD_LIMIT: usize = 8;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RenderPdfOptions {
+    pub progress: RenderPdfProgress,
+    pub verbose: bool,
+    pub timings: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum RenderPdfProgress {
+    #[default]
+    Sparse,
+    PerPage,
+    Quiet,
+}
 
 #[derive(Debug, Default)]
 struct BatchCompareWorst {
@@ -413,20 +430,22 @@ pub fn run_render_pdf(
     output: &Path,
     from_page: usize,
     to_page: Option<usize>,
-    progress: bool,
-    quiet: bool,
-    verbose: bool,
+    options: RenderPdfOptions,
 ) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
     let mut render_count = 0usize;
     let mut summaries = Vec::new();
+    let mut timing_summary = PdfTimingSummary::default();
     let selected_page_count = to_page.map_or_else(
         || None,
         |to_page| to_page.checked_sub(from_page).map(|offset| offset + 1),
     );
     let mut output_file = fs::File::create(output)
         .with_context(|| format!("failed to create {}", output.display()))?;
-    render_document_pdf_to_writer_with_events(
+    let mut timing_callback = |event: DjvuPdfTimingEvent| {
+        timing_summary.record(event);
+    };
+    render_document_pdf_to_writer_with_events_and_timings(
         &mut output_file,
         &bytes,
         from_page,
@@ -436,7 +455,7 @@ pub fn run_render_pdf(
                 page_number,
                 end_page,
             } => {
-                if progress {
+                if options.progress == RenderPdfProgress::PerPage {
                     eprintln!("rendering page {page_number} of {end_page}");
                 }
             }
@@ -444,7 +463,7 @@ pub fn run_render_pdf(
                 page_number,
                 render,
             } => {
-                if progress {
+                if options.progress == RenderPdfProgress::PerPage {
                     eprintln!("rendered page {page_number}");
                 }
                 render_count += 1;
@@ -452,15 +471,14 @@ pub fn run_render_pdf(
                     render_count,
                     selected_page_count,
                     page_number,
-                    quiet,
-                    progress,
+                    options.progress,
                 );
-                if verbose {
+                if options.verbose {
                     summaries.push(render_pdf_page_summary(page_number, render));
                 }
             }
             djvulpes::DjvuPdfRenderEvent::PageImagePrepared { page_number, image } => {
-                if progress {
+                if options.progress == RenderPdfProgress::PerPage {
                     eprintln!("prepared page {page_number}");
                 }
                 render_count += 1;
@@ -468,18 +486,20 @@ pub fn run_render_pdf(
                     render_count,
                     selected_page_count,
                     page_number,
-                    quiet,
-                    progress,
+                    options.progress,
                 );
-                if verbose {
+                if options.verbose {
                     summaries.push(pdf_page_image_summary(page_number, image));
                 }
             }
         },
+        options
+            .timings
+            .then_some(&mut timing_callback as &mut dyn FnMut(DjvuPdfTimingEvent)),
     )?;
 
     println!("wrote {} pages to {}", render_count, output.display());
-    if verbose {
+    if options.verbose {
         println!("file: {}", path.display());
         println!(
             "range: {}..{}",
@@ -491,18 +511,79 @@ pub fn run_render_pdf(
     for summary in summaries {
         print!("{summary}");
     }
+    if options.timings {
+        print!("{timing_summary}");
+    }
 
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct PdfTimingSummary {
+    setup: Duration,
+    text_extraction: Duration,
+    page_plan: Duration,
+    direct_bitonal: Duration,
+    fallback_render: Duration,
+    pdf_write: Duration,
+}
+
+impl PdfTimingSummary {
+    fn record(&mut self, event: DjvuPdfTimingEvent) {
+        match event.stage {
+            DjvuPdfTimingStage::Setup => self.setup += event.duration,
+            DjvuPdfTimingStage::TextExtraction => self.text_extraction += event.duration,
+            DjvuPdfTimingStage::PagePlan => self.page_plan += event.duration,
+            DjvuPdfTimingStage::DirectBitonal => self.direct_bitonal += event.duration,
+            DjvuPdfTimingStage::FallbackRender => self.fallback_render += event.duration,
+            DjvuPdfTimingStage::PdfWrite => self.pdf_write += event.duration,
+        }
+    }
+}
+
+impl std::fmt::Display for PdfTimingSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(formatter, "timings:")?;
+        writeln!(formatter, "  setup: {}", format_duration(self.setup))?;
+        writeln!(
+            formatter,
+            "  text extraction: {}",
+            format_duration(self.text_extraction)
+        )?;
+        writeln!(
+            formatter,
+            "  page planning: {}",
+            format_duration(self.page_plan)
+        )?;
+        writeln!(
+            formatter,
+            "  direct bitonal: {}",
+            format_duration(self.direct_bitonal)
+        )?;
+        writeln!(
+            formatter,
+            "  fallback render: {}",
+            format_duration(self.fallback_render)
+        )?;
+        writeln!(
+            formatter,
+            "  pdf write/encode: {}",
+            format_duration(self.pdf_write)
+        )
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!("{:.3}s", duration.as_secs_f64())
 }
 
 fn print_render_pdf_sparse_progress(
     render_count: usize,
     selected_page_count: Option<usize>,
     page_number: usize,
-    quiet: bool,
-    per_page_progress: bool,
+    progress: RenderPdfProgress,
 ) {
-    if quiet || per_page_progress {
+    if progress != RenderPdfProgress::Sparse {
         return;
     }
     if render_count.is_multiple_of(50) || selected_page_count == Some(render_count) {
@@ -3605,9 +3686,10 @@ mod tests {
             &output,
             961,
             Some(961),
-            false,
-            true,
-            false,
+            RenderPdfOptions {
+                progress: RenderPdfProgress::Quiet,
+                ..RenderPdfOptions::default()
+            },
         )
         .expect("render-pdf should write page 961");
         let pdf = fs::read(&output).expect("rendered PDF should be readable");
@@ -3632,9 +3714,10 @@ mod tests {
             &output,
             68,
             Some(68),
-            false,
-            true,
-            false,
+            RenderPdfOptions {
+                progress: RenderPdfProgress::Quiet,
+                ..RenderPdfOptions::default()
+            },
         )
         .expect("render-pdf should write page 68");
         let pdf = fs::read(&output).expect("rendered PDF should be readable");

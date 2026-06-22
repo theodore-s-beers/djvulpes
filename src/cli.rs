@@ -1,9 +1,10 @@
 use crate::commands::{
-    Iw44PixelInspectOptions, Iw44PixelTrace, run_compare_ppm, run_compare_render_page,
-    run_compare_render_page_layer, run_compare_render_pages, run_dirm, run_dump_bitonal,
-    run_dump_image_layers, run_extract_text, run_form, run_forms, run_inspect_iw44_pixel,
-    run_outline, run_page, run_pages, run_render_page, run_render_page_layer, run_render_page_pdf,
-    run_render_pdf, run_render_plan, run_summary, run_text,
+    Iw44PixelInspectOptions, Iw44PixelTrace, RenderPdfOptions, RenderPdfProgress, run_compare_ppm,
+    run_compare_render_page, run_compare_render_page_layer, run_compare_render_pages, run_dirm,
+    run_dump_bitonal, run_dump_image_layers, run_extract_text, run_form, run_forms,
+    run_inspect_iw44_pixel, run_outline, run_page, run_pages, run_render_page,
+    run_render_page_layer, run_render_page_pdf, run_render_pdf, run_render_plan, run_summary,
+    run_text,
 };
 use clap::{Parser, Subcommand};
 use djvulpes::{PageRenderMode, RenderCompareLimits};
@@ -96,6 +97,8 @@ enum Command {
         quiet: bool,
         #[arg(long)]
         verbose: bool,
+        #[arg(long)]
+        timings: bool,
         #[arg(default_value = DEFAULT_FILE)]
         file: PathBuf,
     },
@@ -271,8 +274,25 @@ fn run_command(command: Command) -> anyhow::Result<()> {
             progress,
             quiet,
             verbose,
+            timings,
             file,
-        } => run_render_pdf(&file, &output, from_page, to_page, progress, quiet, verbose)?,
+        } => run_render_pdf(
+            &file,
+            &output,
+            from_page,
+            to_page,
+            RenderPdfOptions {
+                progress: if quiet {
+                    RenderPdfProgress::Quiet
+                } else if progress {
+                    RenderPdfProgress::PerPage
+                } else {
+                    RenderPdfProgress::Sparse
+                },
+                verbose,
+                timings,
+            },
+        )?,
         Command::CompareRenderPage { .. }
         | Command::CompareRenderPages { .. }
         | Command::CompareRenderPageLayer { .. }

@@ -5,9 +5,11 @@ use crate::{
     render::{PageBitmap, PartialPageRender, PixelFormat},
 };
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     fmt::{self, Write as _},
     io::{self, Cursor, Write},
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -66,6 +68,22 @@ pub enum DjvuPdfRenderEvent<'a> {
         page_number: usize,
         render: &'a PartialPageRender,
     },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DjvuPdfTimingStage {
+    Setup,
+    TextExtraction,
+    PagePlan,
+    DirectBitonal,
+    FallbackRender,
+    PdfWrite,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct DjvuPdfTimingEvent {
+    pub stage: DjvuPdfTimingStage,
+    pub duration: Duration,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -216,6 +234,7 @@ where
         pages,
         &[],
         None,
+        None,
     )
 }
 
@@ -243,7 +262,7 @@ where
 {
     let mut pdf = Cursor::new(Vec::new());
     write_page_image_pdf_iter_with_bookmarks_and_text_to_writer(
-        &mut pdf, page_count, pages, bookmarks, text_pages,
+        &mut pdf, page_count, pages, bookmarks, text_pages, None,
     )?;
 
     Ok(pdf.into_inner())
@@ -259,6 +278,7 @@ fn write_page_image_pdf_iter_with_bookmarks_and_text_to_writer<W, I, E>(
     pages: I,
     bookmarks: &[PdfBookmark],
     text_pages: Option<&[PdfTextPage]>,
+    mut timing: Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
 ) -> Result<(), E>
 where
     W: Write,
@@ -378,8 +398,17 @@ where
         pdf.write_object(content_id, &content_stream)
             .map_err(E::from)?;
 
+        let image_start = timing.is_some().then(Instant::now);
         let image_stream = page_image.image_stream_object();
         pdf.write_object(image_id, &image_stream).map_err(E::from)?;
+        if let Some(image_start) = image_start
+            && let Some(timing) = timing.as_deref_mut()
+        {
+            timing(DjvuPdfTimingEvent {
+                stage: DjvuPdfTimingStage::PdfWrite,
+                duration: image_start.elapsed(),
+            });
+        }
     }
 
     if actual_page_count != page_count {
@@ -421,7 +450,18 @@ where
         .map_err(E::from)?;
     }
 
-    pdf.finish(catalog_id).map_err(E::from)
+    let finish_start = timing.is_some().then(Instant::now);
+    let result = pdf.finish(catalog_id).map_err(E::from);
+    if let Some(finish_start) = finish_start
+        && let Some(timing) = timing
+    {
+        timing(DjvuPdfTimingEvent {
+            stage: DjvuPdfTimingStage::PdfWrite,
+            duration: finish_start.elapsed(),
+        });
+    }
+
+    result
 }
 
 /// Writes a PDF from an iterator of rendered pages.
@@ -544,8 +584,32 @@ pub fn render_document_pdf_to_writer_with_events<W: Write>(
     bytes: &[u8],
     from_page: usize,
     to_page: Option<usize>,
-    mut event: impl FnMut(DjvuPdfRenderEvent<'_>),
+    event: impl FnMut(DjvuPdfRenderEvent<'_>),
 ) -> DjvuPdfResult<()> {
+    render_document_pdf_to_writer_with_events_and_timings(
+        writer, bytes, from_page, to_page, event, None,
+    )
+}
+
+/// Renders a `DjVu` document byte slice to a PDF writer, reporting page-level
+/// events and optional aggregate timing events.
+///
+/// Timing callbacks are coarse-grained and opt-in. Passing `None` avoids timing
+/// collection in normal conversion paths.
+///
+/// # Errors
+///
+/// Returns the same errors as [`render_document_pdf_to_writer_with_events`].
+pub fn render_document_pdf_to_writer_with_events_and_timings<W: Write>(
+    writer: W,
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+    mut event: impl FnMut(DjvuPdfRenderEvent<'_>),
+    timing: Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+) -> DjvuPdfResult<()> {
+    let timing = RefCell::new(timing);
+    let setup_start = pdf_timing_start(&timing);
     let document = Document::parse(bytes)?;
     let decoded_tail;
     let tail_entries = if let Some(dirm) = &document.directory {
@@ -559,7 +623,10 @@ pub fn render_document_pdf_to_writer_with_events<W: Write>(
     let bookmarks = extract_document_bookmarks(bytes)?.map_or_else(Vec::new, |bookmarks| {
         pdf_bookmarks_from_djvu(&bookmarks, from_page, end_page)
     });
+    record_pdf_timing(&timing, DjvuPdfTimingStage::Setup, setup_start);
+    let text_start = pdf_timing_start(&timing);
     let text_pages = pdf_text_pages_from_djvu(bytes, from_page, Some(end_page))?;
+    record_pdf_timing(&timing, DjvuPdfTimingStage::TextExtraction, text_start);
     let selected_page_count = end_page - from_page + 1;
     let mut pages = document.pages(bytes).enumerate();
 
@@ -579,8 +646,12 @@ pub fn render_document_pdf_to_writer_with_events<W: Write>(
             });
             let image = (|| {
                 let page = page?;
+                let plan_start = pdf_timing_start(&timing);
                 let plan = document.page_render_plan(bytes, &page, &tail_entries)?;
+                record_pdf_timing(&timing, DjvuPdfTimingStage::PagePlan, plan_start);
+                let direct_start = pdf_timing_start(&timing);
                 if let Some(image) = direct_bitonal_pdf_page_image(bytes, &plan)? {
+                    record_pdf_timing(&timing, DjvuPdfTimingStage::DirectBitonal, direct_start);
                     event(DjvuPdfRenderEvent::PageImagePrepared {
                         page_number,
                         image: &image,
@@ -588,7 +659,9 @@ pub fn render_document_pdf_to_writer_with_events<W: Write>(
                     return Ok(image);
                 }
 
+                let render_start = pdf_timing_start(&timing);
                 let render = plan.render_bitmap_with_mode(bytes, PageRenderMode::Full)?;
+                record_pdf_timing(&timing, DjvuPdfTimingStage::FallbackRender, render_start);
                 event(DjvuPdfRenderEvent::PageRendered {
                     page_number,
                     render: &render,
@@ -603,13 +676,42 @@ pub fn render_document_pdf_to_writer_with_events<W: Write>(
         None
     });
 
+    let mut write_timing = |event| {
+        if let Some(timing) = timing.borrow_mut().as_deref_mut() {
+            timing(event);
+        }
+    };
+    let has_timing = timing.borrow().is_some();
+
     write_page_image_pdf_iter_with_bookmarks_and_text_to_writer(
         writer,
         selected_page_count,
         page_images,
         &bookmarks,
         Some(&text_pages),
+        has_timing.then_some(&mut write_timing as &mut dyn FnMut(DjvuPdfTimingEvent)),
     )
+}
+
+fn pdf_timing_start(
+    timing: &RefCell<Option<&mut dyn FnMut(DjvuPdfTimingEvent)>>,
+) -> Option<Instant> {
+    timing.borrow().is_some().then(Instant::now)
+}
+
+fn record_pdf_timing(
+    timing: &RefCell<Option<&mut dyn FnMut(DjvuPdfTimingEvent)>>,
+    stage: DjvuPdfTimingStage,
+    start: Option<Instant>,
+) {
+    if let Some(start) = start
+        && let Some(timing) = timing.borrow_mut().as_deref_mut()
+    {
+        timing(DjvuPdfTimingEvent {
+            stage,
+            duration: start.elapsed(),
+        });
+    }
 }
 
 fn checked_document_pdf_page_range(
