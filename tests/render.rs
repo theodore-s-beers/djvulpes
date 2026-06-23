@@ -3,7 +3,7 @@ use djvulpes::{
     render_document_pages, render_document_pages_with_events,
 };
 
-const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
+const RYPKA: &[u8] = include_bytes!("../fixtures/Rypka-HIL.djvu");
 
 #[test]
 fn render_document_page_rejects_invalid_page_numbers() {

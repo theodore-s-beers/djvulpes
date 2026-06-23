@@ -3,7 +3,7 @@ use djvulpes::{
     format_document_text_zones,
 };
 
-const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
+const RYPKA: &[u8] = include_bytes!("../fixtures/Rypka-HIL.djvu");
 
 #[test]
 fn extract_document_text_matches_djvutxt_page_separator_convention() {

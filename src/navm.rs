@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn parses_rypka_navm_bookmarks() {
-        const RYPKA: &[u8] = include_bytes!("../Rypka-HIL.djvu");
+        const RYPKA: &[u8] = include_bytes!("../fixtures/Rypka-HIL.djvu");
         let document = Document::parse(RYPKA).expect("document should parse");
         let navm = document
             .root_chunks

@@ -223,7 +223,7 @@ fn decoder_rejects_iw44_chunk_serial_gap() {
 
 #[test]
 fn decoder_builds_coefficients_from_rypka_background_chunks() {
-    const RYPKA: &[u8] = include_bytes!("../../Rypka-HIL.djvu");
+    const RYPKA: &[u8] = include_bytes!("../../fixtures/Rypka-HIL.djvu");
     let document = Document::parse(RYPKA).expect("fixture DjVu should parse");
     let page = document
         .pages(RYPKA)
@@ -311,7 +311,7 @@ fn decoder_builds_coefficients_from_rypka_background_chunks() {
 
 #[test]
 fn reconstructs_rypka_page_961_background_without_saturating_wavelet_artifact() {
-    const RYPKA: &[u8] = include_bytes!("../../Rypka-HIL.djvu");
+    const RYPKA: &[u8] = include_bytes!("../../fixtures/Rypka-HIL.djvu");
     let document = Document::parse(RYPKA).expect("fixture DjVu should parse");
     let page = document
         .pages(RYPKA)

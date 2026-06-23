@@ -1526,7 +1526,7 @@ mod tests {
             std::env::temp_dir().join(format!("djvulpes-page-68-{}.pdf", std::process::id()));
 
         run_render_pdf(
-            Path::new("Rypka-HIL.djvu"),
+            Path::new("fixtures/Rypka-HIL.djvu"),
             &output,
             68,
             Some(68),
@@ -1558,14 +1558,14 @@ mod tests {
         let oracle = oracle_dir.join("page-1.ppm");
 
         run_render_page_image(
-            Path::new("Rypka-HIL.djvu"),
+            Path::new("fixtures/Rypka-HIL.djvu"),
             1,
             PageRenderMode::Full,
             &oracle,
         )
         .expect("page oracle should render");
         run_compare_render(
-            Path::new("Rypka-HIL.djvu"),
+            Path::new("fixtures/Rypka-HIL.djvu"),
             CompareRenderOptions {
                 oracle: None,
                 oracle_dir: Some(&oracle_dir),
@@ -1587,14 +1587,14 @@ mod tests {
             std::env::temp_dir().join(format!("djvulpes-page-1-{}.ppm", std::process::id()));
 
         run_render_page_image(
-            Path::new("Rypka-HIL.djvu"),
+            Path::new("fixtures/Rypka-HIL.djvu"),
             1,
             PageRenderMode::Full,
             &oracle,
         )
         .expect("page oracle should render");
         run_compare_render(
-            Path::new("Rypka-HIL.djvu"),
+            Path::new("fixtures/Rypka-HIL.djvu"),
             CompareRenderOptions {
                 oracle: Some(&oracle),
                 oracle_dir: None,
@@ -1635,7 +1635,7 @@ mod tests {
         let output_dir =
             std::env::temp_dir().join(format!("djvulpes-iw44-dump-{}", std::process::id()));
 
-        run_dump_image_layers(Path::new("Rypka-HIL.djvu"), 1, &output_dir)
+        run_dump_image_layers(Path::new("fixtures/Rypka-HIL.djvu"), 1, &output_dir)
             .expect("image layer dump should write native IW44 PPMs");
 
         let background = fs::read(output_dir.join("page-1-background.ppm"))

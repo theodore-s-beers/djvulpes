@@ -1,26 +1,16 @@
-use std::fs;
-
 use djvulpes::{
     Document, Iw44LayerRole, PageChunkKind, PageRenderMode, extract_document_bookmarks,
     format_document_text_zones, render_document_page, render_document_pdf,
 };
 
-const JOHNSON_PATH: &str = "johnson-persian.djvu";
-
-fn johnson() -> Option<Vec<u8>> {
-    fs::read(JOHNSON_PATH).ok()
-}
+const JOHNSON: &[u8] = include_bytes!("../fixtures/johnson-persian.djvu");
 
 #[test]
 fn johnson_document_structure_is_supported() {
-    let Some(bytes) = johnson() else {
-        return;
-    };
-
-    let document = Document::parse(&bytes).expect("Johnson should parse");
+    let document = Document::parse(JOHNSON).expect("Johnson should parse");
     let form_counts = document.form_kind_counts();
     let root_counts = document
-        .root_chunk_counts(&bytes)
+        .root_chunk_counts(JOHNSON)
         .expect("Johnson root chunks should parse");
 
     assert_eq!(form_counts.pages, 272);
@@ -31,7 +21,7 @@ fn johnson_document_structure_is_supported() {
     assert_eq!(root_counts.other, 0);
 
     let first_page = document
-        .pages(&bytes)
+        .pages(JOHNSON)
         .next()
         .expect("Johnson should have a first page")
         .expect("Johnson first page should parse");
@@ -45,18 +35,14 @@ fn johnson_document_structure_is_supported() {
 
 #[test]
 fn johnson_cida_page_chunks_are_classified_as_known_metadata() {
-    let Some(bytes) = johnson() else {
-        return;
-    };
-
-    let document = Document::parse(&bytes).expect("Johnson should parse");
+    let document = Document::parse(JOHNSON).expect("Johnson should parse");
     let page = document
-        .pages(&bytes)
+        .pages(JOHNSON)
         .nth(1)
         .expect("Johnson should have page 2")
         .expect("Johnson page 2 should parse");
     let details = page
-        .details(&bytes)
+        .details(JOHNSON)
         .expect("Johnson page 2 details should parse");
 
     assert_eq!(
@@ -79,23 +65,15 @@ fn johnson_cida_page_chunks_are_classified_as_known_metadata() {
 
 #[test]
 fn johnson_has_no_outline() {
-    let Some(bytes) = johnson() else {
-        return;
-    };
-
-    let bookmarks = extract_document_bookmarks(&bytes).expect("bookmark extraction should parse");
+    let bookmarks = extract_document_bookmarks(JOHNSON).expect("bookmark extraction should parse");
 
     assert!(bookmarks.is_none());
 }
 
 #[test]
 fn johnson_page_2_structured_text_uses_bottom_left_coordinates() {
-    let Some(bytes) = johnson() else {
-        return;
-    };
-
     let text =
-        format_document_text_zones(&bytes, 2, Some(2)).expect("page 2 text zones should format");
+        format_document_text_zones(JOHNSON, 2, Some(2)).expect("page 2 text zones should format");
 
     assert!(text.starts_with("(page 761 1574 1127 1699\n"));
     assert!(text.contains("(word 803 1664 1001 1699 \"Copyright,\")"));
@@ -104,11 +82,7 @@ fn johnson_page_2_structured_text_uses_bottom_left_coordinates() {
 
 #[test]
 fn johnson_representative_text_page_renders() {
-    let Some(bytes) = johnson() else {
-        return;
-    };
-
-    let render = render_document_page(&bytes, 2, PageRenderMode::Full)
+    let render = render_document_page(JOHNSON, 2, PageRenderMode::Full)
         .expect("Johnson page 2 should render");
     let stats = render.bitmap.stats();
 
@@ -126,11 +100,7 @@ fn johnson_representative_text_page_renders() {
 
 #[test]
 fn johnson_last_page_renders() {
-    let Some(bytes) = johnson() else {
-        return;
-    };
-
-    let render = render_document_page(&bytes, 272, PageRenderMode::Full)
+    let render = render_document_page(JOHNSON, 272, PageRenderMode::Full)
         .expect("Johnson final page should render");
     let stats = render.bitmap.stats();
 
@@ -145,11 +115,7 @@ fn johnson_last_page_renders() {
 
 #[test]
 fn johnson_single_page_pdf_renders() {
-    let Some(bytes) = johnson() else {
-        return;
-    };
-
-    let pdf = render_document_pdf(&bytes, 2, Some(2)).expect("page 2 should render to PDF");
+    let pdf = render_document_pdf(JOHNSON, 2, Some(2)).expect("page 2 should render to PDF");
     let text = String::from_utf8_lossy(&pdf);
 
     assert!(text.starts_with("%PDF-1.4\n"));

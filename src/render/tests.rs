@@ -572,7 +572,7 @@ fn render_plan_classifies_effective_page_chunks() {
 
 #[test]
 fn render_plan_recognizes_all_rypka_effective_chunks() {
-    const RYPKA: &[u8] = include_bytes!("../../Rypka-HIL.djvu");
+    const RYPKA: &[u8] = include_bytes!("../../fixtures/Rypka-HIL.djvu");
     let document = Document::parse(RYPKA).expect("fixture DjVu should parse");
     let decoded_tail = document
         .directory
@@ -941,7 +941,7 @@ fn render_plan_foreground_mode_paints_bitonal_masks_without_iw44_foreground() {
 
 #[test]
 fn render_plan_paints_iw44_background_before_bitonal_masks() {
-    const RYPKA: &[u8] = include_bytes!("../../Rypka-HIL.djvu");
+    const RYPKA: &[u8] = include_bytes!("../../fixtures/Rypka-HIL.djvu");
     let document = Document::parse(RYPKA).expect("fixture DjVu should parse");
     let page = document
         .pages(RYPKA)
@@ -1027,7 +1027,7 @@ fn render_plan_paints_iw44_background_before_bitonal_masks() {
 
 #[test]
 fn render_plan_paints_rypka_page_961_background_without_iw44_artifact() {
-    const RYPKA: &[u8] = include_bytes!("../../Rypka-HIL.djvu");
+    const RYPKA: &[u8] = include_bytes!("../../fixtures/Rypka-HIL.djvu");
     let document = Document::parse(RYPKA).expect("fixture DjVu should parse");
     let page = document
         .pages(RYPKA)
@@ -1083,7 +1083,7 @@ fn render_plan_paints_rypka_page_961_background_without_iw44_artifact() {
 
 #[test]
 fn render_plan_uses_inherited_jb2_dictionary() {
-    const RYPKA: &[u8] = include_bytes!("../../Rypka-HIL.djvu");
+    const RYPKA: &[u8] = include_bytes!("../../fixtures/Rypka-HIL.djvu");
     let document = Document::parse(RYPKA).expect("fixture DjVu should parse");
     let page = document
         .pages(RYPKA)
