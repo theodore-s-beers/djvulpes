@@ -58,19 +58,19 @@ enum Command {
     },
     /// Render all pages into one RGB PDF.
     RenderPdf {
-        #[arg(long)]
+        #[arg(short, long)]
         output: PathBuf,
-        #[arg(long, default_value_t = 1)]
+        #[arg(short = 'f', long, default_value_t = 1)]
         from_page: usize,
-        #[arg(long)]
+        #[arg(short = 't', long)]
         to_page: Option<usize>,
-        #[arg(long, value_enum, default_value_t = RenderPdfProgress::Sparse)]
+        #[arg(short, long, value_enum, default_value_t = RenderPdfProgress::Sparse)]
         progress: RenderPdfProgress,
-        #[arg(long)]
+        #[arg(short, long)]
         verbose: bool,
         #[arg(long)]
         timings: bool,
-        #[arg(long)]
+        #[arg(short, long)]
         jobs: Option<usize>,
         file: PathBuf,
     },
