@@ -1,16 +1,16 @@
 use anyhow::{Context, bail};
 use clap::ValueEnum;
-use djvulpes::decode_dirm_tail;
 use djvulpes::{
     Bookmark, extract_document_bookmarks, extract_document_text, format_document_text_zones,
 };
 use djvulpes::{
     Chunk, DirectoryEntry, Document, DocumentFormKind, Form, PageChunk, PageChunkPayload,
-    PageChunkSource, PageRenderMode, PageRenderPlan, ParseResult, PartialPageRender, PdfPageImage,
-    parse_chunks, parse_dirm_tail, parse_form_at, read_page_details,
-    render_document_pdf_to_writer_with_events_and_timings,
+    PageChunkSource, PageRenderMode, PageRenderPlan, ParseResult, PartialPageRender, parse_chunks,
+    parse_dirm_tail, parse_form_at, read_page_details,
+    render_document_pdf_to_writer_parallel_with_timings,
 };
 use djvulpes::{DjvuPdfPageKind, DjvuPdfTimingEvent, DjvuPdfTimingStage};
+use djvulpes::{decode_dirm_tail, default_pdf_render_jobs};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -28,6 +28,7 @@ pub struct RenderPdfOptions {
     pub progress: RenderPdfProgress,
     pub verbose: bool,
     pub timings: bool,
+    pub jobs: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
@@ -329,7 +330,6 @@ pub fn run_render_pdf(
 ) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
     let mut render_count = 0usize;
-    let mut summaries = Vec::new();
     let mut timing_summary = PdfTimingSummary::default();
     let selected_page_count = to_page.map_or_else(
         || None,
@@ -337,63 +337,54 @@ pub fn run_render_pdf(
     );
     let mut output_file = fs::File::create(output)
         .with_context(|| format!("failed to create {}", output.display()))?;
+    let jobs = options.jobs.unwrap_or_else(default_pdf_render_jobs);
+    if jobs == 0 {
+        bail!("--jobs must be 1 or greater");
+    }
+
+    let collect_events = options.timings || options.progress != RenderPdfProgress::Quiet;
     let mut timing_callback = |event: DjvuPdfTimingEvent| {
-        timing_summary.record(event);
+        if options.timings {
+            timing_summary.record(event);
+        }
+        if event.stage == DjvuPdfTimingStage::PageTotal
+            && let Some(page_number) = event.page_number
+        {
+            if options.progress == RenderPdfProgress::PerPage {
+                eprintln!("prepared page {page_number}");
+            }
+            render_count += 1;
+            print_render_pdf_sparse_progress(
+                render_count,
+                selected_page_count,
+                page_number,
+                options.progress,
+            );
+        }
     };
-    render_document_pdf_to_writer_with_events_and_timings(
+    render_document_pdf_to_writer_parallel_with_timings(
         &mut output_file,
         &bytes,
         from_page,
         to_page,
-        |event| match event {
-            djvulpes::DjvuPdfRenderEvent::PageStarted {
-                page_number,
-                end_page,
-            } => {
-                if options.progress == RenderPdfProgress::PerPage {
-                    eprintln!("rendering page {page_number} of {end_page}");
-                }
-            }
-            djvulpes::DjvuPdfRenderEvent::PageRendered {
-                page_number,
-                render,
-            } => {
-                if options.progress == RenderPdfProgress::PerPage {
-                    eprintln!("rendered page {page_number}");
-                }
-                render_count += 1;
-                print_render_pdf_sparse_progress(
-                    render_count,
-                    selected_page_count,
-                    page_number,
-                    options.progress,
-                );
-                if options.verbose {
-                    summaries.push(render_pdf_page_summary(page_number, render));
-                }
-            }
-            djvulpes::DjvuPdfRenderEvent::PageImagePrepared { page_number, image } => {
-                if options.progress == RenderPdfProgress::PerPage {
-                    eprintln!("prepared page {page_number}");
-                }
-                render_count += 1;
-                print_render_pdf_sparse_progress(
-                    render_count,
-                    selected_page_count,
-                    page_number,
-                    options.progress,
-                );
-                if options.verbose {
-                    summaries.push(pdf_page_image_summary(page_number, image));
-                }
-            }
-        },
-        options
-            .timings
-            .then_some(&mut timing_callback as &mut dyn FnMut(DjvuPdfTimingEvent)),
+        jobs,
+        collect_events.then_some(&mut timing_callback as &mut dyn FnMut(DjvuPdfTimingEvent)),
     )?;
 
-    println!("wrote {} pages to {}", render_count, output.display());
+    if render_count != 0 {
+        println!(
+            "wrote {} pages to {} with {jobs} jobs",
+            render_count,
+            output.display()
+        );
+    } else if let Some(selected_page_count) = selected_page_count {
+        println!(
+            "wrote {selected_page_count} pages to {} with {jobs} jobs",
+            output.display()
+        );
+    } else {
+        println!("wrote PDF to {} with {jobs} jobs", output.display());
+    }
     if options.verbose {
         println!("file: {}", path.display());
         println!(
@@ -402,9 +393,7 @@ pub fn run_render_pdf(
             to_page.map_or_else(|| "end".to_string(), |page| page.to_string())
         );
         println!("format: PDF");
-    }
-    for summary in summaries {
-        print!("{summary}");
+        println!("jobs: {jobs}");
     }
     if options.timings {
         print!("{timing_summary}");
@@ -648,74 +637,6 @@ fn print_render_pdf_sparse_progress(
     }
     if render_count.is_multiple_of(50) || selected_page_count == Some(render_count) {
         eprintln!("processed {render_count} pages; latest page {page_number}");
-    }
-}
-
-fn render_pdf_page_summary(page_number: usize, render: &PartialPageRender) -> String {
-    let mut summary = String::new();
-    writeln!(&mut summary, "page: {page_number}").expect("writing to string should not fail");
-    writeln!(
-        &mut summary,
-        "rendered: {}x{} dpi={}",
-        render.bitmap.width, render.bitmap.height, render.bitmap.dpi
-    )
-    .expect("writing to string should not fail");
-    write_bitmap_stats(&mut summary, &render.bitmap);
-    write_partial_render_summary(&mut summary, &render.bitonal_masks);
-    write_iw44_render_summary(&mut summary, &render.iw44_layers);
-
-    summary
-}
-
-fn pdf_page_image_summary(page_number: usize, image: &PdfPageImage) -> String {
-    let mut summary = String::new();
-    writeln!(&mut summary, "page: {page_number}").expect("writing to string should not fail");
-    write_pdf_page_image_summary(&mut summary, image);
-
-    summary
-}
-
-fn write_pdf_page_image_summary(summary: &mut String, image: &PdfPageImage) {
-    match image {
-        PdfPageImage::Rgb8 {
-            width,
-            height,
-            dpi,
-            pixels,
-        } => {
-            writeln!(
-                summary,
-                "prepared: {width}x{height} dpi={dpi} format=PDF/RGB bytes={}",
-                pixels.len()
-            )
-            .expect("writing to string should not fail");
-        }
-        PdfPageImage::Gray8 {
-            width,
-            height,
-            dpi,
-            pixels,
-        } => {
-            writeln!(
-                summary,
-                "prepared: {width}x{height} dpi={dpi} format=PDF/DeviceGray8 bytes={}",
-                pixels.len()
-            )
-            .expect("writing to string should not fail");
-        }
-        PdfPageImage::BitonalMask {
-            width,
-            height,
-            dpi,
-            mask,
-        } => {
-            writeln!(
-                summary,
-                "prepared: {width}x{height} dpi={dpi} format=PDF/DeviceGray1 bytes={}",
-                mask.len()
-            )
-            .expect("writing to string should not fail");
-        }
     }
 }
 
@@ -1547,6 +1468,32 @@ mod tests {
         ));
         assert!(text.contains("/BitsPerComponent 1"));
         assert!(!text.contains("/ColorSpace /DeviceRGB"));
+        assert!(pdf.ends_with(b"%%EOF\n"));
+    }
+
+    #[test]
+    fn run_render_pdf_writes_parallel_page_range_pdf() {
+        let output =
+            std::env::temp_dir().join(format!("djvulpes-pages-68-70-{}.pdf", std::process::id()));
+
+        run_render_pdf(
+            Path::new("fixtures/Rypka-HIL.djvu"),
+            &output,
+            68,
+            Some(70),
+            RenderPdfOptions {
+                progress: RenderPdfProgress::Quiet,
+                jobs: Some(4),
+                ..RenderPdfOptions::default()
+            },
+        )
+        .expect("parallel render-pdf should write pages 68-70");
+        let pdf = fs::read(&output).expect("rendered PDF should be readable");
+        let _ = fs::remove_file(&output);
+        let text = String::from_utf8_lossy(&pdf);
+
+        assert!(text.starts_with("%PDF-1.4\n"));
+        assert!(text.contains("/Type /Pages /Count 3"));
         assert!(pdf.ends_with(b"%%EOF\n"));
     }
 

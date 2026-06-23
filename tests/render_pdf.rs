@@ -1,6 +1,6 @@
 use djvulpes::{
     DjvuPdfError, DjvuPdfRenderEvent, PdfPageImage, render_document_pdf,
-    render_document_pdf_with_events,
+    render_document_pdf_parallel, render_document_pdf_with_events,
 };
 
 const RYPKA: &[u8] = include_bytes!("../fixtures/Rypka-HIL.djvu");
@@ -64,6 +64,24 @@ fn render_document_pdf_with_events_renders_fixture_page_range() {
     );
     assert!(text.contains("/Type /Pages /Count 1"));
     assert!(text.contains("/ColorSpace /DeviceGray /BitsPerComponent 1 /Decode [1 0]"));
+}
+
+#[test]
+fn render_document_pdf_parallel_matches_serial_bitonal_page_range() {
+    let serial = render_document_pdf(RYPKA, 68, Some(70)).expect("serial PDF should render");
+    let parallel =
+        render_document_pdf_parallel(RYPKA, 68, Some(70), 4).expect("parallel PDF should render");
+
+    assert_eq!(parallel, serial);
+}
+
+#[test]
+fn render_document_pdf_parallel_matches_serial_rgb_page() {
+    let serial = render_document_pdf(RYPKA, 961, Some(961)).expect("serial PDF should render");
+    let parallel =
+        render_document_pdf_parallel(RYPKA, 961, Some(961), 4).expect("parallel PDF should render");
+
+    assert_eq!(parallel, serial);
 }
 
 #[test]

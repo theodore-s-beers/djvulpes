@@ -70,6 +70,8 @@ enum Command {
         verbose: bool,
         #[arg(long)]
         timings: bool,
+        #[arg(long)]
+        jobs: Option<usize>,
         file: PathBuf,
     },
     /// Compare rendered pages against binary RGB PPM oracle files.
@@ -199,6 +201,7 @@ fn run_render_command(command: &Command) -> anyhow::Result<bool> {
             progress,
             verbose,
             timings,
+            jobs,
             file,
         } => run_render_pdf(
             file,
@@ -209,6 +212,7 @@ fn run_render_command(command: &Command) -> anyhow::Result<bool> {
                 progress: *progress,
                 verbose: *verbose,
                 timings: *timings,
+                jobs: *jobs,
             },
         )?,
         Command::DumpBitonal {

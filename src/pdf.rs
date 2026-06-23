@@ -1,7 +1,7 @@
 use crate::{
-    BzzError, DjvuRenderError, Document, Jb2Dictionary, Jb2Error, Jb2PartialImage, ParseError,
-    RenderError, TextError, decode_dirm_tail, decode_jb2_dictionary, extract_document_bookmarks,
-    parse_dirm_tail,
+    BzzError, DirmTailEntry, DjvuRenderError, Document, Jb2Dictionary, Jb2Error, Jb2PartialImage,
+    ParseError, RenderError, TextError, decode_dirm_tail, decode_jb2_dictionary,
+    extract_document_bookmarks, parse_dirm_tail,
     render::{PageBitmap, PartialPageRender, PixelFormat},
     render_jb2_image, render_jb2_image_with_dictionary,
 };
@@ -22,6 +22,11 @@ use std::{
     collections::BTreeMap,
     fmt,
     io::{self, Cursor, Write},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -732,7 +737,81 @@ pub fn render_document_pdf_to_writer<W: Write>(
     from_page: usize,
     to_page: Option<usize>,
 ) -> DjvuPdfResult<()> {
-    render_document_pdf_to_writer_with_events(writer, bytes, from_page, to_page, |_| {})
+    render_document_pdf_to_writer_parallel(writer, bytes, from_page, to_page, 1)
+}
+
+/// Returns the default worker count for parallel PDF page preparation.
+///
+/// This uses the process' available parallelism as reported by the standard
+/// library, which accounts for common CPU quota and affinity constraints.
+#[must_use]
+pub fn default_pdf_render_jobs() -> usize {
+    thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+/// Renders a `DjVu` document byte slice to a PDF using worker threads for page
+/// image preparation.
+///
+/// Page numbers are 1-based. If `to_page` is `None`, rendering continues
+/// through the final page. `jobs` controls the maximum number of worker
+/// threads used for page preparation; values below 1 are treated as 1. PDF
+/// object serialization remains ordered and single-threaded.
+///
+/// This entry point does not report page-level events or timing callbacks. Use
+/// [`render_document_pdf_with_events`] when those callbacks are required.
+///
+/// # Errors
+///
+/// Returns the same errors as [`render_document_pdf`].
+pub fn render_document_pdf_parallel(
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+    jobs: usize,
+) -> DjvuPdfResult<Vec<u8>> {
+    let mut pdf = Cursor::new(Vec::new());
+    render_document_pdf_to_writer_parallel(&mut pdf, bytes, from_page, to_page, jobs)?;
+
+    Ok(pdf.into_inner())
+}
+
+/// Renders a `DjVu` document byte slice to a PDF writer using worker threads
+/// for page image preparation.
+///
+/// See [`render_document_pdf_parallel`] for parallelism semantics.
+///
+/// # Errors
+///
+/// Returns the same errors as [`render_document_pdf_to_writer`].
+pub fn render_document_pdf_to_writer_parallel<W: Write>(
+    writer: W,
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+    jobs: usize,
+) -> DjvuPdfResult<()> {
+    render_document_pdf_to_writer_parallel_with_timings(
+        writer, bytes, from_page, to_page, jobs, None,
+    )
+}
+
+/// Renders a `DjVu` document byte slice to a PDF writer using worker threads
+/// for page image preparation, with optional aggregate timing events.
+///
+/// See [`render_document_pdf_parallel`] for parallelism semantics.
+///
+/// # Errors
+///
+/// Returns the same errors as [`render_document_pdf_to_writer`].
+pub fn render_document_pdf_to_writer_parallel_with_timings<W: Write>(
+    writer: W,
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+    jobs: usize,
+    timing: Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+) -> DjvuPdfResult<()> {
+    render_document_pdf_to_writer_parallel_inner(writer, bytes, from_page, to_page, jobs, timing)
 }
 
 /// Renders a `DjVu` document byte slice to a PDF, reporting page-level events.
@@ -879,6 +958,431 @@ pub fn render_document_pdf_to_writer_with_events_and_timings<W: Write>(
     )
 }
 
+struct PdfPageRenderJob<'a> {
+    index: usize,
+    page_number: usize,
+    plan: crate::PageRenderPlan<'a>,
+}
+
+struct PreparedPdfPage {
+    index: usize,
+    page: DjvuPdfResult<PreparedPdfPageImage>,
+}
+
+struct PreparedPdfPageImage {
+    image: PdfPageImage,
+    image_stream: Vec<u8>,
+    timing_events: Vec<DjvuPdfTimingEvent>,
+}
+
+fn render_document_pdf_to_writer_parallel_inner<W: Write>(
+    writer: W,
+    bytes: &[u8],
+    from_page: usize,
+    to_page: Option<usize>,
+    jobs: usize,
+    mut timing: Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+) -> DjvuPdfResult<()> {
+    let setup_start = timing.is_some().then(Instant::now);
+    let document = Document::parse(bytes)?;
+    let decoded_tail;
+    let tail_entries = if let Some(dirm) = &document.directory {
+        decoded_tail = decode_dirm_tail(bytes, dirm)?;
+        parse_dirm_tail(dirm, &decoded_tail)?
+    } else {
+        Vec::new()
+    };
+    let page_count = document.form_kind_counts().pages;
+    let end_page = checked_document_pdf_page_range(page_count, from_page, to_page)?;
+    let bookmarks = extract_document_bookmarks(bytes)?.map_or_else(Vec::new, |bookmarks| {
+        pdf_bookmarks_from_djvu(&bookmarks, from_page, end_page)
+    });
+    record_direct_pdf_timing(&mut timing, DjvuPdfTimingStage::Setup, setup_start);
+    let text_start = timing.is_some().then(Instant::now);
+    let text_pages = pdf_text_pages_from_djvu(bytes, from_page, Some(end_page))?;
+    record_direct_pdf_timing(&mut timing, DjvuPdfTimingStage::TextExtraction, text_start);
+    let selected_page_count = end_page - from_page + 1;
+    let page_jobs = collect_pdf_page_render_jobs(
+        &document,
+        bytes,
+        &tail_entries,
+        from_page,
+        end_page,
+        selected_page_count,
+        &mut timing,
+    )?;
+
+    let collect_timing = timing.is_some();
+    let worker_count = jobs.max(1).min(page_jobs.len()).max(1);
+    let next_job = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let (sender, receiver) = mpsc::sync_channel(worker_count.saturating_mul(2));
+        let page_jobs = &page_jobs;
+        let next_job = &next_job;
+
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            scope.spawn(move || {
+                let mut bitonal_dictionary_cache = Jb2DictionaryCache::new();
+                loop {
+                    let job_index = next_job.fetch_add(1, Ordering::Relaxed);
+                    let Some(job) = page_jobs.get(job_index) else {
+                        break;
+                    };
+                    let page = if collect_timing {
+                        let mut timing_events = Vec::new();
+                        let result = {
+                            let mut timing_callback = |event| timing_events.push(event);
+                            let timing = RefCell::new(Some(
+                                &mut timing_callback as &mut dyn FnMut(DjvuPdfTimingEvent),
+                            ));
+                            prepare_pdf_page_image_without_callbacks(
+                                bytes,
+                                &job.plan,
+                                job.page_number,
+                                &mut bitonal_dictionary_cache,
+                                &timing,
+                            )
+                        };
+                        result.map(|mut page| {
+                            page.timing_events = timing_events;
+                            page
+                        })
+                    } else {
+                        let timing = RefCell::new(None);
+                        prepare_pdf_page_image_without_callbacks(
+                            bytes,
+                            &job.plan,
+                            job.page_number,
+                            &mut bitonal_dictionary_cache,
+                            &timing,
+                        )
+                    };
+                    if sender
+                        .send(PreparedPdfPage {
+                            index: job.index,
+                            page,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        let page_images = OrderedPreparedPdfPages::new(receiver, selected_page_count);
+        write_prepared_pdf_pages_to_writer(
+            writer,
+            selected_page_count,
+            page_images,
+            &bookmarks,
+            Some(&text_pages),
+            timing,
+        )
+    })
+}
+
+fn collect_pdf_page_render_jobs<'a>(
+    document: &'a Document<'a>,
+    bytes: &'a [u8],
+    tail_entries: &[DirmTailEntry<'_>],
+    from_page: usize,
+    end_page: usize,
+    selected_page_count: usize,
+    timing: &mut Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+) -> DjvuPdfResult<Vec<PdfPageRenderJob<'a>>> {
+    let mut page_jobs = Vec::with_capacity(selected_page_count);
+    for (page_index, page) in document.pages(bytes).enumerate() {
+        let page_number = page_index + 1;
+        if page_number < from_page {
+            continue;
+        }
+        if page_number > end_page {
+            break;
+        }
+
+        let page = page?;
+        let plan_start = timing.is_some().then(Instant::now);
+        let plan = document.page_render_plan(bytes, &page, tail_entries)?;
+        record_direct_pdf_timing(timing, DjvuPdfTimingStage::PagePlan, plan_start);
+        page_jobs.push(PdfPageRenderJob {
+            index: page_number - from_page,
+            page_number,
+            plan,
+        });
+    }
+
+    Ok(page_jobs)
+}
+
+fn prepare_pdf_page_image_without_callbacks(
+    bytes: &[u8],
+    plan: &crate::PageRenderPlan<'_>,
+    page_number: usize,
+    bitonal_dictionary_cache: &mut Jb2DictionaryCache,
+    timing: &RefCell<Option<&mut dyn FnMut(DjvuPdfTimingEvent)>>,
+) -> DjvuPdfResult<PreparedPdfPageImage> {
+    let mut event = |_: DjvuPdfRenderEvent<'_>| {};
+    let page_total_start = pdf_timing_start(timing);
+    let (image, page_kind) = pdf_page_image_from_plan_with_kind(
+        bytes,
+        plan,
+        page_number,
+        None,
+        timing,
+        bitonal_dictionary_cache,
+        &mut event,
+    )?;
+    let encode_start = pdf_timing_start(timing);
+    let image_stream = image.image_stream_object();
+    record_pdf_page_timing(
+        timing,
+        if image.is_bitonal_mask() {
+            DjvuPdfTimingStage::CcittEncode
+        } else {
+            DjvuPdfTimingStage::ImageBytes
+        },
+        page_number,
+        encode_start,
+    );
+    record_pdf_page_kind_timing(
+        timing,
+        DjvuPdfTimingStage::PageTotal,
+        page_number,
+        page_kind,
+        page_total_start,
+    );
+
+    Ok(PreparedPdfPageImage {
+        image,
+        image_stream,
+        timing_events: Vec::new(),
+    })
+}
+
+fn write_prepared_pdf_pages_to_writer<W, I, E>(
+    writer: W,
+    page_count: usize,
+    pages: I,
+    bookmarks: &[PdfBookmark],
+    text_pages: Option<&[PdfTextPage]>,
+    mut timing: Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+) -> Result<(), E>
+where
+    W: Write,
+    I: IntoIterator<Item = Result<PreparedPdfPageImage, E>>,
+    E: From<PdfError>,
+{
+    if page_count == 0 {
+        return Err(PdfError::new("cannot write a PDF with no pages").into());
+    }
+    if let Some(text_pages) = text_pages
+        && text_pages.len() != page_count
+    {
+        return Err(PdfError::new(format!(
+            "PDF text layer has {} pages, expected {page_count}",
+            text_pages.len()
+        ))
+        .into());
+    }
+    let has_text_layer =
+        text_pages.is_some_and(|pages| pages.iter().any(|page| !page.spans.is_empty()));
+    let text_encoding = if has_text_layer {
+        Some(PdfTextEncoding::from_pages(text_pages.expect(
+            "text pages should exist when text layer is present",
+        ))?)
+    } else {
+        None
+    };
+    let outline_item_count = count_pdf_bookmarks(bookmarks);
+    let has_outline = outline_item_count != 0;
+    let ids = PdfObjectIds::new(page_count, has_text_layer, outline_item_count);
+    let numbered_bookmarks = if has_outline {
+        let mut next_id = ids.first_outline_item;
+        number_pdf_bookmarks(bookmarks, &mut next_id)
+    } else {
+        Vec::new()
+    };
+    let mut pdf = PdfObjectWriter::new(writer, ids.max_object).map_err(E::from)?;
+
+    write_pdf_catalog_and_page_tree(&mut pdf, ids, page_count, has_outline).map_err(E::from)?;
+    let actual_page_count = write_prepared_pdf_page_objects(
+        &mut pdf,
+        ids,
+        page_count,
+        pages,
+        text_pages,
+        text_encoding.as_ref(),
+        &mut timing,
+    )?;
+    if actual_page_count != page_count {
+        return Err(PdfError::new(format!(
+            "PDF page iterator produced {actual_page_count} pages, expected {page_count}"
+        ))
+        .into());
+    }
+
+    write_pdf_text_objects(&mut pdf, ids, text_encoding.as_ref()).map_err(E::from)?;
+
+    if has_outline {
+        write_pdf_outlines(
+            &mut pdf,
+            ids.outline_root,
+            ids.first_page,
+            &numbered_bookmarks,
+        )
+        .map_err(E::from)?;
+    }
+
+    let finish_start = timing.is_some().then(Instant::now);
+    let result = pdf.finish(ids.catalog).map_err(E::from);
+    record_direct_pdf_timing(&mut timing, DjvuPdfTimingStage::PdfWrite, finish_start);
+
+    result
+}
+
+fn write_prepared_pdf_page_objects<W, I, E>(
+    pdf: &mut PdfObjectWriter<W>,
+    ids: PdfObjectIds,
+    page_count: usize,
+    pages: I,
+    text_pages: Option<&[PdfTextPage]>,
+    text_encoding: Option<&PdfTextEncoding>,
+    timing: &mut Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+) -> Result<usize, E>
+where
+    W: Write,
+    I: IntoIterator<Item = Result<PreparedPdfPageImage, E>>,
+    E: From<PdfError>,
+{
+    let mut actual_page_count = 0usize;
+    for (index, page) in pages.into_iter().enumerate() {
+        if index >= page_count {
+            return Err(PdfError::new(format!(
+                "PDF page iterator produced more than {page_count} pages"
+            ))
+            .into());
+        }
+        let page = page?;
+        if let Some(timing) = timing.as_deref_mut() {
+            for event in &page.timing_events {
+                timing(*event);
+            }
+        }
+        validate_page_image(&page.image).map_err(E::from)?;
+        actual_page_count += 1;
+        write_pdf_single_prepared_page_objects(
+            pdf,
+            ids,
+            index,
+            &page,
+            text_pages.and_then(|pages| pages.get(index)),
+            text_encoding,
+            timing,
+        )?;
+    }
+
+    Ok(actual_page_count)
+}
+
+fn write_pdf_single_prepared_page_objects<W, E>(
+    pdf: &mut PdfObjectWriter<W>,
+    ids: PdfObjectIds,
+    index: usize,
+    page: &PreparedPdfPageImage,
+    text_page: Option<&PdfTextPage>,
+    text_encoding: Option<&PdfTextEncoding>,
+    timing: &mut Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+) -> Result<(), E>
+where
+    W: Write,
+    E: From<PdfError>,
+{
+    let page_object_id = ids.first_page + index;
+    let content_id = ids.first_content + index;
+    let image_id = ids.first_image + index;
+    let image_name = format!("Im{}", index + 1);
+    let width_points = points_from_pixels(page.image.width(), page.image.dpi());
+    let height_points = points_from_pixels(page.image.height(), page.image.dpi());
+    let font_resource = if text_encoding.is_some() {
+        format!(" /Font << /Ftxt {} 0 R >>", ids.font)
+    } else {
+        String::new()
+    };
+    let page_object = format!(
+        "<< /Type /Page /Parent {} 0 R /MediaBox [0 0 {width_points} {height_points}] /Resources << /XObject << /{image_name} {image_id} 0 R >>{font_resource} >> /Contents {content_id} 0 R >>",
+        ids.pages
+    );
+    pdf.write_object(page_object_id, page_object.as_bytes())
+        .map_err(E::from)?;
+
+    write_pdf_page_content(
+        pdf,
+        content_id,
+        PdfPageContent {
+            image_name: &image_name,
+            page_image: &page.image,
+            text_page,
+            text_encoding,
+            width_points: &width_points,
+            height_points: &height_points,
+        },
+    )?;
+    let write_start = timing.is_some().then(Instant::now);
+    pdf.write_object(image_id, &page.image_stream)
+        .map_err(E::from)?;
+    record_direct_pdf_timing(timing, DjvuPdfTimingStage::PdfObjectWrite, write_start);
+
+    Ok(())
+}
+
+struct OrderedPreparedPdfPages {
+    receiver: mpsc::Receiver<PreparedPdfPage>,
+    pending: BTreeMap<usize, DjvuPdfResult<PreparedPdfPageImage>>,
+    next_index: usize,
+    page_count: usize,
+}
+
+impl OrderedPreparedPdfPages {
+    const fn new(receiver: mpsc::Receiver<PreparedPdfPage>, page_count: usize) -> Self {
+        Self {
+            receiver,
+            pending: BTreeMap::new(),
+            next_index: 0,
+            page_count,
+        }
+    }
+}
+
+impl Iterator for OrderedPreparedPdfPages {
+    type Item = DjvuPdfResult<PreparedPdfPageImage>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_index == self.page_count {
+            return None;
+        }
+        if let Some(image) = self.pending.remove(&self.next_index) {
+            self.next_index += 1;
+            return Some(image);
+        }
+
+        while let Ok(prepared) = self.receiver.recv() {
+            if prepared.index == self.next_index {
+                self.next_index += 1;
+                return Some(prepared.page);
+            }
+            self.pending.insert(prepared.index, prepared.page);
+        }
+
+        Some(Err(PdfError::new(
+            "parallel PDF renderer stopped before all pages were prepared",
+        )
+        .into()))
+    }
+}
+
 fn pdf_timing_start(
     timing: &RefCell<Option<&mut dyn FnMut(DjvuPdfTimingEvent)>>,
 ) -> Option<Instant> {
@@ -892,6 +1396,18 @@ fn record_pdf_timing(
 ) {
     if let Some(start) = start
         && let Some(timing) = timing.borrow_mut().as_deref_mut()
+    {
+        timing(DjvuPdfTimingEvent::aggregate(stage, start.elapsed()));
+    }
+}
+
+fn record_direct_pdf_timing(
+    timing: &mut Option<&mut dyn FnMut(DjvuPdfTimingEvent)>,
+    stage: DjvuPdfTimingStage,
+    start: Option<Instant>,
+) {
+    if let Some(start) = start
+        && let Some(timing) = timing.as_deref_mut()
     {
         timing(DjvuPdfTimingEvent::aggregate(stage, start.elapsed()));
     }
@@ -942,6 +1458,27 @@ fn pdf_page_image_from_plan(
     bitonal_dictionary_cache: &mut Jb2DictionaryCache,
     event: &mut impl FnMut(DjvuPdfRenderEvent<'_>),
 ) -> DjvuPdfResult<PdfPageImage> {
+    pdf_page_image_from_plan_with_kind(
+        bytes,
+        plan,
+        page_number,
+        page_total_start,
+        timing,
+        bitonal_dictionary_cache,
+        event,
+    )
+    .map(|(image, _)| image)
+}
+
+fn pdf_page_image_from_plan_with_kind(
+    bytes: &[u8],
+    plan: &crate::PageRenderPlan<'_>,
+    page_number: usize,
+    page_total_start: Option<Instant>,
+    timing: &RefCell<Option<&mut dyn FnMut(DjvuPdfTimingEvent)>>,
+    bitonal_dictionary_cache: &mut Jb2DictionaryCache,
+    event: &mut impl FnMut(DjvuPdfRenderEvent<'_>),
+) -> DjvuPdfResult<(PdfPageImage, DjvuPdfPageKind)> {
     let direct_start = pdf_timing_start(timing);
     if let Some(image) =
         direct_bitonal_pdf_page_image(bytes, plan, page_number, timing, bitonal_dictionary_cache)?
@@ -964,7 +1501,7 @@ fn pdf_page_image_from_plan(
             page_number,
             image: &image,
         });
-        return Ok(image);
+        return Ok((image, DjvuPdfPageKind::DirectBitonal));
     }
 
     let render_start = pdf_timing_start(timing);
@@ -1003,7 +1540,7 @@ fn pdf_page_image_from_plan(
         page_total_start,
     );
 
-    Ok(image)
+    Ok((image, DjvuPdfPageKind::FallbackRgb))
 }
 
 fn checked_document_pdf_page_range(

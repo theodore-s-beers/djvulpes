@@ -17,6 +17,7 @@ cargo run -- render-page-image --page 1 --output page.ppm path/to/file.djvu
 cargo run -- render-page-image --page 1 --mode background --output background.ppm path/to/file.djvu
 cargo run -- render-pdf --output document.pdf path/to/file.djvu
 cargo run -- render-pdf --output pages-1-5.pdf --from-page 1 --to-page 5 path/to/file.djvu
+cargo run -- render-pdf --output document.pdf --jobs 1 path/to/file.djvu
 cargo run -- compare-ppm actual.ppm expected.ppm
 cargo run -- compare-render --oracle oracle.ppm --page 1 path/to/file.djvu
 cargo run -- compare-render --oracle-dir oracles --from-page 1 --to-page 5 path/to/file.djvu
@@ -35,7 +36,7 @@ Available subcommands:
 - `dirm` inspects the bundled document directory.
 - `render-plan --page <number>` shows the renderer-facing page chunk plan.
 - `render-page-image --page <number> --mode <full|background|foreground|mask> --output <output.ppm>` renders one compositor mode to binary RGB PPM/P6. The default mode is `full`.
-- `render-pdf --output <output.pdf>` renders every supported page into one PDF, printing sparse status every 50 pages by default. Use `--from-page` and `--to-page` to render a page range, `--progress <sparse|per-page|quiet>` to control status output, `--verbose` for detailed per-page summaries, and `--timings` for aggregate stage timings. Bitonal-only pages are embedded as 1-bit grayscale images; color/IW44 pages are embedded as RGB images. In-range `NAVM` outline entries are preserved as PDF bookmarks, and hidden text lines are embedded as invisible PDF text spans with Unicode `/ActualText`.
+- `render-pdf --output <output.pdf>` renders every supported page into one PDF, printing sparse status every 50 pages by default. Page preparation and image encoding use a worker pool sized from the process' available parallelism by default; use `--jobs <n>` to override it, or `--jobs 1` for serial execution through the same pipeline. Use `--from-page` and `--to-page` to render a page range, `--progress <sparse|per-page|quiet>` to control status output, `--verbose` for conversion metadata, and `--timings` for aggregate stage timings. Bitonal-only pages are embedded as 1-bit grayscale images; color/IW44 pages are embedded as RGB images. In-range `NAVM` outline entries are preserved as PDF bookmarks, and hidden text lines are embedded as invisible PDF text spans with Unicode `/ActualText`.
 - `compare-ppm <actual.ppm> <expected.ppm>` compares two binary RGB PPM/P6 images using the same diff summary and tolerance flags as the render comparison commands.
 - `compare-render` compares rendered output with binary RGB PPM/P6 oracle files. Use `--oracle <file.ppm> --page <number>` for one explicit oracle file, or `--oracle-dir <dir> --from-page <n> --to-page <n>` for `page-<number>.ppm` files in a directory. Use `--mode full|background|foreground|mask` to validate one compositor mode.
 - `dump-bitonal --page <number> --output-dir <dir>` writes raw `Djbz`/`Sjbz` JB2 bitonal payloads.
@@ -51,8 +52,11 @@ The reusable render path is exposed through:
 - `render_document_pages(bytes, from_page, to_page, mode)` for a 1-based page range, returning `RenderedDocumentPage` values that preserve the source page number.
 - `render_document_pages_with_events(...)` for page-range rendering with start/rendered callbacks.
 - `render_document_pdf(bytes, from_page, to_page)` for direct DjVu-to-PDF conversion with bookmarks and a searchable text layer when the source document provides them.
+- `render_document_pdf_parallel(bytes, from_page, to_page, jobs)` for direct DjVu-to-PDF conversion with parallel page preparation and ordered PDF output.
 - `render_document_pdf_with_events(...)` for PDF conversion with page-level callbacks.
-- `render_document_pdf_to_writer(...)` and `render_document_pdf_to_writer_with_events(...)` for streaming PDF conversion to an existing writer.
+- `render_document_pdf_to_writer(...)`, `render_document_pdf_to_writer_parallel(...)`, and `render_document_pdf_to_writer_parallel_with_timings(...)` for PDF conversion to an existing writer.
+- `render_document_pdf_to_writer_with_events(...)` and `render_document_pdf_to_writer_with_events_and_timings(...)` for callback-oriented PDF conversion with borrowed page-level event payloads.
+- `default_pdf_render_jobs()` for the default PDF worker count, based on the process' available parallelism.
 - `extract_document_text(bytes, from_page, to_page)` for raw hidden-text extraction with `djvutxt`-compatible page separators.
 - `extract_document_text_pages(bytes, from_page, to_page)` for per-page hidden-text extraction that preserves empty pages.
 - `extract_document_text_zone_pages(bytes, from_page, to_page)` for per-page hidden text plus parsed zone trees.
