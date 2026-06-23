@@ -1,9 +1,8 @@
 use crate::commands::{
-    CompareRenderOptions, Iw44PixelInspectOptions, Iw44PixelTrace, RenderPdfOptions,
-    RenderPdfProgress, run_compare_ppm, run_compare_render, run_compare_render_page_layer,
+    CompareRenderOptions, RenderPdfOptions, RenderPdfProgress, run_compare_ppm, run_compare_render,
     run_dirm, run_dump_bitonal, run_dump_image_layers, run_extract_text, run_form, run_forms,
-    run_inspect_iw44_pixel, run_outline, run_page, run_pages, run_render_page,
-    run_render_page_layer, run_render_pdf, run_render_plan, run_summary,
+    run_outline, run_page, run_pages, run_render_page_image, run_render_pdf, run_render_plan,
+    run_summary,
 };
 use clap::{Parser, Subcommand};
 use djvulpes::{PageRenderMode, RenderCompareLimits};
@@ -42,31 +41,31 @@ enum Command {
     /// Inspect the bundled document directory.
     Dirm { file: PathBuf },
     /// Show the renderer-facing chunk plan for one page.
-    RenderPlan { number: usize, file: PathBuf },
-    /// Render a page-sized RGB PPM image.
-    RenderPage {
-        number: usize,
-        output: PathBuf,
+    RenderPlan {
+        #[arg(long)]
+        page: usize,
         file: PathBuf,
     },
-    /// Render one page layer mode to a page-sized RGB PPM image.
-    RenderPageLayer {
-        number: usize,
+    /// Render one page image mode to a page-sized RGB PPM image.
+    RenderPageImage {
+        #[arg(long)]
+        page: usize,
+        #[arg(long, default_value = "full")]
         mode: PageRenderMode,
+        #[arg(long)]
         output: PathBuf,
         file: PathBuf,
     },
     /// Render all pages into one RGB PDF.
     RenderPdf {
+        #[arg(long)]
         output: PathBuf,
         #[arg(long, default_value_t = 1)]
         from_page: usize,
         #[arg(long)]
         to_page: Option<usize>,
-        #[arg(long)]
-        progress: bool,
-        #[arg(long)]
-        quiet: bool,
+        #[arg(long, value_enum, default_value_t = RenderPdfProgress::Sparse)]
+        progress: RenderPdfProgress,
         #[arg(long)]
         verbose: bool,
         #[arg(long)]
@@ -97,21 +96,6 @@ enum Command {
         max_mean_abs_delta: f64,
         file: PathBuf,
     },
-    /// Compare one rendered page layer mode against a binary RGB PPM oracle.
-    CompareRenderPageLayer {
-        number: usize,
-        mode: PageRenderMode,
-        oracle: PathBuf,
-        #[arg(long, default_value_t = 0)]
-        max_different_pixels: usize,
-        #[arg(long, default_value_t = 0)]
-        max_abs_delta: u8,
-        #[arg(long)]
-        max_delta_pixels: Option<usize>,
-        #[arg(long, default_value_t = 0.0)]
-        max_mean_abs_delta: f64,
-        file: PathBuf,
-    },
     /// Compare two binary RGB PPM images.
     ComparePpm {
         actual: PathBuf,
@@ -127,36 +111,18 @@ enum Command {
     },
     /// Dump Djbz/Sjbz JB2 bitonal payloads for one page.
     DumpBitonal {
-        number: usize,
+        #[arg(long)]
+        page: usize,
+        #[arg(long)]
         output_dir: PathBuf,
         file: PathBuf,
     },
     /// Dump FG44/BG44 IW44 payloads for one page.
     DumpImageLayers {
-        number: usize,
+        #[arg(long)]
+        page: usize,
+        #[arg(long)]
         output_dir: PathBuf,
-        file: PathBuf,
-    },
-    /// Inspect decoded IW44 samples at a page-space pixel.
-    InspectIw44Pixel {
-        number: usize,
-        mode: PageRenderMode,
-        x: u32,
-        y: u32,
-        #[arg(long, default_value_t = 0)]
-        radius: u8,
-        #[arg(long, default_value_t = 0)]
-        coefficients: usize,
-        #[arg(long = "coefficient-index")]
-        coefficient_indices: Vec<usize>,
-        #[arg(long)]
-        trace_coefficients: bool,
-        #[arg(long)]
-        trace_slices: bool,
-        #[arg(long)]
-        trace_events: bool,
-        #[arg(long)]
-        trace_reconstruction: bool,
         file: PathBuf,
     },
     /// Extract hidden text as raw djvutxt-compatible or structured djvused-style output.
@@ -197,46 +163,14 @@ fn run_command(command: Command) -> anyhow::Result<()> {
             None => run_forms(&file)?,
         },
         Command::Dirm { file } => run_dirm(&file)?,
-        Command::CompareRender { .. }
-        | Command::CompareRenderPageLayer { .. }
-        | Command::ComparePpm { .. } => unreachable!("compare command already handled"),
+        Command::CompareRender { .. } | Command::ComparePpm { .. } => {
+            unreachable!("compare command already handled")
+        }
         Command::RenderPlan { .. }
-        | Command::RenderPage { .. }
-        | Command::RenderPageLayer { .. }
+        | Command::RenderPageImage { .. }
         | Command::RenderPdf { .. }
         | Command::DumpBitonal { .. }
         | Command::DumpImageLayers { .. } => unreachable!("render command already handled"),
-        Command::InspectIw44Pixel {
-            number,
-            mode,
-            x,
-            y,
-            radius,
-            coefficients,
-            coefficient_indices,
-            trace_coefficients,
-            trace_slices,
-            trace_events,
-            trace_reconstruction,
-            file,
-        } => run_inspect_iw44_pixel(
-            &file,
-            number,
-            mode,
-            &iw44_pixel_inspect_options(
-                x,
-                y,
-                radius,
-                coefficient_indices,
-                coefficients,
-                [
-                    (trace_coefficients, Iw44PixelTrace::Coefficients),
-                    (trace_slices, Iw44PixelTrace::Slices),
-                    (trace_events, Iw44PixelTrace::Events),
-                    (trace_reconstruction, Iw44PixelTrace::Reconstruction),
-                ],
-            ),
-        )?,
         Command::ExtractText {
             from_page,
             to_page,
@@ -251,24 +185,18 @@ fn run_command(command: Command) -> anyhow::Result<()> {
 
 fn run_render_command(command: &Command) -> anyhow::Result<bool> {
     match command {
-        Command::RenderPlan { number, file } => run_render_plan(file, *number)?,
-        Command::RenderPage {
-            number,
-            output,
-            file,
-        } => run_render_page(file, *number, output)?,
-        Command::RenderPageLayer {
-            number,
+        Command::RenderPlan { page, file } => run_render_plan(file, *page)?,
+        Command::RenderPageImage {
+            page,
             mode,
             output,
             file,
-        } => run_render_page_layer(file, *number, *mode, output)?,
+        } => run_render_page_image(file, *page, *mode, output)?,
         Command::RenderPdf {
             output,
             from_page,
             to_page,
             progress,
-            quiet,
             verbose,
             timings,
             file,
@@ -278,56 +206,25 @@ fn run_render_command(command: &Command) -> anyhow::Result<bool> {
             *from_page,
             *to_page,
             RenderPdfOptions {
-                progress: render_pdf_progress(*quiet, *progress),
+                progress: *progress,
                 verbose: *verbose,
                 timings: *timings,
             },
         )?,
         Command::DumpBitonal {
-            number,
+            page,
             output_dir,
             file,
-        } => run_dump_bitonal(file, *number, output_dir)?,
+        } => run_dump_bitonal(file, *page, output_dir)?,
         Command::DumpImageLayers {
-            number,
+            page,
             output_dir,
             file,
-        } => run_dump_image_layers(file, *number, output_dir)?,
+        } => run_dump_image_layers(file, *page, output_dir)?,
         _ => return Ok(false),
     }
 
     Ok(true)
-}
-
-const fn render_pdf_progress(quiet: bool, progress: bool) -> RenderPdfProgress {
-    if quiet {
-        RenderPdfProgress::Quiet
-    } else if progress {
-        RenderPdfProgress::PerPage
-    } else {
-        RenderPdfProgress::Sparse
-    }
-}
-
-fn iw44_pixel_inspect_options(
-    x: u32,
-    y: u32,
-    radius: u8,
-    coefficient_indices: Vec<usize>,
-    coefficient_limit: usize,
-    trace_flags: [(bool, Iw44PixelTrace); 4],
-) -> Iw44PixelInspectOptions {
-    Iw44PixelInspectOptions {
-        x,
-        y,
-        radius,
-        coefficient_limit,
-        coefficient_indices,
-        traces: trace_flags
-            .into_iter()
-            .filter_map(|(enabled, trace)| enabled.then_some(trace))
-            .collect(),
-    }
 }
 
 fn run_compare_command(command: &Command) -> anyhow::Result<bool> {
@@ -354,27 +251,6 @@ fn run_compare_command(command: &Command) -> anyhow::Result<bool> {
                 from_page: *from_page,
                 to_page: *to_page,
             },
-            RenderCompareLimits::new(
-                *max_different_pixels,
-                *max_abs_delta,
-                *max_delta_pixels,
-                *max_mean_abs_delta,
-            ),
-        )?,
-        Command::CompareRenderPageLayer {
-            number,
-            mode,
-            oracle,
-            max_different_pixels,
-            max_abs_delta,
-            max_delta_pixels,
-            max_mean_abs_delta,
-            file,
-        } => run_compare_render_page_layer(
-            file,
-            *number,
-            *mode,
-            oracle,
             RenderCompareLimits::new(
                 *max_different_pixels,
                 *max_abs_delta,

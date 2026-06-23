@@ -12,11 +12,11 @@ cargo run -- pages path/to/file.djvu
 cargo run -- pages --page 1 path/to/file.djvu
 cargo run -- forms path/to/file.djvu
 cargo run -- forms --offset 12345 path/to/file.djvu
-cargo run -- render-plan 1 path/to/file.djvu
-cargo run -- render-page 1 page.ppm path/to/file.djvu
-cargo run -- render-page-layer 1 background background.ppm path/to/file.djvu
-cargo run -- render-pdf document.pdf path/to/file.djvu
-cargo run -- render-pdf pages-1-5.pdf --from-page 1 --to-page 5 path/to/file.djvu
+cargo run -- render-plan --page 1 path/to/file.djvu
+cargo run -- render-page-image --page 1 --output page.ppm path/to/file.djvu
+cargo run -- render-page-image --page 1 --mode background --output background.ppm path/to/file.djvu
+cargo run -- render-pdf --output document.pdf path/to/file.djvu
+cargo run -- render-pdf --output pages-1-5.pdf --from-page 1 --to-page 5 path/to/file.djvu
 cargo run -- compare-ppm actual.ppm expected.ppm
 cargo run -- compare-render --oracle oracle.ppm --page 1 path/to/file.djvu
 cargo run -- compare-render --oracle-dir oracles --from-page 1 --to-page 5 path/to/file.djvu
@@ -33,15 +33,13 @@ Available subcommands:
 - `pages` lists pages with basic metadata. Use `--page <number>` to inspect one page form.
 - `forms` lists forms referenced by the document directory. Use `--offset <byte-offset>` to inspect one form.
 - `dirm` inspects the bundled document directory.
-- `render-plan <number>` shows the renderer-facing page chunk plan.
-- `render-page <number> <output.ppm>` renders supported page layers to binary RGB PPM/P6.
-- `render-page-layer <number> <full|background|foreground|mask> <output.ppm>` renders one compositor mode to binary RGB PPM/P6.
-- `render-pdf <output.pdf>` renders every supported page into one PDF, printing sparse status every 50 pages by default. Use `--from-page` and `--to-page` to render a page range, `--progress` for per-page status, `--quiet` for only the final summary, `--verbose` for detailed per-page summaries, and `--timings` for aggregate stage timings. Bitonal-only pages are embedded as 1-bit grayscale images; color/IW44 pages are embedded as RGB images. In-range `NAVM` outline entries are preserved as PDF bookmarks, and hidden text lines are embedded as invisible PDF text spans with Unicode `/ActualText`.
+- `render-plan --page <number>` shows the renderer-facing page chunk plan.
+- `render-page-image --page <number> --mode <full|background|foreground|mask> --output <output.ppm>` renders one compositor mode to binary RGB PPM/P6. The default mode is `full`.
+- `render-pdf --output <output.pdf>` renders every supported page into one PDF, printing sparse status every 50 pages by default. Use `--from-page` and `--to-page` to render a page range, `--progress <sparse|per-page|quiet>` to control status output, `--verbose` for detailed per-page summaries, and `--timings` for aggregate stage timings. Bitonal-only pages are embedded as 1-bit grayscale images; color/IW44 pages are embedded as RGB images. In-range `NAVM` outline entries are preserved as PDF bookmarks, and hidden text lines are embedded as invisible PDF text spans with Unicode `/ActualText`.
 - `compare-ppm <actual.ppm> <expected.ppm>` compares two binary RGB PPM/P6 images using the same diff summary and tolerance flags as the render comparison commands.
 - `compare-render` compares rendered output with binary RGB PPM/P6 oracle files. Use `--oracle <file.ppm> --page <number>` for one explicit oracle file, or `--oracle-dir <dir> --from-page <n> --to-page <n>` for `page-<number>.ppm` files in a directory. Use `--mode full|background|foreground|mask` to validate one compositor mode.
-- `compare-render-page-layer <number> <full|background|foreground|mask> <oracle.ppm>` compares one compositor mode with a binary RGB PPM/P6 oracle.
-- `dump-image-layers <number> <output-dir>` writes raw `FG44`/`BG44` payloads, decoded native IW44 RGB PPMs, and decoded IW44 coefficient/reconstruction summaries.
-- `inspect-iw44-pixel <number> <background|foreground> <x> <y>` maps a page-space pixel to a decoded IW44 layer sample and prints RGB plus reconstructed Y/Cb/Cr values. Use `--radius <n>` to print a small Y-neighborhood grid around the target, `--coefficients <n>` to print the strongest luma coefficients in the containing 32x32 block, `--coefficient-index <n>` to include a specific local coefficient index, `--trace-coefficients` to show how those coefficients change after each progressive IW44 chunk or slice, `--trace-events` to show the bucket, activation, sign, and refinement decisions for those coefficients, and `--trace-reconstruction` to show how zeroing listed coefficients, bands, buckets, or the containing block changes the reconstructed sample and how the sample changes under diagnostic inverse-transform order/extent variants.
+- `dump-bitonal --page <number> --output-dir <dir>` writes raw `Djbz`/`Sjbz` JB2 bitonal payloads.
+- `dump-image-layers --page <number> --output-dir <dir>` writes raw `FG44`/`BG44` payloads, decoded native IW44 RGB PPMs, and decoded IW44 coefficient/reconstruction summaries.
 - `extract-text` extracts hidden text from a page range as raw `djvutxt`-compatible output. Use `--structured` for `djvused print-txt`-style zone expressions, and `--from-page`/`--to-page` to select a range.
 - `outline` prints the document outline/bookmarks as `djvused`-style bookmark syntax.
 
@@ -82,7 +80,7 @@ ddjvu -format=ppm -mode=background -page=1 path/to/file.djvu background-oracles/
 cargo run -- compare-render --oracle-dir background-oracles --mode background --from-page 1 --to-page 1 path/to/file.djvu
 
 ddjvu -format=ppm -mode=background -page=1 path/to/file.djvu background-oracle.ppm
-cargo run -- compare-render-page-layer 1 background background-oracle.ppm path/to/file.djvu
+cargo run -- compare-render --oracle background-oracle.ppm --page 1 --mode background path/to/file.djvu
 ```
 
 By default, the compare commands require an exact match. Use `--max-different-pixels`, `--max-abs-delta`, `--max-delta-pixels`, and `--max-mean-abs-delta` when evaluating approximate output during decoder development.

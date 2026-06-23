@@ -1,4 +1,5 @@
 use anyhow::{Context, bail};
+use clap::ValueEnum;
 use djvulpes::decode_dirm_tail;
 use djvulpes::{
     Bookmark, extract_document_bookmarks, extract_document_text, format_document_text_zones,
@@ -17,12 +18,8 @@ use std::time::Duration;
 
 mod compare;
 mod dump;
-mod iw44_inspect;
-pub use compare::{
-    CompareRenderOptions, run_compare_ppm, run_compare_render, run_compare_render_page_layer,
-};
+pub use compare::{CompareRenderOptions, run_compare_ppm, run_compare_render};
 pub use dump::{run_dump_bitonal, run_dump_image_layers};
-pub use iw44_inspect::run_inspect_iw44_pixel;
 
 const JB2_PLAN_PREFIX_RECORD_LIMIT: usize = 8;
 
@@ -33,30 +30,24 @@ pub struct RenderPdfOptions {
     pub timings: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
 pub enum RenderPdfProgress {
     #[default]
     Sparse,
+    #[value(name = "per-page")]
     PerPage,
     Quiet,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Iw44PixelInspectOptions {
-    pub x: u32,
-    pub y: u32,
-    pub radius: u8,
-    pub coefficient_limit: usize,
-    pub coefficient_indices: Vec<usize>,
-    pub traces: Vec<Iw44PixelTrace>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum Iw44PixelTrace {
-    Coefficients,
-    Slices,
-    Events,
-    Reconstruction,
+impl std::fmt::Display for RenderPdfProgress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Sparse => "sparse",
+            Self::PerPage => "per-page",
+            Self::Quiet => "quiet",
+        };
+        formatter.write_str(value)
+    }
 }
 
 pub fn run_summary(path: &Path) -> anyhow::Result<()> {
@@ -303,27 +294,7 @@ pub fn run_render_plan(path: &Path, number: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run_render_page(path: &Path, number: usize, output: &Path) -> anyhow::Result<()> {
-    let render = render_page(path, number)?;
-    let ppm = render.bitmap.to_ppm_bytes();
-
-    fs::write(output, ppm).with_context(|| format!("failed to write {}", output.display()))?;
-
-    println!("file: {}", path.display());
-    println!("page: {number}");
-    println!(
-        "rendered: {}x{} dpi={} format=PPM/P6",
-        render.bitmap.width, render.bitmap.height, render.bitmap.dpi
-    );
-    println!("output: {}", output.display());
-    print_bitmap_stats(&render.bitmap);
-    print_partial_render_summary(&render.bitonal_masks);
-    print_iw44_render_summary(&render.iw44_layers);
-
-    Ok(())
-}
-
-pub fn run_render_page_layer(
+pub fn run_render_page_image(
     path: &Path,
     number: usize,
     mode: PageRenderMode,
@@ -680,11 +651,6 @@ fn print_render_pdf_sparse_progress(
     }
 }
 
-fn render_page(path: &Path, number: usize) -> anyhow::Result<PartialPageRender> {
-    let bytes = read_file(path)?;
-    djvulpes::render_document_page(&bytes, number, PageRenderMode::Full).map_err(Into::into)
-}
-
 fn render_pdf_page_summary(page_number: usize, render: &PartialPageRender) -> String {
     let mut summary = String::new();
     writeln!(&mut summary, "page: {page_number}").expect("writing to string should not fail");
@@ -760,39 +726,6 @@ fn render_page_layer(
 ) -> anyhow::Result<PartialPageRender> {
     let bytes = read_file(path)?;
     djvulpes::render_document_page(&bytes, number, mode).map_err(Into::into)
-}
-
-fn with_page_render_plan<T>(
-    path: &Path,
-    number: usize,
-    render: impl for<'a> FnOnce(&'a [u8], PageRenderPlan<'a>) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    if number == 0 {
-        bail!("page number must be 1 or greater");
-    }
-
-    let bytes = read_file(path)?;
-    let document = Document::parse(&bytes)?;
-    let page = document
-        .pages(&bytes)
-        .nth(number - 1)
-        .transpose()?
-        .with_context(|| {
-            format!(
-                "page {number} not found; document has {} pages",
-                document.form_kind_counts().pages
-            )
-        })?;
-    let decoded_tail;
-    let tail_entries = if let Some(dirm) = &document.directory {
-        decoded_tail = decode_dirm_tail(&bytes, dirm)?;
-        parse_dirm_tail(dirm, &decoded_tail)?
-    } else {
-        Vec::new()
-    };
-    let plan = document.page_render_plan(&bytes, &page, &tail_entries)?;
-
-    render(&bytes, plan)
 }
 
 pub fn run_extract_text(
@@ -1646,24 +1579,29 @@ mod tests {
     }
 
     #[test]
-    fn compare_render_page_layer_accepts_exact_rypka_page_961_background_oracle() {
+    fn compare_render_accepts_exact_generated_background_oracle() {
         let oracle = std::env::temp_dir().join(format!(
             "djvulpes-page-961-background-{}.ppm",
             std::process::id()
         ));
 
-        run_render_page_layer(
+        run_render_page_image(
             Path::new("Rypka-HIL.djvu"),
             961,
             PageRenderMode::Background,
             &oracle,
         )
         .expect("background oracle should render");
-        run_compare_render_page_layer(
+        run_compare_render(
             Path::new("Rypka-HIL.djvu"),
-            961,
-            PageRenderMode::Background,
-            &oracle,
+            CompareRenderOptions {
+                oracle: Some(&oracle),
+                oracle_dir: None,
+                page: Some(961),
+                mode: PageRenderMode::Background,
+                from_page: 1,
+                to_page: None,
+            },
             RenderCompareLimits::new(0, 0, Some(0), 0.0),
         )
         .expect("render should match generated oracle exactly");
@@ -1677,8 +1615,13 @@ mod tests {
         fs::create_dir_all(&oracle_dir).expect("oracle directory should be created");
         let oracle = oracle_dir.join("page-1.ppm");
 
-        run_render_page(Path::new("Rypka-HIL.djvu"), 1, &oracle)
-            .expect("page oracle should render");
+        run_render_page_image(
+            Path::new("Rypka-HIL.djvu"),
+            1,
+            PageRenderMode::Full,
+            &oracle,
+        )
+        .expect("page oracle should render");
         run_compare_render(
             Path::new("Rypka-HIL.djvu"),
             CompareRenderOptions {
@@ -1701,8 +1644,13 @@ mod tests {
         let oracle =
             std::env::temp_dir().join(format!("djvulpes-page-1-{}.ppm", std::process::id()));
 
-        run_render_page(Path::new("Rypka-HIL.djvu"), 1, &oracle)
-            .expect("page oracle should render");
+        run_render_page_image(
+            Path::new("Rypka-HIL.djvu"),
+            1,
+            PageRenderMode::Full,
+            &oracle,
+        )
+        .expect("page oracle should render");
         run_compare_render(
             Path::new("Rypka-HIL.djvu"),
             CompareRenderOptions {

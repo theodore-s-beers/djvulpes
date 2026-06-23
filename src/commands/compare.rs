@@ -396,29 +396,3 @@ fn run_compare_render_oracle_dir(
 
     Ok(())
 }
-
-pub fn run_compare_render_page_layer(
-    path: &Path,
-    number: usize,
-    mode: PageRenderMode,
-    oracle: &Path,
-    limits: RenderCompareLimits,
-) -> anyhow::Result<()> {
-    let render = render_page_layer(path, number, mode)?;
-    let oracle_bytes = read_file(oracle)?;
-    let expected = djvulpes::PageBitmap::from_ppm_bytes(&oracle_bytes, render.bitmap.dpi)?;
-    let diff = render.bitmap.diff(&expected)?;
-
-    println!("file: {}", path.display());
-    println!("page: {number}");
-    println!("mode: {}", mode.as_str());
-    println!("oracle: {}", oracle.display());
-    println!(
-        "rendered: {}x{} dpi={} format=PPM/P6",
-        render.bitmap.width, render.bitmap.height, render.bitmap.dpi
-    );
-    print_bitmap_comparison(&render.bitmap, &expected, &diff);
-    print_partial_render_summary(&render.bitonal_masks);
-    print_iw44_render_summary(&render.iw44_layers);
-    enforce_bitmap_diff(&diff, limits)
-}
