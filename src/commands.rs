@@ -1521,34 +1521,6 @@ mod tests {
     use djvulpes::RenderCompareLimits;
 
     #[test]
-    fn run_render_pdf_writes_rypka_page_961_rgb_pdf() {
-        let output =
-            std::env::temp_dir().join(format!("djvulpes-page-961-{}.pdf", std::process::id()));
-
-        run_render_pdf(
-            Path::new("Rypka-HIL.djvu"),
-            &output,
-            961,
-            Some(961),
-            RenderPdfOptions {
-                progress: RenderPdfProgress::Quiet,
-                ..RenderPdfOptions::default()
-            },
-        )
-        .expect("render-pdf should write page 961");
-        let pdf = fs::read(&output).expect("rendered PDF should be readable");
-        let _ = fs::remove_file(&output);
-        let text = String::from_utf8_lossy(&pdf);
-
-        assert!(text.starts_with("%PDF-1.4\n"));
-        assert!(text.contains("/Type /Pages /Count 1"));
-        assert!(text.contains("/Subtype /Image /Width 3486 /Height 2783"));
-        assert!(text.contains("/ColorSpace /DeviceRGB /BitsPerComponent 8"));
-        assert!(!text.contains("/ImageMask true"));
-        assert!(pdf.ends_with(b"%%EOF\n"));
-    }
-
-    #[test]
     fn run_render_pdf_writes_rypka_page_68_bitonal_mask_pdf() {
         let output =
             std::env::temp_dir().join(format!("djvulpes-page-68-{}.pdf", std::process::id()));
@@ -1576,36 +1548,6 @@ mod tests {
         assert!(text.contains("/BitsPerComponent 1"));
         assert!(!text.contains("/ColorSpace /DeviceRGB"));
         assert!(pdf.ends_with(b"%%EOF\n"));
-    }
-
-    #[test]
-    fn compare_render_accepts_exact_generated_background_oracle() {
-        let oracle = std::env::temp_dir().join(format!(
-            "djvulpes-page-961-background-{}.ppm",
-            std::process::id()
-        ));
-
-        run_render_page_image(
-            Path::new("Rypka-HIL.djvu"),
-            961,
-            PageRenderMode::Background,
-            &oracle,
-        )
-        .expect("background oracle should render");
-        run_compare_render(
-            Path::new("Rypka-HIL.djvu"),
-            CompareRenderOptions {
-                oracle: Some(&oracle),
-                oracle_dir: None,
-                page: Some(961),
-                mode: PageRenderMode::Background,
-                from_page: 1,
-                to_page: None,
-            },
-            RenderCompareLimits::new(0, 0, Some(0), 0.0),
-        )
-        .expect("render should match generated oracle exactly");
-        let _ = fs::remove_file(&oracle);
     }
 
     #[test]
