@@ -1,7 +1,3 @@
 /target/
-bringhurst-typography.djvu
-bringhurst-typography.pdf
-johnson-persian.djvu
+/fixtures/*.djvu
 out.pdf
-Rypka-HIL.djvu
-Rypka-HIL.pdf
