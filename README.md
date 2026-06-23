@@ -64,6 +64,7 @@ Use `PageRenderMode::Full`, `Background`, `Foreground`, or `Mask` to select the 
 ## Requirements
 
 - No external runtime decoder is required for the in-tree BZZ/IW44/JB2 paths currently implemented.
+- The larger corpus tests expect local, ignored DjVu files under `fixtures/`: `Rypka-HIL.djvu`, `bringhurst-typography.djvu`, and `johnson-persian.djvu`. These files are not committed; missing files fail at compile time for the tests that use them.
 - `ddjvu` is useful as an optional development oracle. For example:
 
 ```sh
@@ -90,6 +91,7 @@ Current fixture baseline for `Rypka-HIL.djvu`: pages 1-961 match `ddjvu` exactly
 ## Development
 
 ```sh
-cargo clippy
-cargo test
+cargo fmt
+cargo clippy --all-targets
+cargo test --release
 ```

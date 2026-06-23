@@ -1,4 +1,4 @@
-# BZZ Decoder Plan
+# BZZ Decoder Status
 
 `djvulpes` should stay MIT-licensed. The in-house BZZ decoder must therefore be developed without copying or mechanically porting GPL-covered DjVuLibre code or ExifTool's BZZ implementation.
 
@@ -9,6 +9,9 @@
 - Use compressed/decompressed fixture pairs as behavioral tests.
 - Keep external implementations out of runtime and test dependencies; use checked-in fixtures and local structural tests for regression coverage.
 - If the decoder needs generated constants, keep the generator in this repo and document the source formula, derivation, or fixed format source.
+
+## Current Status
+
 - The obsolete provisional bit-model scaffold and its fixture-tuning diagnostics have been removed. Runtime and active tests use the local Z′ register-machine decoder.
 - The old ignored alignment diagnostics for raw-bit skips, previous-`MTFNO` variants, and selector-layout variants have been removed now that active regression tests cover the resolved behavior.
 - Block decoding now consumes the unary-coded pass-through `FSHIFT` field after the block length and before the MTF-number stream.
@@ -22,12 +25,23 @@
 - The in-memory decoder now reads blocks until the zero block-size terminator instead of stopping after the first block. Static compressed/raw fixture pairs cover empty input, one byte, repeated bytes, all byte values, and a patterned 1 KiB payload.
 - `decode_bzz` now calls the in-memory Rust decoder directly; the local `bzz` command fallback has been removed from the runtime path.
 
-## Implementation Stages
+## Completed Implementation Stages
 
 1. Decode BZZ block framing with an in-memory bit reader.
 2. Implement the binary entropy model from independently derived constants.
-3. Decode the rank/MTF symbol stream for one block.
+3. Decode the rank/MTF symbol stream.
 4. Implement inverse Burrows-Wheeler reconstruction.
-5. Decode all blocks and remove the external `bzz` fallback. Done; `decode_bzz` now uses the in-memory decoder directly.
+5. Decode all blocks and remove the external `bzz` fallback.
 
-The current fixture target is `tests/fixtures/bzz/hello.bzz`, which should decode exactly to `tests/fixtures/bzz/hello.raw`.
+## Fixture Coverage
+
+The checked-in BZZ fixture corpus lives in `tests/fixtures/bzz/` and currently covers:
+
+- empty input
+- one byte
+- repeated bytes
+- all byte values
+- a patterned 1 KiB payload
+- the original `hello.bzz`/`hello.raw` fixture
+
+Each compressed fixture is decoded by the in-memory Rust path and compared with its matching `.raw` file.
