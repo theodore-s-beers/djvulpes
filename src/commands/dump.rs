@@ -1,11 +1,12 @@
-use super::{print_decoded_iw44_payload_summary, read_file};
-use anyhow::{Context as _, bail};
+use super::{
+    CommandContext as _, CommandError, CommandResult, print_decoded_iw44_payload_summary, read_file,
+};
 use djvulpes::{Document, decode_dirm_tail, parse_dirm_tail};
 use std::{fs, path::Path};
 
-pub fn run_dump_bitonal(path: &Path, number: usize, output_dir: &Path) -> anyhow::Result<()> {
+pub fn run_dump_bitonal(path: &Path, number: usize, output_dir: &Path) -> CommandResult<()> {
     if number == 0 {
-        bail!("page number must be 1 or greater");
+        return Err(CommandError::new("page number must be 1 or greater"));
     }
 
     let bytes = read_file(path)?;
@@ -69,9 +70,9 @@ pub fn run_dump_bitonal(path: &Path, number: usize, output_dir: &Path) -> anyhow
     Ok(())
 }
 
-pub fn run_dump_image_layers(path: &Path, number: usize, output_dir: &Path) -> anyhow::Result<()> {
+pub fn run_dump_image_layers(path: &Path, number: usize, output_dir: &Path) -> CommandResult<()> {
     if number == 0 {
-        bail!("page number must be 1 or greater");
+        return Err(CommandError::new("page number must be 1 or greater"));
     }
 
     let bytes = read_file(path)?;
@@ -156,7 +157,7 @@ fn write_decoded_iw44_layer_ppm(
     page_number: usize,
     output_dir: &Path,
     layer: Option<djvulpes::RenderedIw44Layer>,
-) -> anyhow::Result<()> {
+) -> CommandResult<()> {
     let Some(layer) = layer else {
         return Ok(());
     };

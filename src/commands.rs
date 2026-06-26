@@ -1,4 +1,3 @@
-use anyhow::{Context, bail};
 use clap::ValueEnum;
 use djvulpes::{
     Bookmark, extract_document_bookmarks, extract_document_text, format_document_text_zones,
@@ -11,6 +10,7 @@ use djvulpes::{
 };
 use djvulpes::{DjvuPdfPageKind, DjvuPdfTimingEvent, DjvuPdfTimingStage};
 use djvulpes::{decode_dirm_tail, default_pdf_render_jobs};
+use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -20,6 +20,130 @@ mod compare;
 mod dump;
 pub use compare::{CompareRenderOptions, run_compare_ppm, run_compare_render};
 pub use dump::{run_dump_bitonal, run_dump_image_layers};
+
+pub type CommandResult<T> = Result<T, CommandError>;
+
+#[derive(Debug)]
+pub struct CommandError {
+    message: String,
+    source: Option<Box<dyn Error + Send + Sync + 'static>>,
+}
+
+impl CommandError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    fn with_source(message: impl Into<String>, source: impl Error + Send + Sync + 'static) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)?;
+        if let Some(source) = &self.source {
+            write!(formatter, ": {source}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for CommandError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn Error + 'static))
+    }
+}
+
+impl From<std::io::Error> for CommandError {
+    fn from(error: std::io::Error) -> Self {
+        Self::with_source("I/O error", error)
+    }
+}
+
+impl From<djvulpes::ParseError> for CommandError {
+    fn from(error: djvulpes::ParseError) -> Self {
+        Self::with_source("parse error", error)
+    }
+}
+
+impl From<djvulpes::BzzError> for CommandError {
+    fn from(error: djvulpes::BzzError) -> Self {
+        Self::with_source("BZZ error", error)
+    }
+}
+
+impl From<djvulpes::Iw44Error> for CommandError {
+    fn from(error: djvulpes::Iw44Error) -> Self {
+        Self::with_source("IW44 error", error)
+    }
+}
+
+impl From<djvulpes::Jb2Error> for CommandError {
+    fn from(error: djvulpes::Jb2Error) -> Self {
+        Self::with_source("JB2 error", error)
+    }
+}
+
+impl From<djvulpes::RenderError> for CommandError {
+    fn from(error: djvulpes::RenderError) -> Self {
+        Self::with_source("render error", error)
+    }
+}
+
+impl From<djvulpes::DjvuRenderError> for CommandError {
+    fn from(error: djvulpes::DjvuRenderError) -> Self {
+        Self::with_source("render error", error)
+    }
+}
+
+impl From<djvulpes::TextError> for CommandError {
+    fn from(error: djvulpes::TextError) -> Self {
+        Self::with_source("text error", error)
+    }
+}
+
+impl From<djvulpes::DjvuPdfError> for CommandError {
+    fn from(error: djvulpes::DjvuPdfError) -> Self {
+        Self::with_source("PDF render error", error)
+    }
+}
+
+pub trait CommandContext<T> {
+    fn context(self, message: impl Into<String>) -> CommandResult<T>;
+    fn with_context(self, message: impl FnOnce() -> String) -> CommandResult<T>;
+}
+
+impl<T, E> CommandContext<T> for Result<T, E>
+where
+    E: Error + Send + Sync + 'static,
+{
+    fn context(self, message: impl Into<String>) -> CommandResult<T> {
+        self.map_err(|error| CommandError::with_source(message, error))
+    }
+
+    fn with_context(self, message: impl FnOnce() -> String) -> CommandResult<T> {
+        self.map_err(|error| CommandError::with_source(message(), error))
+    }
+}
+
+impl<T> CommandContext<T> for Option<T> {
+    fn context(self, message: impl Into<String>) -> CommandResult<T> {
+        self.ok_or_else(|| CommandError::new(message))
+    }
+
+    fn with_context(self, message: impl FnOnce() -> String) -> CommandResult<T> {
+        self.ok_or_else(|| CommandError::new(message()))
+    }
+}
 
 const JB2_PLAN_PREFIX_RECORD_LIMIT: usize = 8;
 
@@ -51,7 +175,7 @@ impl std::fmt::Display for RenderPdfProgress {
     }
 }
 
-pub fn run_summary(path: &Path) -> anyhow::Result<()> {
+pub fn run_summary(path: &Path) -> CommandResult<()> {
     let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
 
@@ -78,7 +202,7 @@ pub fn run_summary(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run_pages(path: &Path) -> anyhow::Result<()> {
+pub fn run_pages(path: &Path) -> CommandResult<()> {
     let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
 
@@ -109,7 +233,7 @@ pub fn run_pages(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run_forms(path: &Path) -> anyhow::Result<()> {
+pub fn run_forms(path: &Path) -> CommandResult<()> {
     let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
 
@@ -135,7 +259,7 @@ pub fn run_forms(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run_form(path: &Path, offset: usize) -> anyhow::Result<()> {
+pub fn run_form(path: &Path, offset: usize) -> CommandResult<()> {
     let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
     let form = parse_form_at(&bytes, offset)?;
@@ -164,11 +288,11 @@ pub fn run_form(path: &Path, offset: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run_dirm(path: &Path) -> anyhow::Result<()> {
+pub fn run_dirm(path: &Path) -> CommandResult<()> {
     let bytes = read_file(path)?;
     let document = Document::parse(&bytes)?;
     let Some(dirm) = &document.directory else {
-        bail!("document has no DIRM chunk");
+        return Err(CommandError::new("document has no DIRM chunk"));
     };
 
     println!("file: {}", path.display());
@@ -222,9 +346,9 @@ pub fn run_dirm(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run_page(path: &Path, number: usize) -> anyhow::Result<()> {
+pub fn run_page(path: &Path, number: usize) -> CommandResult<()> {
     if number == 0 {
-        bail!("page number must be 1 or greater");
+        return Err(CommandError::new("page number must be 1 or greater"));
     }
 
     let bytes = read_file(path)?;
@@ -235,10 +359,10 @@ pub fn run_page(path: &Path, number: usize) -> anyhow::Result<()> {
         .filter(|form| form.kind == DocumentFormKind::Page)
         .nth(number - 1)
     else {
-        bail!(
+        return Err(CommandError::new(format!(
             "page {number} not found; document has {} pages",
             document.form_kind_counts().pages
-        );
+        )));
     };
 
     println!("file: {}", path.display());
@@ -262,9 +386,9 @@ pub fn run_page(path: &Path, number: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run_render_plan(path: &Path, number: usize) -> anyhow::Result<()> {
+pub fn run_render_plan(path: &Path, number: usize) -> CommandResult<()> {
     if number == 0 {
-        bail!("page number must be 1 or greater");
+        return Err(CommandError::new("page number must be 1 or greater"));
     }
 
     let bytes = read_file(path)?;
@@ -300,7 +424,7 @@ pub fn run_render_page_image(
     number: usize,
     mode: PageRenderMode,
     output: &Path,
-) -> anyhow::Result<()> {
+) -> CommandResult<()> {
     let render = render_page_layer(path, number, mode)?;
     let ppm = render.bitmap.to_ppm_bytes();
 
@@ -327,7 +451,7 @@ pub fn run_render_pdf(
     from_page: usize,
     to_page: Option<usize>,
     options: RenderPdfOptions,
-) -> anyhow::Result<()> {
+) -> CommandResult<()> {
     let bytes = read_file(path)?;
     let mut render_count = 0usize;
     let mut timing_summary = PdfTimingSummary::default();
@@ -339,7 +463,7 @@ pub fn run_render_pdf(
         .with_context(|| format!("failed to create {}", output.display()))?;
     let jobs = options.jobs.unwrap_or_else(default_pdf_render_jobs);
     if jobs == 0 {
-        bail!("--jobs must be 1 or greater");
+        return Err(CommandError::new("--jobs must be 1 or greater"));
     }
 
     let collect_events = options.timings || options.progress != RenderPdfProgress::Quiet;
@@ -644,7 +768,7 @@ fn render_page_layer(
     path: &Path,
     number: usize,
     mode: PageRenderMode,
-) -> anyhow::Result<PartialPageRender> {
+) -> CommandResult<PartialPageRender> {
     let bytes = read_file(path)?;
     djvulpes::render_document_page(&bytes, number, mode).map_err(Into::into)
 }
@@ -654,7 +778,7 @@ pub fn run_extract_text(
     from_page: usize,
     to_page: Option<usize>,
     structured: bool,
-) -> anyhow::Result<()> {
+) -> CommandResult<()> {
     let bytes = read_file(path)?;
     let text = if structured {
         format_document_text_zones(&bytes, from_page, to_page)?
@@ -666,7 +790,7 @@ pub fn run_extract_text(
     Ok(())
 }
 
-pub fn run_outline(path: &Path) -> anyhow::Result<()> {
+pub fn run_outline(path: &Path) -> CommandResult<()> {
     let bytes = read_file(path)?;
     let Some(bookmarks) = extract_document_bookmarks(&bytes)? else {
         return Ok(());
@@ -681,7 +805,7 @@ pub fn run_outline(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+fn read_file(path: &Path) -> CommandResult<Vec<u8>> {
     fs::read(path).with_context(|| format!("failed to read {}", path.display()))
 }
 
@@ -1097,7 +1221,7 @@ fn print_iw44_payload_summary(role: &str, chunk_id: &str, index: usize, bytes: &
 fn print_decoded_iw44_payload_summary(
     role: &str,
     payloads: &[djvulpes::RenderChunkPayload<'_>],
-) -> anyhow::Result<()> {
+) -> CommandResult<()> {
     if payloads.is_empty() {
         return Ok(());
     }

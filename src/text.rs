@@ -3,20 +3,56 @@ use crate::document::Document;
 use crate::error::{ParseError, ParseResult};
 use crate::page::PageChunkKind;
 use crate::{BzzError, decode_bzz, decode_dirm_tail, parse_dirm_tail};
-use thiserror::Error;
+use std::fmt;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum TextError {
-    #[error(transparent)]
-    Parse(#[from] ParseError),
-    #[error(transparent)]
-    Bzz(#[from] BzzError),
-    #[error("from_page must be 1 or greater")]
+    Parse(ParseError),
+    Bzz(BzzError),
     ZeroFromPage,
-    #[error("to_page must be greater than or equal to from_page")]
     ReversedPageRange,
-    #[error("page {page} not found; document has {page_count} pages")]
     PageOutOfRange { page: usize, page_count: usize },
+}
+
+impl fmt::Display for TextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(error) => error.fmt(formatter),
+            Self::Bzz(error) => error.fmt(formatter),
+            Self::ZeroFromPage => formatter.write_str("from_page must be 1 or greater"),
+            Self::ReversedPageRange => {
+                formatter.write_str("to_page must be greater than or equal to from_page")
+            }
+            Self::PageOutOfRange { page, page_count } => {
+                write!(
+                    formatter,
+                    "page {page} not found; document has {page_count} pages"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse(error) => Some(error),
+            Self::Bzz(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseError> for TextError {
+    fn from(error: ParseError) -> Self {
+        Self::Parse(error)
+    }
+}
+
+impl From<BzzError> for TextError {
+    fn from(error: BzzError) -> Self {
+        Self::Bzz(error)
+    }
 }
 
 pub type TextResult<T> = Result<T, TextError>;

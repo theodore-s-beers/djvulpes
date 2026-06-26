@@ -1,30 +1,77 @@
 use crate::dirm::Dirm;
 use crate::error::ParseError;
+use std::fmt;
 
 pub type BzzResult<T> = std::result::Result<T, BzzError>;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum BzzError {
-    #[error("failed to read compressed DIRM tail: {0}")]
-    DirmTail(#[from] ParseError),
-    #[error("in-house BZZ decoder is incomplete: {0}")]
+    DirmTail(ParseError),
     IncompleteDecoder(&'static str),
-    #[error("BZZ block declares unsupported size {size} bytes")]
     UnsupportedBlockSize { size: usize },
-    #[error("BZZ block declares invalid FSHIFT value {value}")]
     InvalidFshift { value: u8 },
-    #[error(
-        "BZZ block has invalid Burrows-Wheeler marker position {marker_pos} for block size {block_len}"
-    )]
     InvalidBwtMarker { marker_pos: usize, block_len: usize },
-    #[error("BZZ rank stream ended before {expected_len} block symbols were decoded")]
     TruncatedRankStream { expected_len: usize },
-    #[error("BZZ rank stream contains invalid rank {rank}")]
     InvalidSymbolRank { rank: usize },
-    #[error("BZZ rank stream does not contain a Burrows-Wheeler marker")]
     MissingBwtMarker,
-    #[error("BZZ rank stream contains an unusable Burrows-Wheeler marker")]
     InvalidBwtMarkerStream,
+}
+
+impl fmt::Display for BzzError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DirmTail(error) => {
+                write!(formatter, "failed to read compressed DIRM tail: {error}")
+            }
+            Self::IncompleteDecoder(message) => {
+                write!(formatter, "in-house BZZ decoder is incomplete: {message}")
+            }
+            Self::UnsupportedBlockSize { size } => {
+                write!(
+                    formatter,
+                    "BZZ block declares unsupported size {size} bytes"
+                )
+            }
+            Self::InvalidFshift { value } => {
+                write!(formatter, "BZZ block declares invalid FSHIFT value {value}")
+            }
+            Self::InvalidBwtMarker {
+                marker_pos,
+                block_len,
+            } => write!(
+                formatter,
+                "BZZ block has invalid Burrows-Wheeler marker position {marker_pos} for block size {block_len}"
+            ),
+            Self::TruncatedRankStream { expected_len } => write!(
+                formatter,
+                "BZZ rank stream ended before {expected_len} block symbols were decoded"
+            ),
+            Self::InvalidSymbolRank { rank } => {
+                write!(formatter, "BZZ rank stream contains invalid rank {rank}")
+            }
+            Self::MissingBwtMarker => {
+                formatter.write_str("BZZ rank stream does not contain a Burrows-Wheeler marker")
+            }
+            Self::InvalidBwtMarkerStream => {
+                formatter.write_str("BZZ rank stream contains an unusable Burrows-Wheeler marker")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BzzError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DirmTail(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseError> for BzzError {
+    fn from(error: ParseError) -> Self {
+        Self::DirmTail(error)
+    }
 }
 
 /// Decodes `DjVu` BZZ-compressed bytes.

@@ -37,24 +37,81 @@ pub type PdfResult<T> = Result<T, PdfError>;
 
 pub type DjvuPdfResult<T> = Result<T, DjvuPdfError>;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum DjvuPdfError {
-    #[error("{0}")]
-    Parse(#[from] ParseError),
-    #[error("{0}")]
-    Bzz(#[from] BzzError),
-    #[error("{0}")]
-    Text(#[from] TextError),
-    #[error("{0}")]
-    Render(#[from] RenderError),
-    #[error("{0}")]
-    Pdf(#[from] PdfError),
-    #[error("from page must be 1 or greater")]
+    Parse(ParseError),
+    Bzz(BzzError),
+    Text(TextError),
+    Render(RenderError),
+    Pdf(PdfError),
     ZeroFromPage,
-    #[error("to page must be greater than or equal to from page")]
     ReversedPageRange,
-    #[error("page {page} not found; document has {page_count} pages")]
     PageOutOfRange { page: usize, page_count: usize },
+}
+
+impl fmt::Display for DjvuPdfError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(error) => error.fmt(formatter),
+            Self::Bzz(error) => error.fmt(formatter),
+            Self::Text(error) => error.fmt(formatter),
+            Self::Render(error) => error.fmt(formatter),
+            Self::Pdf(error) => error.fmt(formatter),
+            Self::ZeroFromPage => formatter.write_str("from page must be 1 or greater"),
+            Self::ReversedPageRange => {
+                formatter.write_str("to page must be greater than or equal to from page")
+            }
+            Self::PageOutOfRange { page, page_count } => {
+                write!(
+                    formatter,
+                    "page {page} not found; document has {page_count} pages"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DjvuPdfError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse(error) => Some(error),
+            Self::Bzz(error) => Some(error),
+            Self::Text(error) => Some(error),
+            Self::Render(error) => Some(error),
+            Self::Pdf(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<ParseError> for DjvuPdfError {
+    fn from(error: ParseError) -> Self {
+        Self::Parse(error)
+    }
+}
+
+impl From<BzzError> for DjvuPdfError {
+    fn from(error: BzzError) -> Self {
+        Self::Bzz(error)
+    }
+}
+
+impl From<TextError> for DjvuPdfError {
+    fn from(error: TextError) -> Self {
+        Self::Text(error)
+    }
+}
+
+impl From<RenderError> for DjvuPdfError {
+    fn from(error: RenderError) -> Self {
+        Self::Render(error)
+    }
+}
+
+impl From<PdfError> for DjvuPdfError {
+    fn from(error: PdfError) -> Self {
+        Self::Pdf(error)
+    }
 }
 
 impl From<DjvuRenderError> for DjvuPdfError {

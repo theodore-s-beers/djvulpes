@@ -4,6 +4,6 @@
 mod cli;
 mod commands;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> commands::CommandResult<()> {
     cli::run()
 }

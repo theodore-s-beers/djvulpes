@@ -1,8 +1,7 @@
 use super::{
-    print_bitmap_stats, print_iw44_render_summary, print_partial_render_summary, read_file,
-    render_page_layer,
+    CommandContext as _, CommandError, CommandResult, print_bitmap_stats,
+    print_iw44_render_summary, print_partial_render_summary, read_file, render_page_layer,
 };
-use anyhow::{Context as _, bail};
 use djvulpes::{
     PageRenderMode, RenderCompareLimits, bitmap_diff_failures, bitmap_diff_region_summary,
     bitmap_diff_tile_summaries,
@@ -72,7 +71,7 @@ fn run_compare_render_oracle_file(
     oracle: &Path,
     mode: PageRenderMode,
     limits: RenderCompareLimits,
-) -> anyhow::Result<()> {
+) -> CommandResult<()> {
     let render = render_page_layer(path, number, mode)?;
     let oracle_bytes = read_file(oracle)?;
     let expected = djvulpes::PageBitmap::from_ppm_bytes(&oracle_bytes, render.bitmap.dpi)?;
@@ -96,7 +95,7 @@ pub fn run_compare_ppm(
     actual_path: &Path,
     expected_path: &Path,
     limits: RenderCompareLimits,
-) -> anyhow::Result<()> {
+) -> CommandResult<()> {
     let actual_bytes = read_file(actual_path)?;
     let expected_bytes = read_file(expected_path)?;
     let actual = djvulpes::PageBitmap::from_ppm_bytes(&actual_bytes, 300)
@@ -269,9 +268,9 @@ fn format_milli_delta(total_abs_delta: u64, component_count: usize) -> String {
 fn enforce_bitmap_diff(
     diff: &djvulpes::PageBitmapDiff,
     limits: RenderCompareLimits,
-) -> anyhow::Result<()> {
+) -> CommandResult<()> {
     if let Some(failure) = bitmap_diff_failures(diff, limits).into_iter().next() {
-        bail!("{failure}");
+        return Err(CommandError::new(failure));
     }
 
     Ok(())
@@ -281,12 +280,16 @@ pub fn run_compare_render(
     path: &Path,
     options: CompareRenderOptions<'_>,
     limits: RenderCompareLimits,
-) -> anyhow::Result<()> {
+) -> CommandResult<()> {
     match (options.oracle, options.oracle_dir) {
-        (Some(_), Some(_)) => bail!("use either --oracle or --oracle-dir, not both"),
+        (Some(_), Some(_)) => Err(CommandError::new(
+            "use either --oracle or --oracle-dir, not both",
+        )),
         (Some(oracle), None) => {
             if options.from_page != 1 || options.to_page.is_some() {
-                bail!("--oracle compares one page; use --page instead of --from-page/--to-page");
+                return Err(CommandError::new(
+                    "--oracle compares one page; use --page instead of --from-page/--to-page",
+                ));
             }
             let page = options.page.context("--oracle requires --page <number>")?;
             run_compare_render_oracle_file(path, page, oracle, options.mode, limits)
@@ -306,7 +309,9 @@ pub fn run_compare_render(
                 limits,
             )
         }
-        (None, None) => bail!("compare-render requires --oracle or --oracle-dir"),
+        (None, None) => Err(CommandError::new(
+            "compare-render requires --oracle or --oracle-dir",
+        )),
     }
 }
 
@@ -317,7 +322,7 @@ fn run_compare_render_oracle_dir(
     from_page: usize,
     to_page: Option<usize>,
     limits: RenderCompareLimits,
-) -> anyhow::Result<()> {
+) -> CommandResult<()> {
     let bytes = read_file(path)?;
 
     println!("file: {}", path.display());
@@ -391,7 +396,9 @@ fn run_compare_render_oracle_dir(
     println!("failed pages: {failed_pages}");
     worst.print();
     if failed_pages > 0 {
-        bail!("{failed_pages} rendered pages exceeded comparison limits");
+        return Err(CommandError::new(format!(
+            "{failed_pages} rendered pages exceeded comparison limits"
+        )));
     }
 
     Ok(())

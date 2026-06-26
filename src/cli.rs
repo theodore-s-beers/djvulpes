@@ -141,12 +141,12 @@ enum Command {
     Outline { file: PathBuf },
 }
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run() -> crate::commands::CommandResult<()> {
     let cli = Cli::parse();
     run_command(cli.command)
 }
 
-fn run_command(command: Command) -> anyhow::Result<()> {
+fn run_command(command: Command) -> crate::commands::CommandResult<()> {
     if run_compare_command(&command)? {
         return Ok(());
     }
@@ -185,7 +185,7 @@ fn run_command(command: Command) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_render_command(command: &Command) -> anyhow::Result<bool> {
+fn run_render_command(command: &Command) -> crate::commands::CommandResult<bool> {
     match command {
         Command::RenderPlan { page, file } => run_render_plan(file, *page)?,
         Command::RenderPageImage {
@@ -231,7 +231,7 @@ fn run_render_command(command: &Command) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-fn run_compare_command(command: &Command) -> anyhow::Result<bool> {
+fn run_compare_command(command: &Command) -> crate::commands::CommandResult<bool> {
     match command {
         Command::CompareRender {
             oracle,
